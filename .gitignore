@@ -6,6 +6,7 @@ config.json
 
 # 缓存
 cache/
+covers/
 
 # 旧版 Python 的打包产物与临时文件（仅本地存在）
 build/

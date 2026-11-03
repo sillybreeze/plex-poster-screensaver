@@ -15,6 +15,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::config::Config;
 use crate::gpu::{Gpu, Textures};
+use crate::idle::{self, Idle};
 use crate::plex::{Cache, Client, MediaItem, Section};
 use crate::render::{self, Composition, DIRECTIONS};
 
@@ -117,9 +118,20 @@ enum Phase {
     },
 }
 
+/// 常驻等待状态：窗口先藏着，空闲到点才全屏。
+struct Watch {
+    threshold: Duration,
+    idle: Idle,
+    showing: bool,
+    next_poll: Instant,
+    /// 显示那一刻的系统输入时间戳；变了说明有人动了鼠标/键盘
+    dismiss_tick: u32,
+}
+
 pub struct App {
     cfg: Config,
     preview: bool,
+    watch: Option<Watch>,
     pending: Option<(Client, Cache, Vec<Section>)>,
     rx: Option<Receiver<Slide>>,
 
@@ -152,9 +164,21 @@ impl App {
         sections: Vec<Section>,
     ) -> Self {
         let now = Instant::now();
+        let watch = if cfg.watch && !preview {
+            Some(Watch {
+                threshold: Duration::from_secs_f64(cfg.idle_seconds.max(1.0)),
+                idle: Idle::new(cfg.mouse_only, now),
+                showing: false,
+                next_poll: now,
+                dismiss_tick: 0,
+            })
+        } else {
+            None
+        };
         Self {
             cfg,
             preview,
+            watch,
             pending: Some((client, cache, sections)),
             rx: None,
             size: (1920, 1080),
@@ -177,10 +201,118 @@ impl App {
     }
 
     pub fn run(mut self) -> Result<(), String> {
+        if let Some(w) = &self.watch {
+            println!(
+                "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起",
+                w.threshold.as_secs_f64()
+            );
+        }
         let event_loop = EventLoop::new().map_err(|e| format!("创建事件循环失败: {e}"))?;
         event_loop
             .run_app(&mut self)
             .map_err(|e| format!("事件循环异常: {e}"))
+    }
+
+    /// 惰性创建 D3D11：常驻模式下第一次触发才建，平时不占显存。
+    fn ensure_gpu(&mut self) -> bool {
+        if self.gpu.is_some() {
+            return true;
+        }
+        let Some(window) = self.window.clone() else {
+            return false;
+        };
+        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => {
+                windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)
+            }
+            _ => {
+                eprintln!("无法获取窗口句柄");
+                return false;
+            }
+        };
+        match Gpu::new(hwnd, self.size.0, self.size.1) {
+            Ok(gpu) => {
+                self.gpu = Some(gpu);
+                true
+            }
+            Err(err) => {
+                eprintln!("初始化 D3D11 失败: {err}");
+                false
+            }
+        }
+    }
+
+    /// 空闲到点：把隐藏的窗口全屏显示出来。
+    fn show_screensaver(&mut self, event_loop: &ActiveEventLoop, now: Instant) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        if let Some(monitor) = event_loop.primary_monitor() {
+            let size = monitor.size();
+            self.size = (size.width.max(1), size.height.max(1));
+        }
+        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        window.set_visible(true);
+        window.focus_window();
+
+        if !self.ensure_gpu() {
+            // 建不出渲染器就别干挂着黑屏，一分钟后再试
+            window.set_fullscreen(None);
+            window.set_visible(false);
+            if let Some(w) = &mut self.watch {
+                w.idle.reset(now);
+                w.next_poll = now + Duration::from_secs(60);
+            }
+            return;
+        }
+
+        self.current = None;
+        self.phase = Phase::Idle;
+        self.progress = 0.0;
+        self.uv = [0.0, 0.0, 1.0, 1.0];
+        self.next_frame_at = now;
+        self.grace_until = now + Duration::from_millis(700);
+
+        if let Some(w) = &mut self.watch {
+            w.showing = true;
+            w.dismiss_tick = idle::last_input_tick();
+        }
+        eprintln!("空闲 {:.0} 秒，开始屏保", self.cfg.idle_seconds);
+    }
+
+    /// 有人动了：收起屏保，回到常驻等待。
+    fn hide_screensaver(&mut self, now: Instant) {
+        eprintln!("检测到输入，收起屏保");
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+            window.set_visible(false);
+        }
+        if let Some(w) = &mut self.watch {
+            w.showing = false;
+            w.idle.reset(now);
+            w.next_poll = now + Duration::from_millis(500);
+        }
+        self.current = None;
+        self.phase = Phase::Idle;
+        self.progress = 0.0;
+        self.next_frame_at = now;
+    }
+
+    /// 窗口收到输入。常驻模式收起，普通模式直接退出。
+    fn user_activity(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now < self.grace_until {
+            return;
+        }
+        let showing = self.watch.as_ref().map(|w| w.showing).unwrap_or(false);
+        if self.watch.is_some() {
+            if showing {
+                self.hide_screensaver(now);
+            }
+            return;
+        }
+        event_loop.exit();
     }
 
     fn start_worker(&mut self) {
@@ -373,9 +505,13 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let watching = self.watch.is_some();
         let mut attrs = Window::default_attributes().with_title("Plex 海报屏保");
         if self.preview {
             attrs = attrs.with_inner_size(LogicalSize::new(1280.0, 720.0));
+        } else if watching {
+            // 常驻模式：先建一个隐藏窗口，空闲到点再全屏显示
+            attrs = attrs.with_visible(false).with_decorations(false);
         } else {
             attrs = attrs
                 .with_decorations(false)
@@ -391,56 +527,58 @@ impl ApplicationHandler for App {
             }
         };
 
-        let size = window.inner_size();
-        self.size = (size.width.max(1), size.height.max(1));
-
-        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => {
-                windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)
-            }
-            _ => {
-                eprintln!("无法获取窗口句柄");
-                event_loop.exit();
-                return;
-            }
+        // 隐藏窗口的尺寸没意义，直接按主屏来 —— 工作线程要按目标分辨率合成海报
+        let size = if watching {
+            event_loop
+                .primary_monitor()
+                .map(|m| m.size())
+                .unwrap_or_else(|| window.inner_size())
+        } else {
+            window.inner_size()
         };
-
-        match Gpu::new(hwnd, self.size.0, self.size.1) {
-            Ok(gpu) => self.gpu = Some(gpu),
-            Err(err) => {
-                eprintln!("初始化 D3D11 失败: {err}");
-                event_loop.exit();
-                return;
-            }
-        }
+        self.size = (size.width.max(1), size.height.max(1));
 
         self.window = Some(window);
 
+        if !watching && !self.ensure_gpu() {
+            event_loop.exit();
+            return;
+        }
+
         if !self.started {
             self.started = true;
-            self.grace_until = Instant::now() + Duration::from_millis(1500);
             self.start_worker();
         }
-        self.next_frame_at = Instant::now();
+        let now = Instant::now();
+        self.grace_until = now + Duration::from_millis(1500);
+        self.next_frame_at = now;
+        if let Some(w) = &mut self.watch {
+            w.next_poll = now;
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed && Instant::now() >= self.grace_until {
-                    event_loop.exit();
+                if event.state == ElementState::Pressed {
+                    self.user_activity(event_loop);
                 }
             }
             WindowEvent::MouseInput { state, .. } => {
-                if state == ElementState::Pressed && Instant::now() >= self.grace_until {
-                    event_loop.exit();
+                if state == ElementState::Pressed {
+                    self.user_activity(event_loop);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = Instant::now();
                 if now < self.grace_until {
                     self.pointer_start = (position.x, position.y);
+                } else if self.watch.is_some() {
+                    // 常驻模式：鼠标一动就收起（藏着的窗口不该收到这个事件，防一手）
+                    if self.watch.as_ref().is_some_and(|w| w.showing) {
+                        self.hide_screensaver(now);
+                    }
                 } else if !self.preview {
                     let dx = position.x - self.pointer_start.0;
                     let dy = position.y - self.pointer_start.1;
@@ -455,6 +593,43 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+
+        // 常驻模式：藏着的时候数空闲，显示的时候盯输入
+        let mut start = false;
+        let mut stop = false;
+        if let Some(w) = self.watch.as_mut() {
+            if w.showing {
+                if now >= self.grace_until && idle::last_input_tick() != w.dismiss_tick {
+                    stop = true;
+                }
+            } else if now >= w.next_poll {
+                w.next_poll = now + Duration::from_millis(500);
+                let idle = w.idle.poll(now);
+                if std::env::var_os("PPS_DEBUG").is_some() {
+                    eprintln!(
+                        "[watch] 已空闲 {:.1}s / 阈值 {:.0}s",
+                        idle.as_secs_f64(),
+                        w.threshold.as_secs_f64()
+                    );
+                }
+                if idle >= w.threshold {
+                    start = true;
+                }
+            }
+        }
+        if start {
+            self.show_screensaver(event_loop, now);
+        }
+        if stop {
+            self.hide_screensaver(now);
+        }
+        if let Some(w) = &self.watch {
+            if !w.showing {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(w.next_poll));
+                return;
+            }
+        }
+
         if self.window.is_some() && now >= self.next_frame_at {
             let t0 = Instant::now();
             self.tick(now);

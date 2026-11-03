@@ -15,6 +15,7 @@ Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮
 - **亚像素平滑**：硬件采样天然连续，不会出现「几帧不动、突然跳 1 像素」的卡顿
 - **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡
 - **本地缓存**：按 `ratingKey` 命名，兼容旧版按标题命名的文件，过期自动清理
+- **常驻等待**：`--watch` 启动后不占屏，空闲到点自动全屏，动一下鼠标/键盘立刻收起，循环往复
 
 ## 快速开始
 
@@ -41,6 +42,57 @@ cargo build --release
 # 导出当前合成结果
 .\target\release\plex-poster-screensaver.exe --snapshot out.png
 ```
+
+## 常驻等待模式（不写注册表）
+
+不想走 Windows 那套 `.scr` 屏保（要往注册表写 `SCRNSAVE.EXE`）就用这个：
+程序跑起来后只是藏着等，**空闲到点自动全屏**，动鼠标或按键立刻收起，然后继续等。
+
+```powershell
+.\target\release\plex-poster-screensaver.exe --config config.json --watch
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--watch` | 开启常驻等待 |
+| `--idle <分钟>` | 空闲多久触发，默认 5；可写小数（`0.1` = 6 秒），最小 5 秒 |
+| `--mouse-only` | 只把鼠标当活动，键盘不算 |
+
+也可以固化在 `config.json` 里，启动时不用带参数：
+
+```json
+"watch": true,
+"idle_minutes": 5,
+"mouse_only": false
+```
+
+### 判定口径
+
+默认走 Windows 的 `GetLastInputInfo`，**键盘和鼠标都算活动**，和系统屏保、自动锁屏是同一个标准。
+
+`--mouse-only` 换成轮询鼠标位置和左/右/中键，键盘完全不计入。代价是：你连着打字五分钟，
+屏保也会弹出来（弹出来会被下一次按键立刻收掉）。
+
+不管哪种模式，**收起屏保的条件都是"有任何输入"**——鼠标动、点击、按键都算，不然全屏之后就退不出来了。
+
+### 空闲时不干活
+
+没触发的时候窗口是隐藏的、不渲染、不 `Present`，每 500ms 只读一次时间戳；
+D3D11 设备和纹理也要等第一次触发才创建。所以常驻一整天基本是零 CPU。
+
+### 开机自启（用启动文件夹，不碰注册表）
+
+```powershell
+$startup = [Environment]::GetFolderPath('Startup')
+$ws = New-Object -ComObject WScript.Shell
+$lnk = $ws.CreateShortcut("$startup\Plex 海报屏保.lnk")
+$lnk.TargetPath = "D:\PROJECT\PJ2\target\release\plex-poster-screensaver.exe"
+$lnk.Arguments = '--config "D:\PROJECT\PJ2\config.json" --watch'
+$lnk.Save()
+```
+
+`--config` 别省：exe 在 `target\release` 里，默认只会找**exe 同目录**和 `%LOCALAPPDATA%` 下的
+`config.json`，项目根目录那份它是看不到的。
 
 ## 配置
 
@@ -82,6 +134,9 @@ cp config.example.json config.json
 --cache-days <天>      缓存保留天数
 --no-transcode         不使用服务端缩图
 --insecure             HTTPS 跳过证书校验
+--watch                常驻等待，空闲到点自动全屏
+--idle <分钟>          空闲多久触发，默认 5
+--mouse-only           只把鼠标算作活动
 --preview              1280x720 窗口预览
 --self-test <N>        无界面自检
 --snapshot <png>       导出合成结果
@@ -98,7 +153,8 @@ src/
 ├── plex.rs     Plex 客户端 + 封面缓存
 ├── render.rs   图像管线：缩放、氛围光、Ken Burns 采样
 ├── gpu.rs      D3D11：纹理上传、着色器、交换链
-└── app.rs      winit 窗口、事件循环、动效调度
+├── idle.rs     空闲检测：GetLastInputInfo / 纯鼠标轮询
+└── app.rs      winit 窗口、事件循环、动效调度、常驻等待
 ```
 
 ## 许可

@@ -10,5 +10,8 @@
   "transcode": true,
   "timeout": 10,
   "ken_burns": true,
-  "motion_fps": 30
+  "motion_fps": 30,
+  "watch": false,
+  "idle_minutes": 5,
+  "mouse_only": false
 }

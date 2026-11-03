@@ -31,6 +31,7 @@ mod timer {
     pub fn begin() {}
     pub fn end() {}
 }
+mod idle;
 mod plex;
 mod render;
 
@@ -61,17 +62,7 @@ fn main() {
     }
 
     let client = Client::new(&cfg);
-    let sections = match client.sections() {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("无法连接 Plex 服务器 {}: {err}", cfg.url);
-            std::process::exit(1);
-        }
-    };
-    if sections.is_empty() {
-        eprintln!("服务器上没有找到「电影」或「剧集」类型的媒体库");
-        std::process::exit(1);
-    }
+    let sections = connect(&client, &cfg);
 
     let selected = match select_sections(&sections, &args, &cfg) {
         Ok(v) => v,
@@ -132,6 +123,27 @@ fn main() {
     if let Err(err) = result {
         eprintln!("{err}");
         std::process::exit(1);
+    }
+}
+
+const RETRY_SECONDS: u64 = 15;
+
+/// 连 Plex 拿媒体库列表。
+///
+/// 常驻模式（--watch）下连不上不退出 —— 开机自启时网络和 Plex 往往还没起来，
+/// 隔一会儿再试就是了；普通模式保持原来的「报错退出」。
+fn connect(client: &Client, cfg: &Config) -> Vec<Section> {
+    loop {
+        match client.sections() {
+            Ok(s) if !s.is_empty() => return s,
+            Ok(_) => eprintln!("服务器上没有找到「电影」或「剧集」类型的媒体库"),
+            Err(err) => eprintln!("无法连接 Plex 服务器 {}: {err}", cfg.url),
+        }
+        if !cfg.watch {
+            std::process::exit(1);
+        }
+        eprintln!("{RETRY_SECONDS} 秒后重试（Ctrl+C 退出）");
+        std::thread::sleep(std::time::Duration::from_secs(RETRY_SECONDS));
     }
 }
 

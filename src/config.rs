@@ -29,6 +29,12 @@ pub struct Config {
     pub timeout: u64,
     pub ken_burns: bool,
     pub motion_fps: u32,
+    /// 常驻等待：空闲到点后再全屏，而不是一启动就全屏
+    pub watch: bool,
+    /// 触发屏保需要的空闲秒数
+    pub idle_seconds: f64,
+    /// 只把鼠标算作活动（默认键盘也算）
+    pub mouse_only: bool,
 }
 
 impl Default for Config {
@@ -48,6 +54,9 @@ impl Default for Config {
             timeout: 10,
             ken_burns: true,
             motion_fps: 30,
+            watch: false,
+            idle_seconds: 300.0,
+            mouse_only: false,
         }
     }
 }
@@ -87,6 +96,9 @@ pub struct Args {
     pub config: Option<String>,
     pub self_test: Option<usize>,
     pub snapshot: Option<String>,
+    pub watch: bool,
+    pub idle: Option<f64>,
+    pub mouse_only: bool,
     pub verbose: bool,
     pub help: bool,
 }
@@ -112,6 +124,9 @@ plex-poster-screensaver (Rust)
   --no-transcode        不使用服务端缩图
   --insecure            HTTPS 跳过证书校验
   --preview             以 1280x720 窗口预览
+  --watch               常驻等待：空闲到点后自动全屏，有输入就收起
+  --idle <分钟>         空闲多久触发，默认 5（可写小数，如 0.1 = 6 秒）
+  --mouse-only          只把鼠标当活动，键盘不算（默认和系统屏保一致：键鼠都算）
   --self-test <N>       无界面自检 N 张后退出
   --snapshot <PNG>      渲染一张并保存后退出
   --config <路径>       指定配置文件
@@ -139,6 +154,9 @@ pub fn parse_args() -> Result<Args, String> {
             "--cache-dir" => args.cache_dir = Some(value("--cache-dir")?),
             "--cache-days" => args.cache_days = Some(parse_num(&value("--cache-days")?)?),
             "--config" => args.config = Some(value("--config")?),
+            "--watch" => args.watch = true,
+            "--idle" => args.idle = Some(parse_num(&value("--idle")?)?),
+            "--mouse-only" => args.mouse_only = true,
             "--self-test" => args.self_test = Some(parse_num(&value("--self-test")?)?),
             "--snapshot" => args.snapshot = Some(value("--snapshot")?),
             "-v" | "--verbose" => args.verbose = true,
@@ -167,6 +185,9 @@ struct FileConfig {
     timeout: Option<u64>,
     ken_burns: Option<bool>,
     motion_fps: Option<u32>,
+    watch: Option<bool>,
+    idle_minutes: Option<f64>,
+    mouse_only: Option<bool>,
 }
 
 pub fn locate_config(explicit: Option<&str>) -> Option<PathBuf> {
@@ -232,6 +253,15 @@ pub fn load(args: &Args) -> Config {
                     if let Some(v) = file.motion_fps {
                         cfg.motion_fps = v;
                     }
+                    if let Some(v) = file.watch {
+                        cfg.watch = v;
+                    }
+                    if let Some(v) = file.idle_minutes {
+                        cfg.idle_seconds = (v * 60.0).max(5.0);
+                    }
+                    if let Some(v) = file.mouse_only {
+                        cfg.mouse_only = v;
+                    }
                     eprintln!("已加载配置: {}", path.display());
                 }
                 Err(err) => eprintln!("配置文件解析失败，已忽略 {}: {err}", path.display()),
@@ -264,6 +294,15 @@ pub fn load(args: &Args) -> Config {
     }
     if args.no_motion {
         cfg.ken_burns = false;
+    }
+    if args.watch {
+        cfg.watch = true;
+    }
+    if args.mouse_only {
+        cfg.mouse_only = true;
+    }
+    if let Some(v) = args.idle {
+        cfg.idle_seconds = (v * 60.0).max(5.0);
     }
     if args.no_transcode {
         cfg.transcode = false;
