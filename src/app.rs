@@ -119,6 +119,11 @@ enum Phase {
     },
 }
 
+/// 空闲到点时刚显示的那一小段：别被残留的鼠标抖动立刻关掉。
+const IDLE_GRACE: Duration = Duration::from_millis(700);
+/// 手动拉起（热键 / 再启动）留得久一点：按下和松开热键本身都算输入。
+const MANUAL_GRACE: Duration = Duration::from_millis(1200);
+
 /// 事件循环的自定义事件：外部（再启动一次 exe）要求立刻开始。
 pub enum UserEvent {
     StartNow,
@@ -129,6 +134,8 @@ struct Watch {
     threshold: Duration,
     idle: Idle,
     showing: bool,
+    /// 是不是热键/再启动这类「手动」拉起的（触发的那个动作本身就是输入）
+    manual: bool,
     next_poll: Instant,
     /// 显示那一刻的系统输入时间戳；变了说明有人动了鼠标/键盘
     dismiss_tick: u32,
@@ -175,6 +182,7 @@ impl App {
                 threshold: Duration::from_secs_f64(cfg.idle_seconds.max(1.0)),
                 idle: Idle::new(cfg.mouse_only, now),
                 showing: false,
+                manual: false,
                 next_poll: now,
                 dismiss_tick: 0,
             })
@@ -280,11 +288,14 @@ impl App {
             Some(false) => {}
         }
         eprintln!("收到启动请求，立刻开始");
-        self.show_screensaver(event_loop, Instant::now());
+        self.show_screensaver(event_loop, Instant::now(), true);
     }
 
-    /// 空闲到点：把隐藏的窗口全屏显示出来。
-    fn show_screensaver(&mut self, event_loop: &ActiveEventLoop, now: Instant) {
+    /// 空闲到点 / 手动要求：把隐藏的窗口全屏显示出来。
+    ///
+    /// `manual` 表示这次是热键或再启动拉起的 —— 按热键的那个动作本身就会更新系统的
+    /// 「最后输入时间」，所以宽限期里要一直是刷新基准，否则松开按键就会被当成「有人回来了」。
+    fn show_screensaver(&mut self, event_loop: &ActiveEventLoop, now: Instant, manual: bool) {
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -313,10 +324,16 @@ impl App {
         self.progress = 0.0;
         self.uv = [0.0, 0.0, 1.0, 1.0];
         self.next_frame_at = now;
-        self.grace_until = now + Duration::from_millis(700);
+        self.grace_until = now
+            + if manual {
+                MANUAL_GRACE
+            } else {
+                IDLE_GRACE
+            };
 
         if let Some(w) = &mut self.watch {
             w.showing = true;
+            w.manual = manual;
             w.dismiss_tick = idle::last_input_tick();
         }
     }
@@ -645,7 +662,13 @@ impl ApplicationHandler<UserEvent> for App {
         let mut stop = false;
         if let Some(w) = self.watch.as_mut() {
             if w.showing {
-                if now >= self.grace_until && idle::last_input_tick() != w.dismiss_tick {
+                if now < self.grace_until {
+                    // 手动拉起时，宽限期里的输入（松开热键）要并进基准，
+                    // 否则松开的那一下就会被当成「有人回来了」，下一秒就收起。
+                    if w.manual {
+                        w.dismiss_tick = idle::last_input_tick();
+                    }
+                } else if idle::last_input_tick() != w.dismiss_tick {
                     stop = true;
                 }
             } else if now >= w.next_poll {
@@ -665,7 +688,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         if start {
-            self.show_screensaver(event_loop, now);
+            self.show_screensaver(event_loop, now, false);
         }
         if stop {
             self.hide_screensaver(now);
