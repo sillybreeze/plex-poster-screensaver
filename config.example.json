@@ -14,5 +14,6 @@
   "motion_fps": 30,
   "watch": false,
   "idle_minutes": 5,
-  "mouse_only": false
+  "mouse_only": false,
+  "hotkey": "Ctrl+Alt+P"
 }

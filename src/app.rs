@@ -209,9 +209,13 @@ impl App {
     pub fn run(mut self, trigger: Option<HANDLE>) -> Result<(), String> {
         if let Some(w) = &self.watch {
             println!(
-                "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起；想立刻看就再启动一次",
+                "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起",
                 w.threshold.as_secs_f64()
             );
+            match self.cfg.hotkey {
+                Some(h) => println!("立刻开始：再启动一次 exe，或按 {}", h.label()),
+                None => println!("立刻开始：再启动一次 exe"),
+            }
         }
         let event_loop = EventLoop::<UserEvent>::with_user_event()
             .build()
@@ -222,6 +226,16 @@ impl App {
             crate::trigger::listen(event, move || {
                 let _ = proxy.send_event(UserEvent::StartNow);
             });
+        }
+
+        // 热键只在常驻模式有意义：--now / 普通模式本来就在全屏
+        if self.watch.is_some() {
+            if let Some(hotkey) = self.cfg.hotkey {
+                let proxy = event_loop.create_proxy();
+                crate::trigger::listen_hotkey(hotkey, move || {
+                    let _ = proxy.send_event(UserEvent::StartNow);
+                });
+            }
         }
 
         event_loop

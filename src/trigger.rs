@@ -8,6 +8,12 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
     CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
+
+use crate::config::Hotkey;
 
 const EVENT_NAME: &str = "Local\\PlexPosterScreensaver.StartNow";
 
@@ -41,6 +47,38 @@ pub fn listen(event: HANDLE, on_trigger: impl Fn() + Send + 'static) {
         while handle.wait() {
             on_trigger();
         }
+    });
+}
+
+/// 注册全局热键，按下就回调一次。
+///
+/// `RegisterHotKey(None, ..)` 注册的是「线程级」热键，`WM_HOTKEY` 会投递到注册它的那个
+/// 线程的消息队列，所以这里必须开一个自己的线程来跑消息循环 —— 主线程的窗口消息泵
+/// 是 winit 的，取到没有窗口的热键消息只会丢掉。
+pub fn listen_hotkey(hotkey: Hotkey, on_trigger: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || unsafe {
+        const ID: i32 = 0x5053;
+        let mods = HOT_KEY_MODIFIERS(hotkey.mods.0 | MOD_NOREPEAT.0);
+        if RegisterHotKey(None, ID, mods, hotkey.vk).is_err() {
+            eprintln!(
+                "热键 {} 注册失败（多半被别的程序占用了），换个组合：--hotkey Ctrl+Alt+其他键",
+                hotkey.label()
+            );
+            return;
+        }
+        eprintln!("热键 {} 已就绪", hotkey.label());
+
+        let mut msg = MSG::default();
+        loop {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 <= 0 {
+                break;
+            }
+            if msg.message == WM_HOTKEY && msg.wParam.0 == ID as usize {
+                on_trigger();
+            }
+        }
+        let _ = UnregisterHotKey(None, ID);
     });
 }
 

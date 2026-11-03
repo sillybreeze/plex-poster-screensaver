@@ -7,6 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
+};
 
 pub const APP_NAME: &str = "PlexPosterScreensaver";
 pub const DEFAULT_URL: &str = "http://127.0.0.1:32400";
@@ -38,6 +41,129 @@ impl Naming {
     }
 }
 
+/// 全局热键，比如 Ctrl+Alt+P。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hotkey {
+    pub mods: HOT_KEY_MODIFIERS,
+    pub vk: u32,
+}
+
+impl Hotkey {
+    /// 默认值：Ctrl+Alt+P。
+    pub fn default_hotkey() -> Self {
+        Self {
+            mods: HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0),
+            vk: 'P' as u32,
+        }
+    }
+
+    /// 解析 `Ctrl+Alt+P` 这种写法；不认识的键返回 None。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut mods = 0u32;
+        let mut vk = None;
+        for part in raw.split('+') {
+            let token = part.trim();
+            if token.is_empty() {
+                continue;
+            }
+            match token.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => mods |= MOD_CONTROL.0,
+                "alt" => mods |= MOD_ALT.0,
+                "shift" => mods |= MOD_SHIFT.0,
+                "win" | "super" | "meta" => mods |= MOD_WIN.0,
+                other => {
+                    if vk.is_some() {
+                        return None;
+                    }
+                    vk = Some(key_code(other)?);
+                }
+            }
+        }
+        Some(Self {
+            mods: HOT_KEY_MODIFIERS(mods),
+            vk: vk?,
+        })
+    }
+
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.mods.0 & MOD_CONTROL.0 != 0 {
+            parts.push("Ctrl".to_string());
+        }
+        if self.mods.0 & MOD_ALT.0 != 0 {
+            parts.push("Alt".to_string());
+        }
+        if self.mods.0 & MOD_SHIFT.0 != 0 {
+            parts.push("Shift".to_string());
+        }
+        if self.mods.0 & MOD_WIN.0 != 0 {
+            parts.push("Win".to_string());
+        }
+        parts.push(key_label(self.vk));
+        parts.join("+")
+    }
+}
+
+fn key_code(token: &str) -> Option<u32> {
+    let upper = token.to_ascii_uppercase();
+    let mut chars = upper.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if c.is_ascii_alphanumeric() {
+            return Some(c as u32);
+        }
+    }
+    if let Some(num) = upper.strip_prefix('F') {
+        if let Ok(n) = num.parse::<u32>() {
+            if (1..=24).contains(&n) {
+                return Some(0x70 + n - 1);
+            }
+        }
+    }
+    match upper.as_str() {
+        "SPACE" => Some(0x20),
+        "TAB" => Some(0x09),
+        "ENTER" | "RETURN" => Some(0x0D),
+        "ESC" | "ESCAPE" => Some(0x1B),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PGUP" | "PAGEUP" => Some(0x21),
+        "PGDN" | "PAGEDOWN" => Some(0x22),
+        "INS" | "INSERT" => Some(0x2D),
+        "DEL" | "DELETE" => Some(0x2E),
+        "LEFT" => Some(0x25),
+        "UP" => Some(0x26),
+        "RIGHT" => Some(0x27),
+        "DOWN" => Some(0x28),
+        _ => None,
+    }
+}
+
+fn key_label(vk: u32) -> String {
+    if (0x30..=0x39).contains(&vk) || (0x41..=0x5A).contains(&vk) {
+        return char::from_u32(vk).map(|c| c.to_string()).unwrap_or_default();
+    }
+    if (0x70..=0x87).contains(&vk) {
+        return format!("F{}", vk - 0x70 + 1);
+    }
+    match vk {
+        0x20 => "Space".to_string(),
+        0x09 => "Tab".to_string(),
+        0x0D => "Enter".to_string(),
+        0x1B => "Esc".to_string(),
+        0x24 => "Home".to_string(),
+        0x23 => "End".to_string(),
+        0x21 => "PgUp".to_string(),
+        0x22 => "PgDn".to_string(),
+        0x2D => "Ins".to_string(),
+        0x2E => "Del".to_string(),
+        0x25 => "Left".to_string(),
+        0x26 => "Up".to_string(),
+        0x27 => "Right".to_string(),
+        0x28 => "Down".to_string(),
+        other => format!("VK{other:02X}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub url: String,
@@ -64,6 +190,8 @@ pub struct Config {
     pub idle_seconds: f64,
     /// 只把鼠标算作活动（默认键盘也算）
     pub mouse_only: bool,
+    /// 立刻开始的全局热键；None 表示关掉
+    pub hotkey: Option<Hotkey>,
 }
 
 impl Default for Config {
@@ -87,6 +215,7 @@ impl Default for Config {
             watch: false,
             idle_seconds: 300.0,
             mouse_only: false,
+            hotkey: Some(Hotkey::default_hotkey()),
         }
     }
 }
@@ -131,6 +260,8 @@ pub struct Args {
     pub now: bool,
     pub idle: Option<f64>,
     pub mouse_only: bool,
+    pub hotkey: Option<Hotkey>,
+    pub no_hotkey: bool,
     pub verbose: bool,
     pub help: bool,
 }
@@ -161,6 +292,8 @@ plex-poster-screensaver (Rust)
   --now                 立刻全屏，不等空闲（覆盖配置里的 watch）
   --idle <分钟>         空闲多久触发，默认 5（可写小数，如 0.1 = 6 秒）
   --mouse-only          只把鼠标当活动，键盘不算（默认和系统屏保一致：键鼠都算）
+  --hotkey <组合键>     立刻开始的全局热键，默认 Ctrl+Alt+P
+  --no-hotkey           停用全局热键
   --self-test <N>       无界面自检 N 张后退出
   --snapshot <PNG>      渲染一张并保存后退出
   --config <路径>       指定配置文件
@@ -197,6 +330,14 @@ pub fn parse_args() -> Result<Args, String> {
             "--now" => args.now = true,
             "--idle" => args.idle = Some(parse_num(&value("--idle")?)?),
             "--mouse-only" => args.mouse_only = true,
+            "--no-hotkey" => args.no_hotkey = true,
+            "--hotkey" => {
+                let raw = value("--hotkey")?;
+                args.hotkey = Some(
+                    Hotkey::parse(&raw)
+                        .ok_or_else(|| format!("无效的热键: {raw}（例：Ctrl+Alt+P、Ctrl+Shift+F9）"))?,
+                );
+            }
             "--self-test" => args.self_test = Some(parse_num(&value("--self-test")?)?),
             "--snapshot" => args.snapshot = Some(value("--snapshot")?),
             "-v" | "--verbose" => args.verbose = true,
@@ -229,6 +370,7 @@ struct FileConfig {
     watch: Option<bool>,
     idle_minutes: Option<f64>,
     mouse_only: Option<bool>,
+    hotkey: Option<String>,
 }
 
 pub fn locate_config(explicit: Option<&str>) -> Option<PathBuf> {
@@ -309,6 +451,17 @@ pub fn load(args: &Args) -> Config {
                     if let Some(v) = file.mouse_only {
                         cfg.mouse_only = v;
                     }
+                    if let Some(v) = &file.hotkey {
+                        let v = v.trim();
+                        if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+                            cfg.hotkey = None;
+                        } else {
+                            match Hotkey::parse(v) {
+                                Some(h) => cfg.hotkey = Some(h),
+                                None => eprintln!("config.json 里的 hotkey 无效，已忽略: {v}"),
+                            }
+                        }
+                    }
                     eprintln!("已加载配置: {}", path.display());
                 }
                 Err(err) => eprintln!("配置文件解析失败，已忽略 {}: {err}", path.display()),
@@ -351,6 +504,12 @@ pub fn load(args: &Args) -> Config {
     if args.mouse_only {
         cfg.mouse_only = true;
     }
+    if let Some(h) = args.hotkey {
+        cfg.hotkey = Some(h);
+    }
+    if args.no_hotkey {
+        cfg.hotkey = None;
+    }
     if let Some(v) = args.idle {
         cfg.idle_seconds = (v * 60.0).max(5.0);
     }
@@ -377,4 +536,35 @@ pub fn load(args: &Args) -> Config {
 
     cfg.url = cfg.url.trim_end_matches('/').to_string();
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_hotkey() {
+        let parsed = Hotkey::parse("Ctrl+Alt+P").expect("默认热键应该能解析");
+        let default = Hotkey::default_hotkey();
+        assert_eq!(parsed.vk, default.vk);
+        assert_eq!(parsed.mods.0, default.mods.0);
+        assert_eq!(parsed.label(), "Ctrl+Alt+P");
+    }
+
+    #[test]
+    fn parses_other_combinations() {
+        assert_eq!(
+            Hotkey::parse("ctrl+shift+f9").unwrap().label(),
+            "Ctrl+Shift+F9"
+        );
+        assert_eq!(Hotkey::parse("Win+Space").unwrap().label(), "Win+Space");
+        assert_eq!(Hotkey::parse(" Alt + A ").unwrap().label(), "Alt+A");
+    }
+
+    #[test]
+    fn rejects_nonsense() {
+        assert!(Hotkey::parse("Ctrl+Nope").is_none());
+        assert!(Hotkey::parse("Ctrl+A+B").is_none());
+        assert!(Hotkey::parse("").is_none());
+    }
 }

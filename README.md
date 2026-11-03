@@ -57,6 +57,8 @@ cargo build --release
 | `--watch` | 开启常驻等待 |
 | `--idle <分钟>` | 空闲多久触发，默认 5；可写小数（`0.1` = 6 秒），最小 5 秒 |
 | `--mouse-only` | 只把鼠标当活动，键盘不算 |
+| `--hotkey <组合键>` | 立刻开始的全局热键，默认 `Ctrl+Alt+P` |
+| `--no-hotkey` | 停用全局热键 |
 | `--now` | 不等空闲，立刻全屏（覆盖配置里的 `watch`） |
 
 也可以固化在 `config.json` 里，启动时不用带参数：
@@ -64,12 +66,23 @@ cargo build --release
 ```json
 "watch": true,
 "idle_minutes": 5,
-"mouse_only": false
+"mouse_only": false,
+"hotkey": "Ctrl+Alt+P"
 ```
 
 ### 想立刻开始
 
-不用改配置，两种方式：
+三种方式，都不用改配置。
+
+**按热键。** 常驻时会注册一个全局热键，默认 `Ctrl+Alt+P`，任何程序在最前面时按一下都能立刻全屏：
+
+```powershell
+--hotkey "Ctrl+Shift+F9"   # 换个不冲突的组合
+--no-hotkey                # 不要热键
+```
+
+支持 `Ctrl` / `Alt` / `Shift` / `Win` 加单个按键：字母、数字、`F1`~`F24`、`Space`、`Tab`、
+`Enter`、`Esc`、方向键等。被别的程序先占了会打印一行提示，其它触发方式照常工作。
 
 **再启动一次。** 常驻模式是单实例的：已经有一个在跑时，新启动的那个只会把「立刻开始」的信号
 递过去然后自己退出，不会开第二个窗口。所以双击同一个快捷方式就等于「现在就开始」。
@@ -177,6 +190,8 @@ cp config.example.json config.json
 --no-transcode         不使用服务端缩图
 --insecure             HTTPS 跳过证书校验
 --watch                常驻等待，空闲到点自动全屏
+--hotkey <组合键>      立刻开始的全局热键，默认 Ctrl+Alt+P
+--no-hotkey            停用全局热键
 --now                  立刻全屏，不等空闲
 --idle <分钟>          空闲多久触发，默认 5
 --mouse-only           只把鼠标算作活动
