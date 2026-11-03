@@ -82,7 +82,7 @@ fn main() {
     }
 
     let cache = if cfg.cache_dir_explicit && !cfg.cache_dir_auto {
-        match Cache::open(&cfg.cache_dir, cfg.cache_days) {
+        match Cache::open(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("{err}");
@@ -90,7 +90,7 @@ fn main() {
             }
         }
     } else {
-        Cache::auto(&cfg.cache_dir, cfg.cache_days)
+        Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming)
     };
     cache.prune();
 
@@ -111,7 +111,11 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", "),
         if cache.is_disk() {
-            cache.dir.display().to_string()
+            format!(
+                "{}（{} 命名）",
+                cache.dir.display(),
+                cfg.cache_naming.as_str()
+            )
         } else {
             "内存（不落盘）".to_string()
         }

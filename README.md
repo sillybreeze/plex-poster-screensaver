@@ -14,7 +14,7 @@ Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮
 - **GPU 渲染**：D3D11 把缩放和双线性采样交给显卡，每帧 CPU 约 0.05 ms，帧率与 CPU 占用基本无关
 - **亚像素平滑**：硬件采样天然连续，不会出现「几帧不动、突然跳 1 像素」的卡顿
 - **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡
-- **本地缓存**：按 `ratingKey` 命名，兼容旧版按标题命名的文件，过期自动清理
+- **本地缓存**：按「标题_编号」命名，一眼认得出片子又不会重名；兼容旧版的标题名和纯编号命名，过期自动清理
 - **常驻等待**：`--watch` 启动后不占屏，空闲到点自动全屏，动一下鼠标/键盘立刻收起，循环往复
 
 ## 快速开始
@@ -110,6 +110,7 @@ cp config.example.json config.json
   "display_seconds": 10,
   "fade_seconds": 1.2,
   "cache_dir": "covers",
+  "cache_naming": "title",
   "cache_days": 30,
   "ken_burns": true,
   "motion_fps": 30
@@ -119,6 +120,23 @@ cp config.example.json config.json
 也可以用环境变量 `PLEX_URL` / `PLEX_TOKEN`，避免把 Token 写进文件。
 
 `config.json` 放在 exe 同目录会被自动读取；也可以用 `--config` 指定路径。
+
+### 缓存文件名
+
+默认 `阿凡达 水之道_1479.jpg`：前面是片名（去掉 `\ / : * ? " < > |` 这些 Windows 不允许的字符，
+连续空格压成一个，最长 60 字），后面的 `1479` 是 Plex 的 `ratingKey`，保证同名不同版本不会互相覆盖。
+
+`--cache-naming key` 换回纯编号的 `1479.jpg`（最短，但认不出是哪部）。
+
+换格式**不会重新下载**：命中旧命名时直接 `rename` 成当前格式。认识三种名字：
+
+| 名字 | 来源 |
+|---|---|
+| `阿凡达 水之道_1479.jpg` | 现在（`title`，默认） |
+| `1479.jpg` | 1.0 的纯 ratingKey（`key`） |
+| `阿凡达 水之道.jpg` | Python v3/v4 的纯标题 |
+
+`prune` 只删自己命名的前两种；Python 版留下的纯标题文件永远不动，要清得自己动手删。
 
 ## 命令行
 
@@ -131,6 +149,7 @@ cp config.example.json config.json
 --motion-fps <帧率>    Ken Burns 帧率
 --no-motion            关闭动效
 --cache-dir <目录>     封面缓存位置（auto = 自动挑选）
+--cache-naming <方式>  缓存文件名（title = 标题_编号，key = 纯编号）
 --cache-days <天>      缓存保留天数
 --no-transcode         不使用服务端缩图
 --insecure             HTTPS 跳过证书校验

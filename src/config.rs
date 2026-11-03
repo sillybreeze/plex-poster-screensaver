@@ -11,6 +11,33 @@ use serde::Deserialize;
 pub const APP_NAME: &str = "PlexPosterScreensaver";
 pub const DEFAULT_URL: &str = "http://127.0.0.1:32400";
 
+/// 封面缓存的文件名格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Naming {
+    /// `标题_1479.jpg`：一眼能认出来，靠 ratingKey 保证不会互相覆盖
+    #[default]
+    Title,
+    /// `1479.jpg`：只按 ratingKey，名字最短
+    Key,
+}
+
+impl Naming {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "title" | "标题" => Some(Self::Title),
+            "key" | "id" | "编号" => Some(Self::Key),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Key => "key",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub url: String,
@@ -19,6 +46,8 @@ pub struct Config {
     pub display_seconds: f64,
     pub fade_seconds: f64,
     pub cache_dir: PathBuf,
+    /// 缓存文件用哪种命名
+    pub cache_naming: Naming,
     /// cache_dir 是配置文件/命令行显式给的（不是默认值）
     pub cache_dir_explicit: bool,
     /// 显式要求自动挑选（--cache-dir auto）
@@ -46,6 +75,7 @@ impl Default for Config {
             display_seconds: 10.0,
             fade_seconds: 1.2,
             cache_dir: app_dir().join("covers"),
+            cache_naming: Naming::default(),
             cache_dir_explicit: false,
             cache_dir_auto: false,
             cache_days: 30,
@@ -92,6 +122,7 @@ pub struct Args {
     pub no_transcode: bool,
     pub insecure: bool,
     pub cache_dir: Option<String>,
+    pub cache_naming: Option<Naming>,
     pub cache_days: Option<i64>,
     pub config: Option<String>,
     pub self_test: Option<usize>,
@@ -121,6 +152,7 @@ plex-poster-screensaver (Rust)
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
   --cache-days <天数>   缓存保留天数，默认 30
+  --cache-naming <方式> 缓存文件名：title=标题_编号（默认），key=只留编号
   --no-transcode        不使用服务端缩图
   --insecure            HTTPS 跳过证书校验
   --preview             以 1280x720 窗口预览
@@ -153,6 +185,11 @@ pub fn parse_args() -> Result<Args, String> {
             "--insecure" => args.insecure = true,
             "--cache-dir" => args.cache_dir = Some(value("--cache-dir")?),
             "--cache-days" => args.cache_days = Some(parse_num(&value("--cache-days")?)?),
+            "--cache-naming" => {
+                let raw = value("--cache-naming")?;
+                args.cache_naming =
+                    Some(Naming::parse(&raw).ok_or_else(|| format!("无效的命名方式: {raw}（title|key）"))?);
+            }
             "--config" => args.config = Some(value("--config")?),
             "--watch" => args.watch = true,
             "--idle" => args.idle = Some(parse_num(&value("--idle")?)?),
@@ -179,6 +216,7 @@ struct FileConfig {
     display_seconds: Option<f64>,
     fade_seconds: Option<f64>,
     cache_dir: Option<String>,
+    cache_naming: Option<String>,
     cache_days: Option<i64>,
     verify_tls: Option<bool>,
     transcode: Option<bool>,
@@ -233,6 +271,12 @@ pub fn load(args: &Args) -> Config {
                         } else {
                             cfg.cache_dir_explicit = true;
                             cfg.cache_dir = PathBuf::from(v);
+                        }
+                    }
+                    if let Some(v) = &file.cache_naming {
+                        match Naming::parse(v) {
+                            Some(n) => cfg.cache_naming = n,
+                            None => eprintln!("config.json 里的 cache_naming 无效（title|key）: {v}"),
                         }
                     }
                     if let Some(v) = file.cache_days {
@@ -317,6 +361,9 @@ pub fn load(args: &Args) -> Config {
             cfg.cache_dir_explicit = true;
             cfg.cache_dir = PathBuf::from(v);
         }
+    }
+    if let Some(n) = args.cache_naming {
+        cfg.cache_naming = n;
     }
     if let Some(v) = args.cache_days {
         cfg.cache_days = v.max(0);

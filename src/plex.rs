@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::config::Config;
+use crate::config::{Config, Naming};
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -165,9 +165,10 @@ impl Client {
     }
 }
 
-/// 按 ratingKey 命名的封面缓存，兼容旧版按标题命名的文件。
+/// 封面缓存。默认按「标题_ratingKey」命名，同时认旧版的纯标题和纯 ratingKey 命名。
 pub struct Cache {
     pub dir: PathBuf,
+    naming: Naming,
     max_age: Option<Duration>,
     pub hits: u64,
     pub misses: u64,
@@ -175,7 +176,7 @@ pub struct Cache {
 
 impl Cache {
     /// 严格模式：配置/命令行显式指定的目录，写不进去就报错，绝不偷偷换地方。
-    pub fn open(dir: &Path, days: i64) -> Result<Self, String> {
+    pub fn open(dir: &Path, days: i64, naming: Naming) -> Result<Self, String> {
         if !writable(dir) {
             return Err(format!(
                 "缓存目录不可写: {}
@@ -189,11 +190,11 @@ impl Cache {
                 dir.display()
             ));
         }
-        Ok(Self::at(dir, days))
+        Ok(Self::at(dir, days, naming))
     }
 
     /// 自动模式：配置目录 -> exe 同目录 -> %LOCALAPPDATA% -> 纯内存
-    pub fn auto(preferred: &Path, days: i64) -> Self {
+    pub fn auto(preferred: &Path, days: i64, naming: Naming) -> Self {
         let candidates = [
             preferred.to_path_buf(),
             crate::config::exe_dir().join("cache"),
@@ -208,21 +209,23 @@ impl Cache {
                         candidate.display()
                     );
                 }
-                return Self::at(&candidate, days);
+                return Self::at(&candidate, days, naming);
             }
         }
         eprintln!("提示: 没有可写的缓存目录，改用内存缓存（显示正常，重启后会重新下载）");
         Self {
             dir: PathBuf::new(),
+            naming,
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
         }
     }
 
-    fn at(dir: &Path, days: i64) -> Self {
+    fn at(dir: &Path, days: i64, naming: Naming) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            naming,
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
@@ -234,52 +237,72 @@ impl Cache {
         !self.dir.as_os_str().is_empty()
     }
 
+    /// 新建缓存时用的文件名。
     pub fn path_for(&self, item: &MediaItem) -> PathBuf {
-        let key: String = item
-            .rating_key
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        let name = if key.is_empty() {
-            format!("h{:x}", fnv1a(item.thumb.as_bytes()))
-        } else {
-            key
-        };
-        self.dir.join(format!("{name}.jpg"))
+        self.dir.join(format!("{}.jpg", self.preferred_stem(item)))
     }
 
-    /// 旧版 v3/v4 用「标题.jpg」命名，命中就改名成 ratingKey，避免重复下载。
-    fn legacy_path(&self, item: &MediaItem) -> Option<PathBuf> {
-        let safe: String = item
-            .title
-            .chars()
-            .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_'))
-            .collect();
-        let safe = safe.trim_end();
-        if safe.is_empty() {
-            return None;
+    fn preferred_stem(&self, item: &MediaItem) -> String {
+        let key = key_stem(item);
+        match self.naming {
+            Naming::Key => key,
+            Naming::Title => {
+                let title = sanitize_title(&item.title, MAX_TITLE_CHARS);
+                if title.is_empty() {
+                    key
+                } else {
+                    titled(&title, &key)
+                }
+            }
         }
-        Some(self.dir.join(format!("{safe}.jpg")))
+    }
+
+    /// 查找顺序：当前格式 -> 另一种新格式 -> 旧版纯标题 -> 旧版纯 ratingKey。
+    fn candidates(&self, item: &MediaItem) -> Vec<PathBuf> {
+        let key = key_stem(item);
+        let new_title = sanitize_title(&item.title, MAX_TITLE_CHARS);
+        let old_title = legacy_title_stem(&item.title);
+
+        let mut stems: Vec<String> = Vec::new();
+        match self.naming {
+            Naming::Title => {
+                push_stem(&mut stems, titled(&new_title, &key));
+                push_stem(&mut stems, titled(&old_title, &key));
+                push_stem(&mut stems, key.clone());
+                push_stem(&mut stems, old_title);
+            }
+            Naming::Key => {
+                push_stem(&mut stems, key.clone());
+                push_stem(&mut stems, titled(&new_title, &key));
+                push_stem(&mut stems, titled(&old_title, &key));
+                push_stem(&mut stems, old_title);
+            }
+        }
+        stems
+            .into_iter()
+            .map(|stem| self.dir.join(format!("{stem}.jpg")))
+            .collect()
     }
 
     pub fn get(&mut self, item: &MediaItem) -> Option<PathBuf> {
         if !self.is_disk() {
             return None;
         }
-        let path = self.path_for(item);
-        if is_usable(&path) {
+        let wanted = self.path_for(item);
+        if is_usable(&wanted) {
             self.hits += 1;
-            return Some(path);
+            return Some(wanted);
         }
-        if let Some(legacy) = self.legacy_path(item) {
-            if is_usable(&legacy) {
-                if fs::rename(&legacy, &path).is_ok() {
-                    self.hits += 1;
-                    return Some(path);
-                }
-                self.hits += 1;
-                return Some(legacy);
+        for candidate in self.candidates(item) {
+            if candidate == wanted || !is_usable(&candidate) {
+                continue;
             }
+            // 命中旧命名顺手改成当前格式，下次就不用再找
+            self.hits += 1;
+            if fs::rename(&candidate, &wanted).is_ok() {
+                return Some(wanted);
+            }
+            return Some(candidate);
         }
         None
     }
@@ -302,7 +325,8 @@ impl Cache {
         Some(path)
     }
 
-    /// 只清理本程序按 ratingKey 命名的文件，旧版标题命名的留给用户。
+    /// 只清理本程序自己命名的文件（纯 ratingKey、标题_ratingKey、哈希兜底），
+    /// 旧版 Python 留下的纯标题文件一律不动。
     pub fn prune(&self) {
         if !self.is_disk() {
             return;
@@ -317,12 +341,12 @@ impl Cache {
             if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
                 continue;
             }
-            let is_rating_key = path
+            let ours = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .map(is_ours_stem)
                 .unwrap_or(false);
-            if !is_rating_key {
+            if !ours {
                 continue;
             }
             if let Ok(meta) = path.metadata() {
@@ -371,6 +395,101 @@ fn is_usable(path: &Path) -> bool {
     path.metadata().map(|m| m.len() > 0).unwrap_or(false)
 }
 
+/// 标题部分最多保留多少字符，免得超长片名撑爆 Windows 的 260 字节路径。
+const MAX_TITLE_CHARS: usize = 60;
+
+/// `标题_编号`；标题为空就退化成纯编号。
+fn titled(title: &str, key: &str) -> String {
+    if title.is_empty() {
+        String::new()
+    } else {
+        format!("{title}_{key}")
+    }
+}
+
+/// ratingKey 规范化成文件名片段；实在拿不到就退回 thumb 的哈希。
+fn key_stem(item: &MediaItem) -> String {
+    let key: String = item
+        .rating_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if key.is_empty() {
+        format!("h{:x}", fnv1a(item.thumb.as_bytes()))
+    } else {
+        key
+    }
+}
+
+/// 标题清洗：去掉 Windows 不允许的字符（`\ / : * ? " < > |`）和控制字符，
+/// 连续空格压成一个，砍掉首尾的空格和点（结尾带点/空格的文件名 Windows 不接受），并限长。
+fn sanitize_title(title: &str, max_chars: usize) -> String {
+    const FORBIDDEN: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let mut last_space = false;
+    for ch in title.chars() {
+        if kept >= max_chars {
+            break;
+        }
+        if ch.is_control() || FORBIDDEN.contains(&ch) {
+            continue;
+        }
+        // 全角空格也当空格处理，免得和 ASCII 空格混在一起
+        let ch = if ch == '\u{3000}' { ' ' } else { ch };
+        if ch == ' ' {
+            if last_space || out.is_empty() {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        out.push(ch);
+        kept += 1;
+    }
+    out.trim_end_matches([' ', '.']).to_string()
+}
+
+/// 旧版 v3/v4 用的标题规则（只留字母数字和空格、点、下划线），用来找老文件。
+fn legacy_title_stem(title: &str) -> String {
+    let safe: String = title
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_'))
+        .collect();
+    safe.trim_end().to_string()
+}
+
+fn push_stem(stems: &mut Vec<String>, stem: String) {
+    if !stem.is_empty() && !stems.contains(&stem) {
+        stems.push(stem);
+    }
+}
+
+fn is_all_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 是不是本程序生成的文件名，`prune` 只删这些。
+fn is_ours_stem(stem: &str) -> bool {
+    // 1.0：1479
+    if is_all_digits(stem) {
+        return true;
+    }
+    // 新版：标题_1479
+    if let Some((_, key)) = stem.rsplit_once('_') {
+        if is_all_digits(key) {
+            return true;
+        }
+    }
+    // ratingKey 为空时的兜底：h 加 fnv1a 十六进制
+    match stem.strip_prefix('h') {
+        Some(hex) => hex.len() >= 8 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -378,4 +497,131 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(key: &str, title: &str) -> MediaItem {
+        MediaItem {
+            rating_key: key.to_string(),
+            title: title.to_string(),
+            thumb: format!("/library/metadata/{key}/thumb/1712345678"),
+        }
+    }
+
+    #[test]
+    fn title_is_cleaned_for_windows() {
+        assert_eq!(sanitize_title("阿凡达: 水之道", 60), "阿凡达 水之道");
+        assert_eq!(sanitize_title("A/B\\C*D?E\"F<G>H|I", 60), "ABCDEFGHI");
+        assert_eq!(sanitize_title("  结局.  ", 60), "结局");
+        assert_eq!(sanitize_title("甲    乙", 60), "甲 乙");
+        assert_eq!(sanitize_title("", 60), "");
+        assert_eq!(sanitize_title("...", 60), "");
+    }
+
+    #[test]
+    fn long_title_is_capped() {
+        let name = sanitize_title(&"阿".repeat(200), MAX_TITLE_CHARS);
+        assert_eq!(name.chars().count(), MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn stems_follow_naming() {
+        let dir = Path::new("C:/tmp");
+        let by_title = Cache::at(dir, 30, Naming::Title);
+        let by_key = Cache::at(dir, 30, Naming::Key);
+        let it = item("1479", "阿凡达: 水之道");
+
+        assert_eq!(by_title.preferred_stem(&it), "阿凡达 水之道_1479");
+        assert_eq!(by_key.preferred_stem(&it), "1479");
+        assert_eq!(
+            by_title.path_for(&it),
+            PathBuf::from("C:/tmp").join("阿凡达 水之道_1479.jpg")
+        );
+    }
+
+    #[test]
+    fn empty_title_falls_back_to_key() {
+        let cache = Cache::at(Path::new("C:/tmp"), 30, Naming::Title);
+        assert_eq!(cache.preferred_stem(&item("1479", "")), "1479");
+        assert_eq!(cache.preferred_stem(&item("1479", "...")), "1479");
+    }
+
+    #[test]
+    fn candidates_cover_both_legacy_names() {
+        let cache = Cache::at(Path::new("C:/tmp"), 30, Naming::Title);
+        let names: Vec<String> = cache
+            .candidates(&item("1479", "阿凡达: 水之道"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(names[0], "阿凡达 水之道_1479.jpg");
+        assert!(names.contains(&"1479.jpg".to_string()));
+        assert!(names.contains(&"阿凡达 水之道.jpg".to_string()));
+
+        let mut deduped = names.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), names.len(), "候选项不该重复: {names:?}");
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("cache-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn old_key_named_file_is_renamed() {
+        let dir = scratch_dir("key");
+        fs::write(dir.join("1479.jpg"), b"x").unwrap();
+
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        let got = cache.get(&item("1479", "阿凡达")).unwrap();
+
+        assert_eq!(got.file_name().unwrap(), "阿凡达_1479.jpg");
+        assert!(dir.join("阿凡达_1479.jpg").is_file());
+        assert!(!dir.join("1479.jpg").exists());
+        assert_eq!(cache.hits, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_title_named_file_is_renamed() {
+        let dir = scratch_dir("title");
+        fs::write(dir.join("阿凡达 水之道.jpg"), b"x").unwrap();
+
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        let got = cache.get(&item("1479", "阿凡达: 水之道")).unwrap();
+
+        assert_eq!(got.file_name().unwrap(), "阿凡达 水之道_1479.jpg");
+        assert!(!dir.join("阿凡达 水之道.jpg").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_file_is_a_miss() {
+        let dir = scratch_dir("miss");
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        assert!(cache.get(&item("1479", "阿凡达")).is_none());
+        assert_eq!(cache.hits, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_only_touches_our_files() {
+        assert!(is_ours_stem("1479"));
+        assert!(is_ours_stem("阿凡达 水之道_1479"));
+        assert!(is_ours_stem("h1a2b3c4d5e6f7a8b"));
+        assert!(!is_ours_stem("蓝色巴士法国足球队罢练事件簿"));
+        assert!(!is_ours_stem("Inception"));
+    }
 }

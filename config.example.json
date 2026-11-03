@@ -5,6 +5,7 @@
   "display_seconds": 10,
   "fade_seconds": 1.2,
   "cache_dir": "covers",
+  "cache_naming": "title",
   "cache_days": 30,
   "verify_tls": true,
   "transcode": true,
