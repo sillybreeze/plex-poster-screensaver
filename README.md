@@ -5,6 +5,8 @@ Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮
 
 > Windows screensaver that displays your Plex movie and TV posters full-screen, with ambient color glow and Ken Burns motion.
 
+[![Release](https://img.shields.io/github/v/release/sillybreeze/plex-poster-screensaver?label=release)](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest)
+
 ![截图](docs/screenshot.png)
 
 ## 特性
@@ -18,6 +20,12 @@ Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮
 - **离线播放**：缓存目录里的 `index.json` 记录媒体信息，Plex 未启动或断网时继续用已有封面轮播，后台每 30 秒重连一次
 - **常驻等待**：`--watch` 启动后不占屏，空闲到点自动全屏，动一下鼠标/键盘立刻收起，循环往复
 - **分辨率跟随**：窗口/显示器尺寸变化时重建交换链、合成尺寸和预取线程，不会拿旧尺寸的画面去套新纹理
+
+## 下载
+
+不想自己编译的话，直接到 [Releases](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest)
+下载 `plex-poster-screensaver-vX.Y.Z-windows-x64.exe`。它是 GitHub Actions 在 Windows 上自动构建的，
+未做代码签名，首次运行时 Windows SmartScreen 可能会提示，选择“仍要运行”即可。
 
 ## 快速开始
 

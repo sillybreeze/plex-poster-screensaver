@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, for example v1.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.version }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          $asset = "plex-poster-screensaver-$tag-windows-x64.exe"
+          Copy-Item "target/release/plex-poster-screensaver.exe" $asset
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_TAG=$tag"
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_NAME=$asset"
+          Write-Host "Packaged $asset"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plex-poster-screensaver-windows-x64
+          path: plex-poster-screensaver-*-windows-x64.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Plex 海报屏保 ${{ env.RELEASE_TAG }}
+          files: ${{ env.ASSET_NAME }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
