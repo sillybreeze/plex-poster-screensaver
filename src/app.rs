@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HANDLE;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -118,6 +119,11 @@ enum Phase {
     },
 }
 
+/// 事件循环的自定义事件：外部（再启动一次 exe）要求立刻开始。
+pub enum UserEvent {
+    StartNow,
+}
+
 /// 常驻等待状态：窗口先藏着，空闲到点才全屏。
 struct Watch {
     threshold: Duration,
@@ -200,14 +206,24 @@ impl App {
         }
     }
 
-    pub fn run(mut self) -> Result<(), String> {
+    pub fn run(mut self, trigger: Option<HANDLE>) -> Result<(), String> {
         if let Some(w) = &self.watch {
             println!(
-                "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起",
+                "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起；想立刻看就再启动一次",
                 w.threshold.as_secs_f64()
             );
         }
-        let event_loop = EventLoop::new().map_err(|e| format!("创建事件循环失败: {e}"))?;
+        let event_loop = EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .map_err(|e| format!("创建事件循环失败: {e}"))?;
+
+        if let Some(event) = trigger {
+            let proxy = event_loop.create_proxy();
+            crate::trigger::listen(event, move || {
+                let _ = proxy.send_event(UserEvent::StartNow);
+            });
+        }
+
         event_loop
             .run_app(&mut self)
             .map_err(|e| format!("事件循环异常: {e}"))
@@ -240,6 +256,17 @@ impl App {
                 false
             }
         }
+    }
+
+    /// 外部要求立刻开始（又启动了一次 exe）。只有常驻模式需要响应。
+    fn start_now(&mut self, event_loop: &ActiveEventLoop) {
+        match self.watch.as_ref().map(|w| w.showing) {
+            None => return,        // --now 或普通模式，本来就在全屏
+            Some(true) => return,  // 已经在放了
+            Some(false) => {}
+        }
+        eprintln!("收到启动请求，立刻开始");
+        self.show_screensaver(event_loop, Instant::now());
     }
 
     /// 空闲到点：把隐藏的窗口全屏显示出来。
@@ -278,7 +305,6 @@ impl App {
             w.showing = true;
             w.dismiss_tick = idle::last_input_tick();
         }
-        eprintln!("空闲 {:.0} 秒，开始屏保", self.cfg.idle_seconds);
     }
 
     /// 有人动了：收起屏保，回到常驻等待。
@@ -499,7 +525,13 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::StartNow => self.start_now(event_loop),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -613,6 +645,7 @@ impl ApplicationHandler for App {
                     );
                 }
                 if idle >= w.threshold {
+                    eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
                     start = true;
                 }
             }

@@ -34,6 +34,7 @@ mod timer {
 mod idle;
 mod plex;
 mod render;
+mod trigger;
 
 use std::path::Path;
 use std::time::Instant;
@@ -42,6 +43,13 @@ use config::{Args, Config};
 use plex::{Cache, Client, Section};
 
 fn main() {
+    // 已经有实例在跑就只叫它一声，不再开第二个窗口
+    if trigger::signal_existing() {
+        println!("已经有一个实例在跑，已通知它立刻开始");
+        return;
+    }
+    let trigger_event = trigger::create();
+
     timer::begin();
     let args = match config::parse_args() {
         Ok(a) => a,
@@ -122,7 +130,7 @@ fn main() {
     );
 
     let app = app::App::new(cfg, args.preview, client, cache, selected);
-    let result = app.run();
+    let result = app.run(trigger_event);
     timer::end();
     if let Err(err) = result {
         eprintln!("{err}");

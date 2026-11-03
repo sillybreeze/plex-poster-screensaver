@@ -57,6 +57,7 @@ cargo build --release
 | `--watch` | 开启常驻等待 |
 | `--idle <分钟>` | 空闲多久触发，默认 5；可写小数（`0.1` = 6 秒），最小 5 秒 |
 | `--mouse-only` | 只把鼠标当活动，键盘不算 |
+| `--now` | 不等空闲，立刻全屏（覆盖配置里的 `watch`） |
 
 也可以固化在 `config.json` 里，启动时不用带参数：
 
@@ -65,6 +66,28 @@ cargo build --release
 "idle_minutes": 5,
 "mouse_only": false
 ```
+
+### 想立刻开始
+
+不用改配置，两种方式：
+
+**再启动一次。** 常驻模式是单实例的：已经有一个在跑时，新启动的那个只会把「立刻开始」的信号
+递过去然后自己退出，不会开第二个窗口。所以双击同一个快捷方式就等于「现在就开始」。
+
+```powershell
+# 平时挂着
+.\target\release\plex-poster-screensaver.exe --config config.json --watch
+
+# 想看了，再跑一次同样的命令（或双击快捷方式）
+```
+
+**`--now`。** 完全不走等待，直接全屏，适合单独做个「立刻播放」的快捷方式：
+
+```powershell
+.\target\release\plex-poster-screensaver.exe --config config.json --now
+```
+
+两者都受「动鼠标/按键就收起」约束，收起后 `--watch` 那个继续等下一轮，`--now` 那个直接退出。
 
 ### 判定口径
 
@@ -154,6 +177,7 @@ cp config.example.json config.json
 --no-transcode         不使用服务端缩图
 --insecure             HTTPS 跳过证书校验
 --watch                常驻等待，空闲到点自动全屏
+--now                  立刻全屏，不等空闲
 --idle <分钟>          空闲多久触发，默认 5
 --mouse-only           只把鼠标算作活动
 --preview              1280x720 窗口预览
@@ -173,6 +197,7 @@ src/
 ├── render.rs   图像管线：缩放、氛围光、Ken Burns 采样
 ├── gpu.rs      D3D11：纹理上传、着色器、交换链
 ├── idle.rs     空闲检测：GetLastInputInfo / 纯鼠标轮询
+├── trigger.rs  单实例信令：再启动一次就通知已经跑着的实例
 └── app.rs      winit 窗口、事件循环、动效调度、常驻等待
 ```
 

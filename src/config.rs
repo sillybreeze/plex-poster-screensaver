@@ -128,6 +128,7 @@ pub struct Args {
     pub self_test: Option<usize>,
     pub snapshot: Option<String>,
     pub watch: bool,
+    pub now: bool,
     pub idle: Option<f64>,
     pub mouse_only: bool,
     pub verbose: bool,
@@ -157,6 +158,7 @@ plex-poster-screensaver (Rust)
   --insecure            HTTPS 跳过证书校验
   --preview             以 1280x720 窗口预览
   --watch               常驻等待：空闲到点后自动全屏，有输入就收起
+  --now                 立刻全屏，不等空闲（覆盖配置里的 watch）
   --idle <分钟>         空闲多久触发，默认 5（可写小数，如 0.1 = 6 秒）
   --mouse-only          只把鼠标当活动，键盘不算（默认和系统屏保一致：键鼠都算）
   --self-test <N>       无界面自检 N 张后退出
@@ -192,6 +194,7 @@ pub fn parse_args() -> Result<Args, String> {
             }
             "--config" => args.config = Some(value("--config")?),
             "--watch" => args.watch = true,
+            "--now" => args.now = true,
             "--idle" => args.idle = Some(parse_num(&value("--idle")?)?),
             "--mouse-only" => args.mouse_only = true,
             "--self-test" => args.self_test = Some(parse_num(&value("--self-test")?)?),
@@ -341,6 +344,9 @@ pub fn load(args: &Args) -> Config {
     }
     if args.watch {
         cfg.watch = true;
+    }
+    if args.now {
+        cfg.watch = false;
     }
     if args.mouse_only {
         cfg.mouse_only = true;
