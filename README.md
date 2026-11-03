@@ -1,7 +1,6 @@
 # plex-poster-screensaver
 
-Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮播，自动提取画面主色做氛围光，
-并带缓慢推近的 Ken Burns 动效。Rust + D3D11 实现。
+Plex 海报屏保：从媒体库随机取电影/剧集海报全屏轮播，自动提取主色做氛围光，并带 Ken Burns 轻动效。Rust + D3D11 实现。
 
 > Windows screensaver that displays your Plex movie and TV posters full-screen, with ambient color glow and Ken Burns motion.
 
@@ -11,144 +10,67 @@ Plex 海报屏保 —— 从 Plex 媒体库随机取电影/剧集海报全屏轮
 
 ## 特性
 
-- **取色氛围光**：按「占比 × 鲜艳度 × 亮度」从海报里挑主色，生成竖向渐变 + 模糊纹理 + 暗角，黑底海报也不会变成一片黑
-- **Ken Burns 轻动效**：10 秒内推近 3.5% 并轻微漂移，方向逐张轮换；海报铺满屏幕高度，上下不留黑边
-- **GPU 渲染**：D3D11 把缩放和双线性采样交给显卡，每帧 CPU 约 0.05 ms，帧率与 CPU 占用基本无关
-- **亚像素平滑**：硬件采样天然连续，不会出现「几帧不动、突然跳 1 像素」的卡顿
+- **氛围光 + Ken Burns**：按主色生成渐变、模糊纹理和暗角；10 秒缓慢推近 3.5%
+- **D3D11 渲染**：缩放和双线性采样交给 GPU，每帧 CPU 约 0.05 ms
 - **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡
-- **本地缓存**：按「标题_编号」命名，一眼认得出片子又不会重名；兼容旧版的标题名和纯编号命名，过期自动清理
-- **离线播放**：缓存目录里的 `index.json` 记录媒体信息，Plex 未启动或断网时继续用已有封面轮播，后台每 30 秒重连一次
-- **常驻等待**：`--watch` 启动后不占屏，空闲到点自动全屏，动一下鼠标/键盘立刻收起，循环往复
-- **分辨率跟随**：窗口/显示器尺寸变化时重建交换链、合成尺寸和预取线程，不会拿旧尺寸的画面去套新纹理
+- **本地缓存 + 离线播放**：`index.json` 记录媒体信息，Plex 断网时继续轮播，并每 30 秒后台重连
+- **常驻等待**：`--watch` 隐藏等待，空闲到点全屏，有输入立刻收起
+- **尺寸跟随**：分辨率变化时重建交换链、合成尺寸和预取线程
 
 ## 下载
 
-不想自己编译的话，直接到 [Releases](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest)
-下载 `plex-poster-screensaver-vX.Y.Z-windows-x64.exe`。它是 GitHub Actions 在 Windows 上自动构建的，
-未做代码签名，首次运行时 Windows SmartScreen 可能会提示，选择“仍要运行”即可。
+[Releases](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest) 提供 GitHub Actions 自动构建的 Windows x64 exe：
+
+`plex-poster-screensaver-vX.Y.Z-windows-x64.exe`
+
+未做代码签名，首次运行 Windows SmartScreen 可能提示，选择“仍要运行”即可。
 
 ## 快速开始
 
-需要 Rust 1.75+ 和 Windows 10/11。
+需要 Windows 10/11 和 Rust 1.75+。先按下方[配置](#配置)准备好项目根目录的 `config.json`，然后：
 
-```bash
+```powershell
 cargo build --release
-# 产物：target/release/plex-poster-screensaver.exe
+.\target\release\plex-poster-screensaver.exe --config config.json --list
+.\target\release\plex-poster-screensaver.exe --config config.json --preview --display 3
 ```
 
-```powershell
-# 首次运行会提示选择媒体库（回车 = 全部）
-.\target\release\plex-poster-screensaver.exe
+`--self-test 5` 无界面取 5 张并打印耗时；`--snapshot out.png` 导出当前合成结果；两者同样要带 `--config config.json`。
 
-# 列出媒体库编号
-.\target\release\plex-poster-screensaver.exe --list
-
-# 窗口预览，方便调试（鼠标移动不会退出）
-.\target\release\plex-poster-screensaver.exe --preview --display 3
-
-# 无界面自检：取 5 张并打印耗时
-.\target\release\plex-poster-screensaver.exe --self-test 5
-
-# 导出当前合成结果
-.\target\release\plex-poster-screensaver.exe --snapshot out.png
-```
-
-## 常驻等待模式（不写注册表）
-
-不想走 Windows 那套 `.scr` 屏保（要往注册表写 `SCRNSAVE.EXE`）就用这个：
-程序跑起来后只是藏着等，**空闲到点自动全屏**，动鼠标或按键立刻收起，然后继续等。
+## 常驻等待
 
 ```powershell
 .\target\release\plex-poster-screensaver.exe --config config.json --watch
 ```
 
-| 参数 | 说明 |
-|---|---|
-| `--watch` | 开启常驻等待 |
-| `--idle <分钟>` | 空闲多久触发，默认 5；可写小数（`0.1` = 6 秒），最小 5 秒 |
-| `--mouse-only` | 只把鼠标当活动，键盘不算 |
-| `--hotkey <组合键>` | 立刻开始的全局热键，默认 `Ctrl+Alt+P` |
-| `--no-hotkey` | 停用全局热键 |
-| `--now` | 不等空闲，立刻全屏（覆盖配置里的 `watch`） |
+- `--idle <分钟>`：空闲多久触发，默认 5；可写小数（`0.1` = 6 秒），最小 5 秒
+- `--mouse-only`：只把鼠标算活动；默认键盘也算
+- `--hotkey <组合键>`：立刻全屏，默认 `Ctrl+Alt+P`；`--no-hotkey` 关闭
+- `--now`：不等空闲，立刻全屏
+- 再启动一次 exe 会通知已运行的实例立刻开始（单实例）
+- 热键/再启动拉起后的前 1.2 秒是宽限期，用来吞掉按键松开产生的输入
 
-也可以固化在 `config.json` 里，启动时不用带参数：
+没触发时窗口隐藏、不渲染、不 `Present`，D3D11 设备等第一次触发才创建。
 
-```json
-"watch": true,
-"idle_minutes": 5,
-"mouse_only": false,
-"hotkey": "Ctrl+Alt+P"
-```
-
-### 想立刻开始
-
-三种方式，都不用改配置。
-
-**按热键。** 常驻时会注册一个全局热键，默认 `Ctrl+Alt+P`，任何程序在最前面时按一下都能立刻全屏：
-
-```powershell
---hotkey "Ctrl+Shift+F9"   # 换个不冲突的组合
---no-hotkey                # 不要热键
-```
-
-支持 `Ctrl` / `Alt` / `Shift` / `Win` 加单个按键：字母、数字、`F1`~`F24`、`Space`、`Tab`、
-`Enter`、`Esc`、方向键等。被别的程序先占了会打印一行提示，其它触发方式照常工作。
-
-热键的**按下和松开都算一次系统输入**，所以手动拉起后的头 1.2 秒里，输入会被忽略掉
-（不然松开按键那一下就会把自己关掉）。这 1.2 秒之后，动鼠标或按键照样立刻收起。
-
-**再启动一次。** 常驻模式是单实例的：已经有一个在跑时，新启动的那个只会把「立刻开始」的信号
-递过去然后自己退出，不会开第二个窗口。所以双击同一个快捷方式就等于「现在就开始」。
-
-```powershell
-# 平时挂着
-.\target\release\plex-poster-screensaver.exe --config config.json --watch
-
-# 想看了，再跑一次同样的命令（或双击快捷方式）
-```
-
-**`--now`。** 完全不走等待，直接全屏，适合单独做个「立刻播放」的快捷方式：
-
-```powershell
-.\target\release\plex-poster-screensaver.exe --config config.json --now
-```
-
-两者都受「动鼠标/按键就收起」约束，收起后 `--watch` 那个继续等下一轮，`--now` 那个直接退出。
-
-### 判定口径
-
-默认走 Windows 的 `GetLastInputInfo`，**键盘和鼠标都算活动**，和系统屏保、自动锁屏是同一个标准。
-
-`--mouse-only` 换成轮询鼠标位置和左/右/中键，键盘完全不计入。代价是：你连着打字五分钟，
-屏保也会弹出来（弹出来会被下一次按键立刻收掉）。
-
-不管哪种模式，**收起屏保的条件都是"有任何输入"**——鼠标动、点击、按键都算，不然全屏之后就退不出来了。
-
-### 空闲时不干活
-
-没触发的时候窗口是隐藏的、不渲染、不 `Present`，每 500ms 只读一次时间戳；
-D3D11 设备和纹理也要等第一次触发才创建。所以常驻一整天基本是零 CPU。
-
-### 开机自启（用启动文件夹，不碰注册表）
+### 开机自启
 
 ```powershell
 $startup = [Environment]::GetFolderPath('Startup')
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut("$startup\Plex 海报屏保.lnk")
-$lnk.TargetPath = "D:\PROJECT\PJ2\target\release\plex-poster-screensaver.exe"
-$lnk.Arguments = '--config "D:\PROJECT\PJ2\config.json" --watch'
+$lnk.TargetPath = "D:\path\to\plex-poster-screensaver.exe"
+$lnk.Arguments = '--config "D:\path\to\config.json" --watch'
 $lnk.Save()
 ```
 
-`--config` 别省：exe 在 `target\release` 里，默认只会找**exe 同目录**和 `%LOCALAPPDATA%` 下的
-`config.json`，项目根目录那份它是看不到的。
+`--config` 建议显式指定：exe 默认只找同目录和 `%LOCALAPPDATA%` 下的 `config.json`。
 
 ## 配置
 
-优先级：命令行 > 环境变量 > `config.json` > 默认值。
+优先级：命令行 > 环境变量 > `config.json` > 默认值。可从示例复制一份，再填 `plex_url` 和 `plex_token`：
 
-```bash
-cp config.example.json config.json
+```powershell
+Copy-Item config.example.json config.json
 ```
 
 ```json
@@ -166,80 +88,29 @@ cp config.example.json config.json
 }
 ```
 
-也可以用环境变量 `PLEX_URL` / `PLEX_TOKEN`，避免把 Token 写进文件。
+`PLEX_URL` / `PLEX_TOKEN` 可替代配置里的地址和 Token。`cache_dir` 的相对路径按 **config.json 所在目录** 解析；命令行 `--cache-dir` 的相对路径按当前工作目录。显式 `--config` 读取或解析失败会直接报错。
 
-`config.json` 放在 exe 同目录会被自动读取；也可以用 `--config` 指定路径。
+**离线播放**：缓存目录的 `index.json` 记录 ratingKey、标题、thumb 和所属媒体库；断网时用缓存轮播，恢复后自动切回在线。旧版 `1479.jpg`、`标题_1479.jpg` 会自动扫描进索引；Plex 不可用且完全没有缓存时，常驻模式会保持后台等待。
 
-`cache_dir` 的相对路径以 **config.json 所在目录** 为基准解析（不是进程工作目录），所以开机自启
-从任何目录启动都会落到同一个缓存位置。显式 `--config` 读不到或 JSON 解析失败会直接报错退出，
-不会悄悄退回默认配置。
-
-### 离线播放
-
-缓存目录里会维护一份 `index.json`，记录每个封面对应的 `ratingKey`、标题和 `thumb`。启动时
-Plex 连不上不会一直卡在启动阶段：只要缓存里有图，就先离线轮播，同时每 30 秒在后台重连一次，
-恢复后自动切回在线随机取图。旧版本留下的 `1479.jpg`、`标题_1479.jpg` 也会在启动扫描时自动补进索引。
-离线队列同样遵守 `--library` / `config.libraries` 的筛选；索引里记录了每个条目所属的媒体库。
-如果缓存是空的，常驻模式会保持后台等待（不会退出），等 Plex 恢复、拿到第一张图后再触发。
-
-### 缓存文件名
-
-默认 `阿凡达 水之道_1479.jpg`：前面是片名（去掉 `\ / : * ? " < > |` 这些 Windows 不允许的字符，
-连续空格压成一个，最长 60 字），后面的 `1479` 是 Plex 的 `ratingKey`，保证同名不同版本不会互相覆盖。
-
-`--cache-naming key` 换回纯编号的 `1479.jpg`（最短，但认不出是哪部）。
-
-换格式**不会重新下载**：命中旧命名时直接 `rename` 成当前格式。认识三种名字：
-
-| 名字 | 来源 |
-|---|---|
-| `阿凡达 水之道_1479.jpg` | 现在（`title`，默认） |
-| `1479.jpg` | 1.0 的纯 ratingKey（`key`） |
-| `阿凡达 水之道.jpg` | Python v3/v4 的纯标题 |
-
-`prune` 只删自己命名的前两种；Python 版留下的纯标题文件永远不动，要清得自己动手删。
+**缓存文件名**：默认 `标题_ratingKey.jpg`（如 `阿凡达 水之道_1479.jpg`）；`--cache-naming key` 改为 `1479.jpg`。命中旧命名会直接改名，不重新下载。
 
 ## 命令行
 
-```
---config <文件>        指定配置文件
---list                 列出媒体库后退出
---library <编号或名称> 选择媒体库，可重复
---display <秒>         每张停留时间
---fade <秒>            淡入淡出时长，0 表示关闭
---motion-fps <帧率>    Ken Burns 帧率
---no-motion            关闭 Ken Burns 动效（轮播继续）
---cache-dir <目录>     封面缓存位置（auto = 自动挑选；相对路径按 CWD 解析）
---cache-naming <方式>  缓存文件名（title = 标题_编号，key = 纯编号）
---cache-days <天>      缓存保留天数
---no-transcode         不使用服务端缩图
---insecure             HTTPS 跳过证书校验
---watch                常驻等待，空闲到点自动全屏
---hotkey <组合键>      立刻开始的全局热键，默认 Ctrl+Alt+P
---no-hotkey            停用全局热键
---now                  立刻全屏，不等空闲
---idle <分钟>          空闲多久触发，默认 5
---mouse-only           只把鼠标算作活动
---preview              1280x720 窗口预览
---self-test <N>        无界面自检
---snapshot <png>       导出合成结果
-```
+`--help` 查看完整参数。常用：
 
-运行时按 ESC、点击鼠标或移动鼠标即可退出。
+| 参数 | 说明 |
+|---|---|
+| `--config <文件>` | 指定配置文件 |
+| `--library <编号/名称>` | 选择媒体库，可重复 |
+| `--display <秒>` / `--fade <秒>` | 停留时间 / 淡入淡出 |
+| `--no-motion` | 关闭 Ken Burns 动效（轮播继续） |
+| `--cache-dir <目录>` | 缓存位置，`auto` 自动挑选 |
+| `--cache-days <天>` | 缓存保留天数 |
+| `--watch` / `--now` | 常驻等待 / 立刻全屏 |
+| `--preview` | 1280x720 窗口预览 |
+| `--self-test <N>` / `--snapshot <png>` | 无界面自检 / 导出结果 |
 
-## 项目结构
-
-```
-src/
-├── main.rs     入口、CLI、list/self-test/snapshot
-├── config.rs   参数与 config.json 解析
-├── plex.rs     Plex 客户端 + 封面缓存
-├── render.rs   图像管线：缩放、氛围光、Ken Burns 采样
-├── gpu.rs      D3D11：纹理上传、着色器、交换链
-├── idle.rs     空闲检测：GetLastInputInfo / 纯鼠标轮询
-├── trigger.rs  单实例信令：再启动一次就通知已经跑着的实例
-└── app.rs      winit 窗口、事件循环、动效调度、常驻等待
-```
+普通全屏模式下按 ESC、点击或移动鼠标退出；`--preview` 不会因鼠标移动退出；`--watch` 有输入时收起并继续等待下一轮。
 
 ## 许可
 
