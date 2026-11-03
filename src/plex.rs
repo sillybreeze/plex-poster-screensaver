@@ -359,8 +359,25 @@ impl Cache {
             .iter_mut()
             .find(|i| i.rating_key == item.rating_key)
         {
-            if existing.title != item.title || existing.thumb != item.thumb {
-                *existing = item.clone();
+            // 旧索引没有媒体库字段；在线播放命中缓存时也要把空字段补齐。
+            // 反过来，扫描旧文件得到的条目字段是空的，不能拿它覆盖已有元数据。
+            let section_changed = (!item.section_key.is_empty()
+                && existing.section_key != item.section_key)
+                || (!item.section_title.is_empty()
+                    && existing.section_title != item.section_title);
+            if existing.title != item.title
+                || existing.thumb != item.thumb
+                || section_changed
+            {
+                existing.title = item.title.clone();
+                existing.thumb = item.thumb.clone();
+                // 空媒体库字段不覆盖已有值，避免扫描旧文件时把元数据冲掉。
+                if !item.section_key.is_empty() {
+                    existing.section_key = item.section_key.clone();
+                }
+                if !item.section_title.is_empty() {
+                    existing.section_title = item.section_title.clone();
+                }
                 self.save_index();
             }
             return;
@@ -994,6 +1011,55 @@ mod tests {
         assert!(reloaded
             .offline_items(&["不存在的库".to_string()])
             .is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_index_gets_section_fields_when_cache_is_played() {
+        let dir = scratch_dir("legacy-upgrade");
+        let full = item("101", "Movie");
+        // 模拟升级前的索引：没有 section_key / section_title。
+        fs::write(
+            dir.join("index.json"),
+            format!(
+                r#"{{"version":1,"items":[{{"rating_key":"101","title":"Movie","thumb":"{}"}}]}}"#,
+                full.thumb
+            ),
+        )
+        .unwrap();
+
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        fs::write(cache.path_for(&full), b"x").unwrap();
+        cache.remember_sections(&[
+            Section {
+                key: "1".to_string(),
+                title: "Movies".to_string(),
+                kind: "movie".to_string(),
+            },
+            Section {
+                key: "2".to_string(),
+                title: "Anime".to_string(),
+                kind: "show".to_string(),
+            },
+        ]);
+        assert!(cache.offline_items(&["Movies".to_string()]).is_empty());
+
+        // 模拟在线播放命中这条旧缓存：remember 应补齐媒体库字段。
+        cache.remember(&full);
+        let reloaded = Cache::at(&dir, 30, Naming::Title);
+        let offline = reloaded.offline_items(&["Movies".to_string()]);
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].section_key, "1");
+
+        // 扫描旧文件产生的空字段不能反过来把已补齐的字段覆盖掉。
+        let mut reloaded = reloaded;
+        let mut without_section = full.clone();
+        without_section.section_key.clear();
+        without_section.section_title.clear();
+        reloaded.remember(&without_section);
+        let again = Cache::at(&dir, 30, Naming::Title);
+        assert_eq!(again.offline_items(&["Movies".to_string()]).len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
