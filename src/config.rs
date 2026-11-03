@@ -279,7 +279,7 @@ plex-poster-screensaver (Rust)
   --list                列出媒体库后退出
   --display <秒>        每张停留时间，默认 10
   --fade <秒>           淡入淡出时长，默认 1.2，0 表示关闭
-  --no-motion           关闭 Ken Burns 缓慢推近
+  --no-motion           关闭 Ken Burns 缓慢推近（轮播继续）
   --motion-fps <帧率>   动效帧率，默认 30
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
@@ -380,21 +380,23 @@ pub fn locate_config(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = env::var_os("PLEX_SCREENSAVER_CONFIG") {
         return Some(PathBuf::from(path));
     }
-    for candidate in [exe_dir().join("config.json"), app_dir().join("config.json")] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    [exe_dir().join("config.json"), app_dir().join("config.json")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
-pub fn load(args: &Args) -> Config {
+pub fn load(args: &Args) -> Result<Config, String> {
     let mut cfg = Config::default();
+
+    // 命令行 / 环境变量显式指定的配置文件：读不到或解析失败要明确报错，
+    // 不能一边忽略错误一边用默认值继续跑，否则很容易以为配置已经生效。
+    let explicit = args.config.is_some() || env::var_os("PLEX_SCREENSAVER_CONFIG").is_some();
 
     if let Some(path) = locate_config(args.config.as_deref()) {
         match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<FileConfig>(&text) {
                 Ok(file) => {
+                    let base = config_base_dir(&path);
                     if let Some(v) = file.plex_url {
                         cfg.url = v;
                     }
@@ -415,7 +417,9 @@ pub fn load(args: &Args) -> Config {
                             cfg.cache_dir_auto = true;
                         } else {
                             cfg.cache_dir_explicit = true;
-                            cfg.cache_dir = PathBuf::from(v);
+                            // 相对路径以配置文件所在目录为基准，而不是进程 CWD。
+                            // 否则手动启动和开机自启可能写到两个不同位置。
+                            cfg.cache_dir = resolve_path(&base, &v);
                         }
                     }
                     if let Some(v) = &file.cache_naming {
@@ -464,9 +468,22 @@ pub fn load(args: &Args) -> Config {
                     }
                     eprintln!("已加载配置: {}", path.display());
                 }
-                Err(err) => eprintln!("配置文件解析失败，已忽略 {}: {err}", path.display()),
+                Err(err) => {
+                    if explicit {
+                        return Err(format!(
+                            "配置文件解析失败 {}: {err}",
+                            path.display()
+                        ));
+                    }
+                    eprintln!("配置文件解析失败，已忽略 {}: {err}", path.display());
+                }
             },
-            Err(err) => eprintln!("无法读取配置 {}: {err}", path.display()),
+            Err(err) => {
+                if explicit {
+                    return Err(format!("无法读取配置文件 {}: {err}", path.display()));
+                }
+                eprintln!("无法读取配置 {}: {err}", path.display());
+            }
         }
     }
 
@@ -535,7 +552,29 @@ pub fn load(args: &Args) -> Config {
     }
 
     cfg.url = cfg.url.trim_end_matches('/').to_string();
-    cfg
+    Ok(cfg)
+}
+
+/// 配置文件所在目录；相对路径的 `cache_dir` 以它为基准。
+fn config_base_dir(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(path)
+    };
+    absolute
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default())
+}
+
+fn resolve_path(base: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 #[cfg(test)]
@@ -566,5 +605,15 @@ mod tests {
         assert!(Hotkey::parse("Ctrl+Nope").is_none());
         assert!(Hotkey::parse("Ctrl+A+B").is_none());
         assert!(Hotkey::parse("").is_none());
+    }
+
+    #[test]
+    fn relative_cache_dir_uses_config_directory() {
+        let base = Path::new("C:/configs");
+        assert_eq!(resolve_path(base, "covers"), base.join("covers"));
+        assert_eq!(
+            resolve_path(base, "C:/other/covers"),
+            PathBuf::from("C:/other/covers")
+        );
     }
 }

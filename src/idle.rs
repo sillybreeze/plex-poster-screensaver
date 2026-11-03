@@ -9,39 +9,48 @@ use std::time::{Duration, Instant};
 /// 系统级「最后一次输入」的时间戳。
 ///
 /// 单位是 `GetTickCount` 的毫秒，32 位，大约 49.7 天回绕一次，所以只能做差值比较。
+///
+/// 失败（安全桌面、非交互会话等）时返回 `None`。调用方必须把「不知道」当成
+/// 暂停判断，而不是当成「刚有输入」或「已经空闲很久」——返回 0 会被算成开机时长。
 #[cfg(windows)]
-pub fn last_input_tick() -> u32 {
+pub fn last_input_tick() -> Option<u32> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
     let mut info = LASTINPUTINFO {
         cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
-    // 失败（安全桌面、非交互会话）时返回 0，调用方会当成「刚有输入」，不会误触发。
     if unsafe { GetLastInputInfo(&mut info).as_bool() } {
-        info.dwTime
+        Some(info.dwTime)
     } else {
-        0
+        None
     }
 }
 
 #[cfg(not(windows))]
-pub fn last_input_tick() -> u32 {
-    0
+pub fn last_input_tick() -> Option<u32> {
+    None
 }
 
-/// 距离最后一次输入过了多久。
+/// 距离最后一次输入过了多久；检测失败时返回 `None`。
 #[cfg(windows)]
-pub fn idle_from_last_input() -> Duration {
+pub fn idle_from_last_input() -> Option<Duration> {
     use windows::Win32::System::SystemInformation::GetTickCount;
 
+    let last = last_input_tick()?;
     let now = unsafe { GetTickCount() };
-    Duration::from_millis(now.wrapping_sub(last_input_tick()) as u64)
+    Some(tick_elapsed(now, last))
 }
 
 #[cfg(not(windows))]
-pub fn idle_from_last_input() -> Duration {
-    Duration::ZERO
+pub fn idle_from_last_input() -> Option<Duration> {
+    None
+}
+
+/// `GetTickCount` 是 32 位毫秒，49.7 天回绕一次，差值必须用 wrapping 运算。
+#[cfg(windows)]
+fn tick_elapsed(now: u32, last: u32) -> Duration {
+    Duration::from_millis(now.wrapping_sub(last) as u64)
 }
 
 /// 鼠标指针位置 + 三个按键的按下状态（只看鼠标，不看键盘）。
@@ -100,8 +109,8 @@ impl Idle {
         self.primed = false;
     }
 
-    /// 轮询一次，返回当前已经空闲了多久。
-    pub fn poll(&mut self, now: Instant) -> Duration {
+    /// 轮询一次，返回当前已经空闲了多久；检测不可用时返回 `None`。
+    pub fn poll(&mut self, now: Instant) -> Option<Duration> {
         if !self.mouse_only {
             return idle_from_last_input();
         }
@@ -113,6 +122,22 @@ impl Idle {
         self.cursor = cursor;
         self.buttons = buttons;
         self.primed = true;
-        now.saturating_duration_since(self.last_activity)
+        Some(now.saturating_duration_since(self.last_activity))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn tick_delta_wraps_around() {
+        // 回绕边界：now 比 last 小，差值仍然是正确的一小段时间。
+        assert_eq!(
+            tick_elapsed(100, u32::MAX - 50),
+            Duration::from_millis(151)
+        );
+        assert_eq!(tick_elapsed(1000, 1000), Duration::ZERO);
     }
 }

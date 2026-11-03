@@ -26,7 +26,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGISwapChain, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_EFFECT_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGISwapChain, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 const SHADER: &str = r#"
@@ -266,6 +267,38 @@ impl Gpu {
         }
     }
 
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 跟随窗口/显示器尺寸重建交换链缓冲区。
+    ///
+    /// 调用前先清空管线状态，确保没有残留的 render target 引用；
+    /// `ResizeBuffers` 成功后，下一帧 `render_target()` 会拿到新尺寸的后缓冲。
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Err(format!("无效的交换链尺寸: {width}x{height}"));
+        }
+        if width == self.width && height == self.height {
+            return Ok(());
+        }
+        unsafe {
+            self.context.ClearState();
+            self.context.Flush();
+            self.swap
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .map_err(|e| format!("调整交换链尺寸失败: {e}"))?;
+        }
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
 
     /// 把背景（0x00RRGGBB）和海报（RGB）上传成纹理，一张图只做一次。
     pub fn upload(
@@ -274,6 +307,17 @@ impl Gpu {
         poster: &RgbImage,
         position: (i32, i32),
     ) -> Result<Textures, String> {
+        let expected = self.width as usize * self.height as usize;
+        if bg.len() != expected {
+            return Err(format!(
+                "背景缓冲区尺寸不匹配: 纹理 {}x{} 需要 {} 像素，实际 {} 像素",
+                self.width,
+                self.height,
+                expected,
+                bg.len()
+            ));
+        }
+
         let bg_srv = create_texture(
             &self.device,
             self.width,

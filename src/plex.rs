@@ -5,7 +5,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{Config, Naming};
+
+/// 本地索引文件名：记录已经缓存过哪些媒体条目，断网时用它枚举缓存。
+const INDEX_FILE: &str = "index.json";
+const INDEX_VERSION: u32 = 1;
+/// 索引最多保留多少条，避免缓存目录长期累积后文件无限增长。
+const MAX_INDEX_ITEMS: usize = 5000;
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -14,13 +22,48 @@ pub struct Section {
     pub kind: String,
 }
 
-#[derive(Debug, Clone)]
+/// 按配置/命令行里的编号或标题筛选媒体库；`wanted` 为空表示全部。
+pub fn filter_sections(sections: &[Section], wanted: &[String]) -> Vec<Section> {
+    if wanted.is_empty() {
+        return sections.to_vec();
+    }
+
+    let mut chosen: Vec<Section> = Vec::new();
+    for token in wanted {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let found = if let Ok(index) = token.parse::<usize>() {
+            sections.get(index.saturating_sub(1)).cloned()
+        } else {
+            sections
+                .iter()
+                .find(|s| s.title == token)
+                .or_else(|| {
+                    sections
+                        .iter()
+                        .find(|s| s.title.to_lowercase().contains(&token.to_lowercase()))
+                })
+                .cloned()
+        };
+        if let Some(section) = found {
+            if !chosen.iter().any(|s| s.key == section.key) {
+                chosen.push(section);
+            }
+        }
+    }
+    chosen
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaItem {
     pub rating_key: String,
     pub title: String,
     pub thumb: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct Client {
     agent: ureq::Agent,
     base: String,
@@ -165,13 +208,24 @@ impl Client {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexFile {
+    version: u32,
+    items: Vec<MediaItem>,
+}
+
 /// 封面缓存。默认按「标题_ratingKey」命名，同时认旧版的纯标题和纯 ratingKey 命名。
+///
+/// 除封面文件外，还在缓存目录里维护一份 `index.json`：记录每个封面对应的
+/// ratingKey / 标题 / thumb。这样 Plex 断网时也能从磁盘枚举出可播放的条目。
+#[derive(Debug, Clone)]
 pub struct Cache {
     pub dir: PathBuf,
     naming: Naming,
     max_age: Option<Duration>,
     pub hits: u64,
     pub misses: u64,
+    index: Vec<MediaItem>,
 }
 
 impl Cache {
@@ -219,16 +273,94 @@ impl Cache {
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
+            index: Vec::new(),
         }
     }
 
     fn at(dir: &Path, days: i64, naming: Naming) -> Self {
+        let mut index = load_index(dir);
+        // 兼容升级前已有的缓存：没有 index.json（或索引不全）时从文件名恢复条目。
+        merge_scanned_index(dir, &mut index);
         Self {
             dir: dir.to_path_buf(),
             naming,
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
+            index,
+        }
+    }
+
+    /// 工作线程重启前从磁盘重新读一次索引；工作线程里的副本可能已经写过新条目。
+    pub fn reload_index(&mut self) {
+        if self.is_disk() {
+            self.index = load_index(&self.dir);
+            merge_scanned_index(&self.dir, &mut self.index);
+        }
+    }
+
+    /// 本地索引里还有对应缓存文件的条目；断网时按这个列表播放。
+    pub fn offline_items(&self) -> Vec<MediaItem> {
+        self.index
+            .iter()
+            .filter(|item| self.find(item).is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// 记住一个封面已经缓存过的媒体条目，写进 `index.json`。
+    pub fn remember(&mut self, item: &MediaItem) {
+        if !self.is_disk() {
+            return;
+        }
+        if let Some(existing) = self
+            .index
+            .iter_mut()
+            .find(|i| i.rating_key == item.rating_key)
+        {
+            if existing.title != item.title || existing.thumb != item.thumb {
+                *existing = item.clone();
+                self.save_index();
+            }
+            return;
+        }
+        self.index.push(item.clone());
+        if self.index.len() > MAX_INDEX_ITEMS {
+            self.index.remove(0);
+        }
+        self.save_index();
+    }
+
+    /// 删除一个损坏的缓存文件；索引条目会在下次在线取图时重新写回。
+    pub fn discard(&self, path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+
+    fn save_index(&self) {
+        if !self.is_disk() {
+            return;
+        }
+        let data = IndexFile {
+            version: INDEX_VERSION,
+            items: self.index.clone(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&data) else {
+            return;
+        };
+        let path = self.dir.join(INDEX_FILE);
+        // 旧/新工作线程可能短暂并存，临时文件名带时间戳，避免互相覆盖同一个 .tmp。
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = self
+            .dir
+            .join(format!("index.{}.{stamp}.tmp", std::process::id()));
+        if fs::write(&tmp, bytes).is_err() {
+            return;
+        }
+        if fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
         }
     }
 
@@ -284,6 +416,20 @@ impl Cache {
             .collect()
     }
 
+    /// 只查找、不重命名、不计命中次数；离线索引过滤用。
+    fn find(&self, item: &MediaItem) -> Option<PathBuf> {
+        if !self.is_disk() {
+            return None;
+        }
+        let wanted = self.path_for(item);
+        if is_usable(&wanted) {
+            return Some(wanted);
+        }
+        self.candidates(item)
+            .into_iter()
+            .find(|candidate| *candidate != wanted && is_usable(candidate))
+    }
+
     pub fn get(&mut self, item: &MediaItem) -> Option<PathBuf> {
         if !self.is_disk() {
             return None;
@@ -322,6 +468,7 @@ impl Cache {
             return None;
         }
         self.misses += 1;
+        self.remember(item);
         Some(path)
     }
 
@@ -373,6 +520,77 @@ fn age_limit(days: i64) -> Option<Duration> {
         Some(Duration::from_secs(days as u64 * 86400))
     } else {
         None
+    }
+}
+
+/// 没有索引（或索引缺条目）时，从缓存文件名恢复离线播放需要的 MediaItem。
+///
+/// 文件名只能还原出 ratingKey 和标题，`thumb` 留空 —— 离线播放不需要它，
+/// 只有重新在线下载时才需要，而那时条目会从 Plex 重新拿到完整信息。
+fn merge_scanned_index(dir: &Path, index: &mut Vec<MediaItem>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_ours_stem(stem) {
+            continue;
+        }
+        let (title, key) = split_stem(stem);
+        if key.is_empty() || index.iter().any(|i| i.rating_key == key) {
+            continue;
+        }
+        index.push(MediaItem {
+            rating_key: key,
+            title,
+            thumb: String::new(),
+        });
+    }
+}
+
+/// `标题_编号` -> (标题, 编号)；纯编号文件 -> ("", 编号)。
+fn split_stem(stem: &str) -> (String, String) {
+    if let Some((title, key)) = stem.rsplit_once('_') {
+        if !title.is_empty() && is_key_like(key) {
+            return (title.to_string(), key.to_string());
+        }
+    }
+    (String::new(), stem.to_string())
+}
+
+fn is_key_like(raw: &str) -> bool {
+    is_all_digits(raw)
+        || (raw.len() >= 8
+            && raw.starts_with('h')
+            && raw[1..].chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// 读本地索引；不存在、损坏或版本不认识时都退化成空索引，不影响正常在线播放。
+fn load_index(dir: &Path) -> Vec<MediaItem> {
+    let path = dir.join(INDEX_FILE);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<IndexFile>(&text) {
+        Ok(file) if file.version == INDEX_VERSION => file.items,
+        Ok(file) => {
+            eprintln!(
+                "缓存索引版本不支持，已忽略 {}（version={}）",
+                path.display(),
+                file.version
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            eprintln!("缓存索引损坏，已忽略 {}: {err}", path.display());
+            Vec::new()
+        }
     }
 }
 
@@ -477,9 +695,9 @@ fn is_ours_stem(stem: &str) -> bool {
     if is_all_digits(stem) {
         return true;
     }
-    // 新版：标题_1479
+    // 新版：标题_1479 / 标题_h1a2b3c4...
     if let Some((_, key)) = stem.rsplit_once('_') {
-        if is_all_digits(key) {
+        if is_key_like(key) {
             return true;
         }
     }
@@ -509,6 +727,26 @@ mod tests {
             title: title.to_string(),
             thumb: format!("/library/metadata/{key}/thumb/1712345678"),
         }
+    }
+
+    #[test]
+    fn sections_filter_by_index_or_title() {
+        let sections = vec![
+            Section {
+                key: "1".to_string(),
+                title: "Movies".to_string(),
+                kind: "movie".to_string(),
+            },
+            Section {
+                key: "2".to_string(),
+                title: "Anime".to_string(),
+                kind: "show".to_string(),
+            },
+        ];
+        assert_eq!(filter_sections(&sections, &[]).len(), 2);
+        assert_eq!(filter_sections(&sections, &["2".to_string()])[0].key, "2");
+        assert_eq!(filter_sections(&sections, &["ani".to_string()])[0].key, "2");
+        assert!(filter_sections(&sections, &["missing".to_string()]).is_empty());
     }
 
     #[test]
@@ -613,6 +851,47 @@ mod tests {
         let mut cache = Cache::at(&dir, 30, Naming::Title);
         assert!(cache.get(&item("1479", "阿凡达")).is_none());
         assert_eq!(cache.hits, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_survives_restart_and_filters_missing_files() {
+        let dir = scratch_dir("index");
+        let it = item("1479", "阿凡达");
+        fs::write(dir.join("1479.jpg"), b"x").unwrap();
+
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        cache.remember(&it);
+        assert!(dir.join("index.json").is_file());
+
+        // 模拟重启：重新从磁盘加载索引。
+        let cache = Cache::at(&dir, 30, Naming::Title);
+        let offline = cache.offline_items();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].rating_key, "1479");
+
+        // 文件被清理后，索引条目不应再出现在可离线播放列表里。
+        fs::remove_file(dir.join("1479.jpg")).unwrap();
+        assert!(cache.offline_items().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_cache_files_are_scanned_for_offline_playback() {
+        let dir = scratch_dir("scan");
+        fs::write(dir.join("1479.jpg"), b"x").unwrap();
+        fs::write(dir.join("阿凡达 水之道_2819.jpg"), b"x").unwrap();
+        fs::write(dir.join("foreign.png"), b"x").unwrap();
+
+        let cache = Cache::at(&dir, 30, Naming::Title);
+        let items = cache.offline_items();
+        assert!(items.iter().any(|i| i.rating_key == "1479"));
+        assert!(items
+            .iter()
+            .any(|i| i.rating_key == "2819" && i.title == "阿凡达 水之道"));
+        assert!(!items.iter().any(|i| i.rating_key == "foreign"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

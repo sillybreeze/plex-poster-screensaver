@@ -2,6 +2,7 @@
 //!
 //! 像素统一用 `u32`（0x00RRGGBB），对应 softbuffer 的缓冲区格式。
 
+use std::fs;
 use std::path::Path;
 
 use image::imageops::FilterType;
@@ -27,13 +28,15 @@ pub struct Composition {
 }
 
 pub fn build(path: &Path, width: u32, height: u32) -> Result<Composition, String> {
-    let img = image::open(path)
-        .map_err(|e| format!("打开封面失败 {}: {e}", path.display()))?
-        .to_rgb8();
-    Ok(build_from_image(img, width, height))
+    // 不能依赖扩展名：Plex 可能把 PNG 内容缓存在 .jpg 文件名下。
+    // `image::open` 只看扩展名，所以这里把文件读进来，按内容识别格式。
+    let data = fs::read(path).map_err(|e| format!("读取封面失败 {}: {e}", path.display()))?;
+    build_from_bytes(&data, width, height).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// 直接从内存里的图片字节构建，缓存目录不可写时用这条路径。
+/// 直接从内存里的图片字节构建；缓存目录不可写时也用这条路径。
+///
+/// `image::load_from_memory` 按文件内容判断格式，不关心扩展名。
 pub fn build_from_bytes(data: &[u8], width: u32, height: u32) -> Result<Composition, String> {
     let img = image::load_from_memory(data)
         .map_err(|e| format!("解码封面失败: {e}"))?
@@ -388,4 +391,31 @@ pub fn save_png(out: &[u32], width: u32, height: u32, path: &Path) -> Result<(),
     }
     image::save_buffer(path, &buf, width, height, image::ColorType::Rgb8)
         .map_err(|e| format!("保存 PNG 失败: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_content_with_jpg_name_still_decodes() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("render-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let png = dir.join("poster.png");
+        let jpg_name = dir.join("poster.jpg");
+        let img = RgbImage::from_pixel(4, 6, Rgb([10, 20, 30]));
+        image::save_buffer(&png, img.as_raw(), 4, 6, image::ColorType::Rgb8).unwrap();
+        fs::rename(&png, &jpg_name).unwrap();
+
+        let comp = build(&jpg_name, 64, 64).expect("扩展名和内容不一致时也要能解码");
+        assert_eq!((comp.width, comp.height), (64, 64));
+        assert_eq!(comp.background.len(), 64 * 64);
+        assert!(comp.poster.width() > 0 && comp.poster.height() > 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

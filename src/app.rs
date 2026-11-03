@@ -25,7 +25,10 @@ pub struct Slide {
     pub comp: Composition,
 }
 
-/// 按库轮询、分批补货，尽量不连续出现同一张。
+/// 断网时每隔多久重试一次 Plex。
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 按库轮询、分批补货，尽量不连续出现同一张；断网时退到本地索引播放。
 pub struct Source {
     client: Client,
     cache: Cache,
@@ -35,15 +38,28 @@ pub struct Source {
     recent: VecDeque<String>,
     rr: usize,
     batch: usize,
+    offline: VecDeque<MediaItem>,
+    online: bool,
+    next_reconnect: Instant,
+    /// 用户配置的媒体库筛选；重连时仍然要按它选，不能把没选的库也播出来。
+    wanted: Vec<String>,
 }
 
 impl Source {
-    pub fn new(client: Client, cache: Cache, sections: Vec<Section>, size: (u32, u32)) -> Self {
+    pub fn new(
+        client: Client,
+        cache: Cache,
+        sections: Vec<Section>,
+        size: (u32, u32),
+        wanted: Vec<String>,
+    ) -> Self {
         let buffers = sections
             .iter()
             .map(|s| (s.key.clone(), VecDeque::new()))
             .collect();
-        Self {
+        let online = !sections.is_empty();
+        let now = Instant::now();
+        let mut source = Self {
             client,
             cache,
             sections,
@@ -52,18 +68,91 @@ impl Source {
             recent: VecDeque::new(),
             rr: 0,
             batch: 40,
-        }
+            offline: VecDeque::new(),
+            online,
+            // 启动时已经试过一次连接；离线就先放缓存，30 秒后再重连。
+            next_reconnect: if online {
+                now
+            } else {
+                now + RECONNECT_INTERVAL
+            },
+            wanted,
+        };
+        source.reload_offline();
+        source
     }
 
-    fn refill(&mut self, key: &str) -> Result<(), String> {
+    fn refill(&mut self, key: &str) -> Result<usize, String> {
         let items = self.client.random_items(key, self.batch)?;
+        let count = items.len();
         if let Some(buf) = self.buffers.get_mut(key) {
             buf.extend(items);
         }
-        Ok(())
+        Ok(count)
     }
 
-    pub fn next(&mut self) -> Result<Slide, String> {
+    /// 从磁盘索引重新装填离线队列，并打乱顺序，避免每次都是同样几张。
+    fn reload_offline(&mut self) {
+        let mut items = self.cache.offline_items();
+        shuffle(&mut items);
+        self.offline = items.into();
+    }
+
+    fn go_offline(&mut self) {
+        if self.online {
+            eprintln!("Plex 暂时取不到图，改用本地缓存离线播放");
+        }
+        self.online = false;
+        self.next_reconnect = Instant::now() + RECONNECT_INTERVAL;
+        self.reload_offline();
+    }
+
+    fn try_reconnect(&mut self, now: Instant) {
+        self.next_reconnect = now + RECONNECT_INTERVAL;
+        match self.client.sections() {
+            Ok(sections) if !sections.is_empty() => {
+                // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
+                let chosen = crate::plex::filter_sections(&sections, &self.wanted);
+                if chosen.is_empty() {
+                    eprintln!("Plex 已恢复，但配置的媒体库一个都没匹配到");
+                    return;
+                }
+                eprintln!("已重新连接 Plex：{} 个媒体库", chosen.len());
+                self.sections = chosen;
+                self.buffers = self
+                    .sections
+                    .iter()
+                    .map(|s| (s.key.clone(), VecDeque::new()))
+                    .collect();
+                self.rr = 0;
+                self.online = true;
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("重连 Plex 失败: {err}"),
+        }
+    }
+
+    fn remember(&mut self, key: &str) {
+        self.recent.push_back(key.to_string());
+        if self.recent.len() > 12 {
+            self.recent.pop_front();
+        }
+    }
+
+    fn finish(&mut self, item: MediaItem, comp: Composition) -> Slide {
+        self.remember(&item.rating_key);
+        Slide { item, comp }
+    }
+
+    /// 在线取一张。只有连续多次取图失败才切离线，单个坏条目不至于让整个屏保定格。
+    fn online_next(&mut self) -> Result<Option<Slide>, String> {
+        if self.sections.is_empty() {
+            self.go_offline();
+            return Ok(None);
+        }
+
+        let mut errors = 0;
+        let mut empty_rounds = 0;
         for attempt in 0..300 {
             let section = &self.sections[self.rr % self.sections.len()];
             self.rr = self.rr.wrapping_add(1);
@@ -71,39 +160,148 @@ impl Source {
 
             let empty = self.buffers.get(&key).map(|b| b.is_empty()).unwrap_or(true);
             if empty {
-                self.refill(&key)?;
+                match self.refill(&key) {
+                    Ok(0) => {
+                        // 这个库是空的；所有库都空就别再刷请求了。
+                        empty_rounds += 1;
+                        if empty_rounds >= self.sections.len() {
+                            eprintln!("Plex 媒体库里没有条目，改用本地缓存");
+                            self.go_offline();
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Ok(_) => empty_rounds = 0,
+                    Err(err) => {
+                        eprintln!("补充取图列表失败: {err}");
+                        self.go_offline();
+                        return Ok(None);
+                    }
+                }
             }
+
+            // 这一批里如果已经没有「最近没放过」的条目，就直接允许重复。
+            // 小库否则会为了一张图反复请求随机列表。
+            let has_fresh = self
+                .buffers
+                .get(&key)
+                .map(|b| b.iter().any(|i| !self.recent.contains(&i.rating_key)))
+                .unwrap_or(false);
+
             let Some(item) = self.buffers.get_mut(&key).and_then(|b| b.pop_front()) else {
                 continue;
             };
 
-            if self.recent.contains(&item.rating_key) && attempt < 60 {
+            if has_fresh && self.recent.contains(&item.rating_key) && attempt < 60 {
                 continue;
             }
 
-            let comp = match self.cache.get(&item) {
-                Some(path) => render::build(&path, self.size.0, self.size.1)?,
-                None => {
-                    let data = self.client.fetch_cover(&item, self.size.0, self.size.1)?;
-                    if data.is_empty() {
-                        return Err(format!("封面内容为空: {}", item.title));
-                    }
-                    match self.cache.store(&item, &data) {
-                        Some(path) => render::build(&path, self.size.0, self.size.1)?,
-                        None => {
-                            render::build_from_bytes(&data, self.size.0, self.size.1)?
-                        }
+            match self.slide_for(&item) {
+                Ok(comp) => return Ok(Some(self.finish(item, comp))),
+                Err(err) => {
+                    eprintln!("取图失败 {}: {err}", item.title);
+                    errors += 1;
+                    if errors >= 3 {
+                        self.go_offline();
+                        return Ok(None);
                     }
                 }
-            };
-
-            self.recent.push_back(item.rating_key.clone());
-            if self.recent.len() > 12 {
-                self.recent.pop_front();
             }
-            return Ok(Slide { item, comp });
         }
-        Err("连续多次都没能取到封面".to_string())
+        Ok(None)
+    }
+
+    /// 在线路径：缓存命中直接解码；命中坏缓存则删掉重下；没有缓存则下载。
+    fn slide_for(&mut self, item: &MediaItem) -> Result<Composition, String> {
+        if let Some(path) = self.cache.get(item) {
+            match render::build(&path, self.size.0, self.size.1) {
+                Ok(comp) => {
+                    self.cache.remember(item);
+                    return Ok(comp);
+                }
+                Err(err) => {
+                    eprintln!("缓存损坏，删除后重新下载: {err}");
+                    self.cache.discard(&path);
+                }
+            }
+        }
+
+        let data = self.client.fetch_cover(item, self.size.0, self.size.1)?;
+        if data.is_empty() {
+            return Err(format!("封面内容为空: {}", item.title));
+        }
+        // 先确认能解码再落盘，避免把坏内容存成 .jpg 后一直命中坏缓存。
+        let comp = render::build_from_bytes(&data, self.size.0, self.size.1)?;
+        self.cache.store(item, &data);
+        Ok(comp)
+    }
+
+    /// 离线路径：只读缓存，绝不访问网络。
+    fn cached_slide(&mut self, item: &MediaItem) -> Result<Composition, String> {
+        let path = self
+            .cache
+            .get(item)
+            .ok_or_else(|| format!("缓存文件不存在: {}", item.title))?;
+        match render::build(&path, self.size.0, self.size.1) {
+            Ok(comp) => {
+                self.cache.remember(item);
+                Ok(comp)
+            }
+            Err(err) => {
+                self.cache.discard(&path);
+                Err(err)
+            }
+        }
+    }
+
+    fn offline_next(&mut self) -> Result<Slide, String> {
+        if self.offline.is_empty() {
+            self.reload_offline();
+        }
+        let count = self.offline.len();
+        for _ in 0..count {
+            let Some(item) = self.offline.pop_front() else {
+                break;
+            };
+            match self.cached_slide(&item) {
+                Ok(comp) => return Ok(self.finish(item, comp)),
+                Err(err) => eprintln!("离线缓存不可用 {}: {err}", item.title),
+            }
+        }
+        Err("无法连接 Plex，本地缓存也没有可用封面".to_string())
+    }
+
+    pub fn next(&mut self) -> Result<Slide, String> {
+        let now = Instant::now();
+        if !self.online && now >= self.next_reconnect {
+            self.try_reconnect(now);
+        }
+        if self.online {
+            match self.online_next() {
+                Ok(Some(slide)) => return Ok(slide),
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("在线取图失败: {err}");
+                    self.go_offline();
+                }
+            }
+        }
+        self.offline_next()
+    }
+}
+
+/// 无 rand 依赖的 Fisher-Yates；只用于打乱本地缓存播放顺序。
+fn shuffle(items: &mut [MediaItem]) {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    for i in (1..items.len()).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = ((state >> 33) as usize) % (i + 1);
+        items.swap(i, j);
     }
 }
 
@@ -119,6 +317,8 @@ enum Phase {
     },
 }
 
+/// 窗口尺寸连续变化时的稳定等待；拖动预览窗口时别反复重建交换链和预取线程。
+const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 /// 空闲到点时刚显示的那一小段：别被残留的鼠标抖动立刻关掉。
 const IDLE_GRACE: Duration = Duration::from_millis(700);
 /// 手动拉起（热键 / 再启动）留得久一点：按下和松开热键本身都算输入。
@@ -137,15 +337,21 @@ struct Watch {
     /// 是不是热键/再启动这类「手动」拉起的（触发的那个动作本身就是输入）
     manual: bool,
     next_poll: Instant,
-    /// 显示那一刻的系统输入时间戳；变了说明有人动了鼠标/键盘
-    dismiss_tick: u32,
+    /// 显示那一刻的系统输入时间戳；变了说明有人动了鼠标/键盘。
+    /// 检测失败时为 `None`，恢复后重新取基准，不拿「不知道」当「有人回来」。
+    dismiss_tick: Option<u32>,
+    /// 上一轮空闲检测是否失败；用来只告警一次。
+    idle_failed: bool,
 }
 
 pub struct App {
     cfg: Config,
     preview: bool,
     watch: Option<Watch>,
-    pending: Option<(Client, Cache, Vec<Section>)>,
+    client: Client,
+    cache: Cache,
+    sections: Vec<Section>,
+    wanted: Vec<String>,
     rx: Option<Receiver<Slide>>,
 
     size: (u32, u32),
@@ -161,7 +367,8 @@ pub struct App {
     next_frame_at: Instant,
     grace_until: Instant,
     pointer_start: (f64, f64),
-    started: bool,
+    /// 窗口连续变化时先等它稳定，再重建交换链和预取线程。
+    pending_resize: Option<(Instant, (u32, u32))>,
     frames: u64,
     last_report: Instant,
     tick_us: f64,
@@ -175,6 +382,7 @@ impl App {
         client: Client,
         cache: Cache,
         sections: Vec<Section>,
+        wanted: Vec<String>,
     ) -> Self {
         let now = Instant::now();
         let watch = if cfg.watch && !preview {
@@ -184,7 +392,8 @@ impl App {
                 showing: false,
                 manual: false,
                 next_poll: now,
-                dismiss_tick: 0,
+                dismiss_tick: None,
+                idle_failed: false,
             })
         } else {
             None
@@ -193,7 +402,10 @@ impl App {
             cfg,
             preview,
             watch,
-            pending: Some((client, cache, sections)),
+            client,
+            cache,
+            sections,
+            wanted,
             rx: None,
             size: (1920, 1080),
             window: None,
@@ -206,7 +418,7 @@ impl App {
             next_frame_at: now,
             grace_until: now + Duration::from_millis(1500),
             pointer_start: (0.0, 0.0),
-            started: false,
+            pending_resize: None,
             frames: 0,
             last_report: now,
             tick_us: 0.0,
@@ -300,13 +512,21 @@ impl App {
             return;
         };
 
-        if let Some(monitor) = event_loop.primary_monitor() {
+        let monitor_size = event_loop.primary_monitor().map(|monitor| {
             let size = monitor.size();
-            self.size = (size.width.max(1), size.height.max(1));
-        }
+            (size.width.max(1), size.height.max(1))
+        });
+
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         window.set_visible(true);
         window.focus_window();
+
+        // 触发时才读主屏尺寸：如果和常驻启动时不同，交换链、合成尺寸、
+        // 预取线程都要一起换掉，不能只更新 self.size 就继续用旧画面。
+        self.pending_resize = None;
+        if let Some(size) = monitor_size {
+            self.update_size(size, now, true);
+        }
 
         if !self.ensure_gpu() {
             // 建不出渲染器就别干挂着黑屏，一分钟后再试
@@ -354,6 +574,7 @@ impl App {
         self.phase = Phase::Idle;
         self.progress = 0.0;
         self.next_frame_at = now;
+        self.pending_resize = None;
     }
 
     /// 窗口收到输入。常驻模式收起，普通模式直接退出。
@@ -372,15 +593,29 @@ impl App {
         event_loop.exit();
     }
 
+    /// 当前是否处于可见播放状态（常驻模式藏着的时候不算）。
+    fn active(&self) -> bool {
+        match &self.watch {
+            Some(w) => w.showing,
+            None => self.window.is_some(),
+        }
+    }
+
+    /// 启动/重启预取线程。旧线程的 receiver 被丢弃后会自己退出。
     fn start_worker(&mut self) {
-        let Some((client, cache, sections)) = self.pending.take() else {
-            return;
-        };
         let size = self.size;
         let (tx, rx): (SyncSender<Slide>, Receiver<Slide>) = sync_channel(1);
         self.rx = Some(rx);
+
+        let client = self.client.clone();
+        let mut cache = self.cache.clone();
+        // 工作线程自己会更新索引；重建时从磁盘读一次，别用启动时的旧副本。
+        cache.reload_index();
+        let sections = self.sections.clone();
+        let wanted = self.wanted.clone();
+
         thread::spawn(move || {
-            let mut source = Source::new(client, cache, sections, size);
+            let mut source = Source::new(client, cache, sections, size, wanted);
             loop {
                 match source.next() {
                     Ok(slide) => {
@@ -397,6 +632,82 @@ impl App {
         });
     }
 
+    /// 更新目标尺寸：能立即重建就立即重建；窗口连续拖动时先记下来，等稳定后再重建。
+    fn update_size(&mut self, size: (u32, u32), now: Instant, immediate: bool) {
+        let size = (size.0.max(1), size.1.max(1));
+        if size == self.size {
+            if immediate && self.rx.is_none() {
+                self.start_worker();
+                self.next_frame_at = now;
+            }
+            return;
+        }
+
+        if std::env::var_os("PPS_DEBUG").is_some() {
+            eprintln!(
+                "尺寸更新: {}x{} -> {}x{}（immediate={immediate}）",
+                self.size.0, self.size.1, size.0, size.1
+            );
+        }
+        self.size = size;
+
+        // 旧纹理是按旧尺寸合成的，留着只会被拉伸；丢掉，等新尺寸的预取画面。
+        self.current = None;
+        self.phase = Phase::Idle;
+        self.progress = 0.0;
+        self.uv = [0.0, 0.0, 1.0, 1.0];
+
+        let mut resize_failed = false;
+        if let Some(gpu) = &mut self.gpu {
+            if gpu.size() != size {
+                if let Err(err) = gpu.resize(size.0, size.1) {
+                    eprintln!("调整交换链失败: {err}");
+                    resize_failed = true;
+                }
+            }
+        }
+        if resize_failed {
+            self.gpu = None;
+        }
+        if self.gpu.is_none() && self.active() && !self.ensure_gpu() {
+            eprintln!("重建渲染器失败，下一帧再试");
+        }
+
+        // 预取队列里是旧尺寸的画面，立即作废，避免上传时尺寸不一致。
+        self.rx = None;
+
+        if immediate {
+            self.pending_resize = None;
+            self.start_worker();
+            self.next_frame_at = now;
+        } else {
+            self.pending_resize = Some((now, size));
+            let due = now + RESIZE_SETTLE;
+            if self.next_frame_at > due {
+                self.next_frame_at = due;
+            }
+        }
+    }
+
+    /// 窗口拖拽/全屏切换会连续触发 Resized；等 250ms 没有新尺寸再真正重建预取。
+    fn apply_pending_resize(&mut self, now: Instant) {
+        let Some((at, size)) = self.pending_resize else {
+            return;
+        };
+        let due = at + RESIZE_SETTLE;
+        if now < due {
+            if self.next_frame_at > due {
+                self.next_frame_at = due;
+            }
+            return;
+        }
+        self.pending_resize = None;
+        if self.size == size {
+            self.start_worker();
+            self.next_frame_at = now;
+        }
+    }
+
     fn direction(&self) -> (f32, f32) {
         DIRECTIONS[self.slide_index % DIRECTIONS.len()]
     }
@@ -408,6 +719,14 @@ impl App {
         let Ok(slide) = rx.try_recv() else {
             return false;
         };
+
+        if (slide.comp.width, slide.comp.height) != self.size {
+            eprintln!(
+                "丢弃尺寸不匹配的预取画面: {}x{}（当前 {}x{}）",
+                slide.comp.width, slide.comp.height, self.size.0, self.size.1
+            );
+            return false;
+        }
 
         eprintln!("显示: {}", slide.item.title);
         self.slide_index += 1;
@@ -502,8 +821,11 @@ impl App {
 
     fn render_motion(&mut self, now: Instant, start: Instant) {
         let display = self.cfg.display_seconds.max(0.1);
+        let elapsed = (now - start).as_secs_f64();
+        // 切张只看 elapsed；Ken Burns 进度只负责动效。关掉动效时 progress 恒 0，
+        // 但停留时间到了仍然要换下一张。
         let progress = if self.cfg.ken_burns {
-            ((now - start).as_secs_f64() / display).min(1.0) as f32
+            (elapsed / display).min(1.0) as f32
         } else {
             0.0
         };
@@ -514,7 +836,7 @@ impl App {
             gpu.draw(current, self.uv, 1.0);
         }
 
-        if progress >= 1.0 {
+        if elapsed >= display {
             if self.take_next(now) {
                 return;
             }
@@ -523,7 +845,18 @@ impl App {
             let fps = self.cfg.motion_fps.max(1);
             self.next_frame_at = now + Duration::from_millis(1000 / fps as u64);
         } else {
-            self.next_frame_at = now + Duration::from_millis(120);
+            // 没有动效就不需要每 120ms 重画同一帧，直接等到该换张的时刻。
+            // 常驻模式还要每 500ms 醒一次检查输入（尤其宽限期结束时），
+            // 不能只靠窗口事件 —— 焦点万一不在自己身上就收不起来。
+            let end = start + Duration::from_secs_f64(display);
+            let mut next = end;
+            if self.watch.is_some() {
+                next = next.min(now + Duration::from_millis(500));
+                if now < self.grace_until {
+                    next = next.min(self.grace_until);
+                }
+            }
+            self.next_frame_at = next;
         }
     }
 
@@ -608,8 +941,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        if !self.started {
-            self.started = true;
+        if self.rx.is_none() {
             self.start_worker();
         }
         let now = Instant::now();
@@ -623,6 +955,16 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                // 常驻模式收起/隐藏过程中的窗口尺寸没有意义，等下次触发再按主屏重建。
+                if self.watch.as_ref().is_some_and(|w| !w.showing) {
+                    return;
+                }
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                self.update_size((size.width, size.height), Instant::now(), false);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     self.user_activity(event_loop);
@@ -657,6 +999,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
 
+        // 窗口尺寸稳定后再重建交换链/预取线程。
+        self.apply_pending_resize(now);
+
         // 常驻模式：藏着的时候数空闲，显示的时候盯输入
         let mut start = false;
         let mut stop = false;
@@ -668,22 +1013,41 @@ impl ApplicationHandler<UserEvent> for App {
                     if w.manual {
                         w.dismiss_tick = idle::last_input_tick();
                     }
-                } else if idle::last_input_tick() != w.dismiss_tick {
-                    stop = true;
+                } else {
+                    // 检测失败时不知道有没有输入：不收起，也不拿失败值当基准。
+                    match (idle::last_input_tick(), w.dismiss_tick) {
+                        (Some(tick), Some(base)) if tick != base => stop = true,
+                        (Some(tick), None) => w.dismiss_tick = Some(tick),
+                        _ => {}
+                    }
                 }
             } else if now >= w.next_poll {
                 w.next_poll = now + Duration::from_millis(500);
-                let idle = w.idle.poll(now);
-                if std::env::var_os("PPS_DEBUG").is_some() {
-                    eprintln!(
-                        "[watch] 已空闲 {:.1}s / 阈值 {:.0}s",
-                        idle.as_secs_f64(),
-                        w.threshold.as_secs_f64()
-                    );
-                }
-                if idle >= w.threshold {
-                    eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
-                    start = true;
+                match w.idle.poll(now) {
+                    Some(idle) => {
+                        w.idle_failed = false;
+                        if std::env::var_os("PPS_DEBUG").is_some() {
+                            eprintln!(
+                                "[watch] 已空闲 {:.1}s / 阈值 {:.0}s",
+                                idle.as_secs_f64(),
+                                w.threshold.as_secs_f64()
+                            );
+                        }
+                        if idle >= w.threshold {
+                            eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
+                            start = true;
+                        }
+                    }
+                    None => {
+                        // 拿不到「最后输入时间」时暂停自动触发，避免把开机时长
+                        // 误当成空闲时间；热键/再启动仍然可以手动拉起。
+                        if !w.idle_failed {
+                            w.idle_failed = true;
+                            eprintln!(
+                                "空闲检测不可用（GetLastInputInfo 失败），暂停自动触发；仍可用热键拉起"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -698,6 +1062,10 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(w.next_poll));
                 return;
             }
+        }
+
+        if self.window.is_some() && self.active() && self.gpu.is_none() {
+            self.ensure_gpu();
         }
 
         if self.window.is_some() && now >= self.next_frame_at {

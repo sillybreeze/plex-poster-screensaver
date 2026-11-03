@@ -39,7 +39,7 @@ mod trigger;
 use std::path::Path;
 use std::time::Instant;
 
-use config::{Args, Config};
+use config::Config;
 use plex::{Cache, Client, Section};
 
 fn main() {
@@ -63,24 +63,45 @@ fn main() {
         return;
     }
 
-    let cfg = config::load(&args);
+    let cfg = match config::load(&args) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("配置错误: {err}");
+            std::process::exit(2);
+        }
+    };
     if cfg.token.is_empty() {
         eprintln!("缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。");
         std::process::exit(1);
     }
 
-    let client = Client::new(&cfg);
-    let sections = connect(&client, &cfg);
+    let wanted = if !args.library.is_empty() {
+        args.library.clone()
+    } else {
+        cfg.libraries.clone()
+    };
 
-    let selected = match select_sections(&sections, &args, &cfg) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(1);
+    let client = Client::new(&cfg);
+    let sections = connect(&client, &cfg.url);
+
+    let selected = if sections.is_empty() {
+        // 连不上也不急着退出：本地索引里有缓存就先用缓存播放。
+        Vec::new()
+    } else {
+        match select_sections(&sections, &wanted) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
         }
     };
 
     if args.list {
+        if selected.is_empty() {
+            eprintln!("无法连接 Plex 或没有可用媒体库");
+            std::process::exit(1);
+        }
         println!("Plex: {}", cfg.url);
         for (i, s) in selected.iter().enumerate() {
             let kind = if s.kind == "movie" { "电影" } else { "剧集" };
@@ -102,22 +123,42 @@ fn main() {
     };
     cache.prune();
 
+    if selected.is_empty() {
+        let offline = cache.offline_items();
+        if offline.is_empty() {
+            eprintln!(
+                "无法连接 Plex，本地也没有可离线播放的缓存: {}",
+                cache.dir.display()
+            );
+            std::process::exit(1);
+        }
+        eprintln!(
+            "Plex 暂不可用，先用本地缓存播放 {} 张；后台会自动重连",
+            offline.len()
+        );
+    }
+
     if let Some(count) = args.self_test {
-        run_self_test(&cfg, client, cache, selected, count);
+        run_self_test(&cfg, client, cache, selected, wanted, count);
         return;
     }
     if let Some(path) = &args.snapshot {
-        run_snapshot(&cfg, client, cache, selected, path);
+        run_snapshot(&cfg, client, cache, selected, wanted, path);
         return;
     }
 
-    println!(
-        "媒体库: {} | 缓存: {}",
+    let libraries = if selected.is_empty() {
+        "离线缓存".to_string()
+    } else {
         selected
             .iter()
             .map(|s| s.title.as_str())
             .collect::<Vec<_>>()
-            .join(", "),
+            .join(", ")
+    };
+    println!(
+        "媒体库: {} | 缓存: {}",
+        libraries,
         if cache.is_disk() {
             format!(
                 "{}（{} 命名）",
@@ -129,7 +170,7 @@ fn main() {
         }
     );
 
-    let app = app::App::new(cfg, args.preview, client, cache, selected);
+    let app = app::App::new(cfg, args.preview, client, cache, selected, wanted);
     let result = app.run(trigger_event);
     timer::end();
     if let Err(err) = result {
@@ -138,67 +179,30 @@ fn main() {
     }
 }
 
-const RETRY_SECONDS: u64 = 15;
-
-/// 连 Plex 拿媒体库列表。
+/// 启动时尝试连接一次 Plex，拿媒体库列表。
 ///
-/// 常驻模式（--watch）下连不上不退出 —— 开机自启时网络和 Plex 往往还没起来，
-/// 隔一会儿再试就是了；普通模式保持原来的「报错退出」。
-fn connect(client: &Client, cfg: &Config) -> Vec<Section> {
-    loop {
-        match client.sections() {
-            Ok(s) if !s.is_empty() => return s,
-            Ok(_) => eprintln!("服务器上没有找到「电影」或「剧集」类型的媒体库"),
-            Err(err) => eprintln!("无法连接 Plex 服务器 {}: {err}", cfg.url),
+/// 连不上就返回空列表，让主流程先走本地缓存；`Source` 会在后台每隔一段时间
+/// 重新调用 `sections()`，恢复后自动切回在线取图。这样开机自启时网络/Plex
+/// 还没起来也不会一直卡在启动阶段。
+fn connect(client: &Client, url: &str) -> Vec<Section> {
+    match client.sections() {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            eprintln!("服务器上没有找到「电影」或「剧集」类型的媒体库");
+            Vec::new()
         }
-        if !cfg.watch {
-            std::process::exit(1);
+        Err(err) => {
+            eprintln!("无法连接 Plex 服务器 {url}: {err}");
+            Vec::new()
         }
-        eprintln!("{RETRY_SECONDS} 秒后重试（Ctrl+C 退出）");
-        std::thread::sleep(std::time::Duration::from_secs(RETRY_SECONDS));
     }
 }
 
-fn select_sections(
-    sections: &[Section],
-    args: &Args,
-    cfg: &Config,
-) -> Result<Vec<Section>, String> {
-    let wanted = if !args.library.is_empty() {
-        args.library.clone()
-    } else {
-        cfg.libraries.clone()
-    };
+fn select_sections(sections: &[Section], wanted: &[String]) -> Result<Vec<Section>, String> {
     if wanted.is_empty() {
         return Ok(sections.to_vec());
     }
-
-    let mut chosen: Vec<Section> = Vec::new();
-    for token in wanted {
-        let token = token.trim().to_string();
-        let found = if let Ok(index) = token.parse::<usize>() {
-            sections.get(index.saturating_sub(1)).cloned()
-        } else {
-            sections
-                .iter()
-                .find(|s| s.title == token)
-                .or_else(|| {
-                    sections
-                        .iter()
-                        .find(|s| s.title.to_lowercase().contains(&token.to_lowercase()))
-                })
-                .cloned()
-        };
-        match found {
-            Some(section) => {
-                if !chosen.iter().any(|s| s.key == section.key) {
-                    chosen.push(section);
-                }
-            }
-            None => eprintln!("找不到媒体库: {token}"),
-        }
-    }
-
+    let chosen = plex::filter_sections(sections, wanted);
     if chosen.is_empty() {
         return Err(format!(
             "没有匹配到任何媒体库，可用的是: {}",
@@ -212,9 +216,16 @@ fn select_sections(
     Ok(chosen)
 }
 
-fn run_self_test(cfg: &Config, client: Client, cache: Cache, sections: Vec<Section>, count: usize) {
+fn run_self_test(
+    cfg: &Config,
+    client: Client,
+    cache: Cache,
+    sections: Vec<Section>,
+    wanted: Vec<String>,
+    count: usize,
+) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size);
+    let mut source = app::Source::new(client, cache, sections, size, wanted);
 
     println!("自检开始：{count} 张，屏幕 {}x{}", size.0, size.1);
     let mut total = 0.0;
@@ -251,10 +262,11 @@ fn run_snapshot(
     client: Client,
     cache: Cache,
     sections: Vec<Section>,
+    wanted: Vec<String>,
     path: &str,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size);
+    let mut source = app::Source::new(client, cache, sections, size, wanted);
     let slide = match source.next() {
         Ok(s) => s,
         Err(err) => {
