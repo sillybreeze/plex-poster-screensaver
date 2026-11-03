@@ -1,0 +1,14 @@
+{
+  "plex_url": "http://192.168.1.10:32400",
+  "plex_token": "在这里填你的 Plex Token",
+  "libraries": [],
+  "display_seconds": 10,
+  "fade_seconds": 1.2,
+  "cache_dir": "covers",
+  "cache_days": 30,
+  "verify_tls": true,
+  "transcode": true,
+  "timeout": 10,
+  "ken_burns": true,
+  "motion_fps": 30
+}

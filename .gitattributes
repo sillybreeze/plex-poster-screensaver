@@ -1,0 +1,5 @@
+# 统一用 LF：Python 源码、文档、配置一律 LF，二进制文件除外
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.exe binary

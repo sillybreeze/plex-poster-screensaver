@@ -1,0 +1,33 @@
+[package]
+name = "plex-poster-screensaver"
+version = "1.0.0"
+edition = "2021"
+description = "Windows screensaver that displays your Plex movie and TV posters full-screen, with ambient color glow and Ken Burns motion."
+license = "MIT"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ureq = { version = "2", features = ["native-tls"] }
+native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+roxmltree = "0.20"
+winit = "0.30"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

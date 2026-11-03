@@ -1,0 +1,30 @@
+# 构建产物
+target/
+
+# 本地配置（含 Plex Token，绝对不要提交）
+config.json
+
+# 缓存
+cache/
+
+# 旧版 Python 的打包产物与临时文件（仅本地存在）
+build/
+dist/
+*.exe
+__pycache__/
+*.py[cod]
+_site-inspection/
+.playwright-mcp/
+acl-recovery/
+bicycle.*
+test.txt
+_*.png
+*.log
+
+# 旧版脚本里写死了 Token，不进仓库
+plex 屏保V3.py
+plex屏保v4.py
+plex屏保v4.spec
+
+# 迁移后残留的旧构建目录
+rust/
