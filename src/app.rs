@@ -1,6 +1,7 @@
 //! 窗口、事件循环与动效调度（D3D11 渲染）。
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -82,10 +83,10 @@ impl Source {
         source
     }
 
-    fn refill(&mut self, key: &str) -> Result<usize, String> {
-        let items = self.client.random_items(key, self.batch)?;
+    fn refill(&mut self, section: &Section) -> Result<usize, String> {
+        let items = self.client.random_items(section, self.batch)?;
         let count = items.len();
-        if let Some(buf) = self.buffers.get_mut(key) {
+        if let Some(buf) = self.buffers.get_mut(&section.key) {
             buf.extend(items);
         }
         Ok(count)
@@ -93,7 +94,7 @@ impl Source {
 
     /// 从磁盘索引重新装填离线队列，并打乱顺序，避免每次都是同样几张。
     fn reload_offline(&mut self) {
-        let mut items = self.cache.offline_items();
+        let mut items = self.cache.offline_items(&self.wanted);
         shuffle(&mut items);
         self.offline = items.into();
     }
@@ -111,6 +112,8 @@ impl Source {
         self.next_reconnect = now + RECONNECT_INTERVAL;
         match self.client.sections() {
             Ok(sections) if !sections.is_empty() => {
+                // 记下完整的库列表，离线时才能把 --library 的编号解析回库。
+                self.cache.remember_sections(&sections);
                 // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
                 let chosen = crate::plex::filter_sections(&sections, &self.wanted);
                 if chosen.is_empty() {
@@ -154,13 +157,13 @@ impl Source {
         let mut errors = 0;
         let mut empty_rounds = 0;
         for attempt in 0..300 {
-            let section = &self.sections[self.rr % self.sections.len()];
+            let section = self.sections[self.rr % self.sections.len()].clone();
             self.rr = self.rr.wrapping_add(1);
             let key = section.key.clone();
 
             let empty = self.buffers.get(&key).map(|b| b.is_empty()).unwrap_or(true);
             if empty {
-                match self.refill(&key) {
+                match self.refill(&section) {
                     Ok(0) => {
                         // 这个库是空的；所有库都空就别再刷请求了。
                         empty_rounds += 1;
@@ -342,6 +345,8 @@ struct Watch {
     dismiss_tick: Option<u32>,
     /// 上一轮空闲检测是否失败；用来只告警一次。
     idle_failed: bool,
+    /// 已经空闲到点但还没有内容可显示；别把 idle 重置掉，等有内容后立刻触发。
+    waiting_content: bool,
 }
 
 pub struct App {
@@ -353,6 +358,10 @@ pub struct App {
     sections: Vec<Section>,
     wanted: Vec<String>,
     rx: Option<Receiver<Slide>>,
+    /// 常驻隐藏时先从通道里取出来的一张，避免空闲到点却还没内容可显示。
+    pending_slide: Option<Slide>,
+    /// 当前预取线程的取消标志；重建/关闭时置位，失败重试路径也要能退出。
+    worker_cancel: Option<Arc<AtomicBool>>,
 
     size: (u32, u32),
     window: Option<Arc<Window>>,
@@ -394,6 +403,7 @@ impl App {
                 next_poll: now,
                 dismiss_tick: None,
                 idle_failed: false,
+                waiting_content: false,
             })
         } else {
             None
@@ -407,6 +417,8 @@ impl App {
             sections,
             wanted,
             rx: None,
+            pending_slide: None,
+            worker_cancel: None,
             size: (1920, 1080),
             window: None,
             gpu: None,
@@ -512,6 +524,19 @@ impl App {
             return;
         };
 
+        // 断网、缓存为空时先留在后台等 Plex，别全屏挂一块黑屏。
+        self.poll_pending();
+        if self.watch.is_some() && !self.has_content() {
+            if let Some(w) = &mut self.watch {
+                if !w.waiting_content {
+                    w.waiting_content = true;
+                    eprintln!("暂无可播放的海报，等待 Plex 恢复后再触发");
+                }
+                w.next_poll = now + Duration::from_secs(5);
+            }
+            return;
+        }
+
         let monitor_size = event_loop.primary_monitor().map(|monitor| {
             let size = monitor.size();
             (size.width.max(1), size.height.max(1))
@@ -554,6 +579,7 @@ impl App {
         if let Some(w) = &mut self.watch {
             w.showing = true;
             w.manual = manual;
+            w.waiting_content = false;
             w.dismiss_tick = idle::last_input_tick();
         }
     }
@@ -567,6 +593,7 @@ impl App {
         }
         if let Some(w) = &mut self.watch {
             w.showing = false;
+            w.waiting_content = false;
             w.idle.reset(now);
             w.next_poll = now + Duration::from_millis(500);
         }
@@ -601,11 +628,45 @@ impl App {
         }
     }
 
-    /// 启动/重启预取线程。旧线程的 receiver 被丢弃后会自己退出。
+    /// 从预取通道里预读一张，隐藏等待时也就能知道「现在有没有内容可显示」。
+    fn poll_pending(&mut self) {
+        if self.pending_slide.is_some() {
+            return;
+        }
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        if let Ok(slide) = rx.try_recv() {
+            if (slide.comp.width, slide.comp.height) == self.size {
+                self.pending_slide = Some(slide);
+            }
+        }
+    }
+
+    fn has_content(&self) -> bool {
+        self.pending_slide.is_some() || self.current.is_some()
+    }
+
+    /// 停掉当前预取线程：置取消位、断开接收端，并丢弃待处理画面。
+    ///
+    /// 只靠 `send()` 失败发现接收端关闭是不够的：取图一直失败时线程永远走不到
+    /// `send()`，反复重建尺寸会积累后台线程和重连请求。
+    fn stop_worker(&mut self) {
+        if let Some(cancel) = self.worker_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.rx = None;
+        self.pending_slide = None;
+    }
+
+    /// 启动/重启预取线程。
     fn start_worker(&mut self) {
+        self.stop_worker();
         let size = self.size;
         let (tx, rx): (SyncSender<Slide>, Receiver<Slide>) = sync_channel(1);
         self.rx = Some(rx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = Some(cancel.clone());
 
         let client = self.client.clone();
         let mut cache = self.cache.clone();
@@ -617,15 +678,24 @@ impl App {
         thread::spawn(move || {
             let mut source = Source::new(client, cache, sections, size, wanted);
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 match source.next() {
                     Ok(slide) => {
-                        if tx.send(slide).is_err() {
+                        if cancel.load(Ordering::Relaxed) || tx.send(slide).is_err() {
                             break;
                         }
                     }
                     Err(err) => {
                         eprintln!("取图失败: {err}");
-                        thread::sleep(Duration::from_secs(3));
+                        // 3 秒分片睡眠，收到取消信号时立刻退出，不再无限重试。
+                        for _ in 0..30 {
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                        }
                     }
                 }
             }
@@ -673,8 +743,8 @@ impl App {
             eprintln!("重建渲染器失败，下一帧再试");
         }
 
-        // 预取队列里是旧尺寸的画面，立即作废，避免上传时尺寸不一致。
-        self.rx = None;
+        // 预取队列里是旧尺寸的画面，立即作废；同时取消旧线程，别让它继续重试。
+        self.stop_worker();
 
         if immediate {
             self.pending_resize = None;
@@ -713,11 +783,16 @@ impl App {
     }
 
     fn take_next(&mut self, now: Instant) -> bool {
-        let Some(rx) = &self.rx else {
-            return false;
-        };
-        let Ok(slide) = rx.try_recv() else {
-            return false;
+        let slide = if let Some(slide) = self.pending_slide.take() {
+            slide
+        } else {
+            let Some(rx) = &self.rx else {
+                return false;
+            };
+            match rx.try_recv() {
+                Ok(slide) => slide,
+                Err(_) => return false,
+            }
         };
 
         if (slide.comp.width, slide.comp.height) != self.size {
@@ -1001,6 +1076,9 @@ impl ApplicationHandler<UserEvent> for App {
 
         // 窗口尺寸稳定后再重建交换链/预取线程。
         self.apply_pending_resize(now);
+        // 隐藏等待时也预读一张，空闲到点就能判断有没有内容可显示。
+        self.poll_pending();
+        let content = self.pending_slide.is_some() || self.current.is_some();
 
         // 常驻模式：藏着的时候数空闲，显示的时候盯输入
         let mut start = false;
@@ -1034,8 +1112,20 @@ impl ApplicationHandler<UserEvent> for App {
                             );
                         }
                         if idle >= w.threshold {
-                            eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
-                            start = true;
+                            if content {
+                                eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
+                                start = true;
+                            } else {
+                                // 已经空闲到点但 Plex/缓存还没内容：保留 idle 计时，
+                                // 内容一到就能触发，而不是再等一个完整阈值。
+                                if !w.waiting_content {
+                                    w.waiting_content = true;
+                                    eprintln!("已空闲但暂无可播放的海报，等待 Plex 恢复");
+                                }
+                                w.next_poll = now + Duration::from_secs(5);
+                            }
+                        } else {
+                            w.waiting_content = false;
                         }
                     }
                     None => {

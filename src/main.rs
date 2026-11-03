@@ -43,14 +43,6 @@ use config::Config;
 use plex::{Cache, Client, Section};
 
 fn main() {
-    // 已经有实例在跑就只叫它一声，不再开第二个窗口
-    if trigger::signal_existing() {
-        println!("已经有一个实例在跑，已通知它立刻开始");
-        return;
-    }
-    let trigger_event = trigger::create();
-
-    timer::begin();
     let args = match config::parse_args() {
         Ok(a) => a,
         Err(err) => {
@@ -62,6 +54,20 @@ fn main() {
         print!("{}", config::HELP);
         return;
     }
+
+    // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
+    // 只有真正要开窗口的模式才检查是否已有实例在跑。
+    let utility = args.list || args.self_test.is_some() || args.snapshot.is_some();
+    let trigger_event = if utility {
+        None
+    } else {
+        if trigger::signal_existing() {
+            println!("已经有一个实例在跑，已通知它立刻开始");
+            return;
+        }
+        timer::begin();
+        trigger::create()
+    };
 
     let cfg = match config::load(&args) {
         Ok(cfg) => cfg,
@@ -110,7 +116,7 @@ fn main() {
         return;
     }
 
-    let cache = if cfg.cache_dir_explicit && !cfg.cache_dir_auto {
+    let mut cache = if cfg.cache_dir_explicit && !cfg.cache_dir_auto {
         match Cache::open(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming) {
             Ok(cache) => cache,
             Err(err) => {
@@ -122,20 +128,33 @@ fn main() {
         Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming)
     };
     cache.prune();
+    // 保存完整媒体库列表，离线时才能把 --library 的编号/标题解析回库。
+    cache.remember_sections(&sections);
 
     if selected.is_empty() {
-        let offline = cache.offline_items();
+        let offline = cache.offline_items(&wanted);
         if offline.is_empty() {
+            let waiting = cfg.watch
+                && !args.preview
+                && args.self_test.is_none()
+                && args.snapshot.is_none();
+            if waiting {
+                eprintln!(
+                    "Plex 暂不可用，本地也没有可离线播放的缓存；常驻等待，后台会自动重连"
+                );
+            } else {
+                eprintln!(
+                    "无法连接 Plex，本地也没有可离线播放的缓存: {}",
+                    cache.dir.display()
+                );
+                std::process::exit(1);
+            }
+        } else {
             eprintln!(
-                "无法连接 Plex，本地也没有可离线播放的缓存: {}",
-                cache.dir.display()
+                "Plex 暂不可用，先用本地缓存播放 {} 张；后台会自动重连",
+                offline.len()
             );
-            std::process::exit(1);
         }
-        eprintln!(
-            "Plex 暂不可用，先用本地缓存播放 {} 张；后台会自动重连",
-            offline.len()
-        );
     }
 
     if let Some(count) = args.self_test {
