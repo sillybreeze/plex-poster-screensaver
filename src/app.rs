@@ -744,7 +744,8 @@ impl App {
         let now = Instant::now();
         let watch = if cfg.watch && !preview {
             Some(Watch {
-                threshold: Duration::from_secs_f64(cfg.idle_seconds.max(1.0)),
+                threshold: Duration::try_from_secs_f64(cfg.idle_seconds)
+                    .unwrap_or(Duration::from_secs(300)),
                 idle: Idle::new(cfg.mouse_only, now),
                 showing: false,
                 manual: false,
@@ -1330,12 +1331,13 @@ impl App {
     }
 
     fn render_motion(&mut self, now: Instant, start: Instant) {
-        let display = self.cfg.display_seconds.max(0.1);
+        let display = Duration::try_from_secs_f64(self.cfg.display_seconds.max(0.1))
+            .unwrap_or(Duration::from_secs(10));
         let elapsed = (now - start).as_secs_f64();
         // 切张只看 elapsed；Ken Burns 进度只负责动效。关掉动效时 progress 恒 0，
         // 但停留时间到了仍然要换下一张。
         let progress = if self.cfg.ken_burns {
-            (elapsed / display).min(1.0) as f32
+            (elapsed / display.as_secs_f64()).min(1.0) as f32
         } else {
             0.0
         };
@@ -1346,7 +1348,7 @@ impl App {
             gpu.draw(current, self.uv, 1.0);
         }
 
-        if elapsed >= display {
+        if elapsed >= display.as_secs_f64() {
             if self.take_next(now) {
                 return;
             }
@@ -1358,7 +1360,7 @@ impl App {
             // 没有动效就不需要每 120ms 重画同一帧，直接等到该换张的时刻。
             // 常驻模式还要每 500ms 醒一次检查输入（尤其宽限期结束时），
             // 不能只靠窗口事件 —— 焦点万一不在自己身上就收不起来。
-            let end = start + Duration::from_secs_f64(display);
+            let end = start.checked_add(display).unwrap_or(now);
             let mut next = end;
             if self.watch.is_some() {
                 next = next.min(now + Duration::from_millis(500));

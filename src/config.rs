@@ -5,6 +5,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -285,13 +286,13 @@ plex-poster-screensaver (Rust)
   --token <令牌>        Plex Token（也可用环境变量 PLEX_TOKEN）
   --library <编号|名称> 选择媒体库，可重复
   --list                列出媒体库后退出
-  --display <秒>        每张停留时间，默认 10
-  --fade <秒>           淡入淡出时长，默认 1.2，0 表示关闭
+  --display <秒>        每张停留时间，默认 10（0.1–3600）
+  --fade <秒>           淡入淡出时长，默认 1.2（0–60），0 表示关闭
   --no-motion           关闭 Ken Burns 缓慢推近（轮播继续）
-  --motion-fps <帧率>   动效帧率，默认 30
+  --motion-fps <帧率>   动效帧率，默认 30（1–120）
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
-  --cache-days <天数>   缓存保留天数，默认 30
+  --cache-days <天数>   缓存保留天数，默认 30（0–36500，0 表示不限）
   --cache-max-mb <MB>   缓存容量上限，默认 2048；0 表示不限
   --cache-naming <方式> 缓存文件名：title=标题_编号（默认），key=只留编号
   --no-transcode        不使用服务端缩图
@@ -299,7 +300,7 @@ plex-poster-screensaver (Rust)
   --preview             以 1280x720 窗口预览
   --watch               常驻等待：空闲到点后自动全屏，有输入就收起
   --now                 立刻全屏，不等空闲（覆盖配置里的 watch）
-  --idle <分钟>         空闲多久触发，默认 5（可写小数，如 0.1 = 6 秒）
+  --idle <分钟>         空闲多久触发，默认 5（0.0833–1440，即 5 秒–24 小时）
   --mouse-only          只把鼠标当活动，键盘不算（默认和系统屏保一致：键鼠都算）
   --hotkey <组合键>     立刻开始的全局热键，默认 Ctrl+Alt+P
   --no-hotkey           停用全局热键
@@ -467,7 +468,7 @@ pub fn load(args: &Args) -> Result<Config, String> {
                         cfg.watch = v;
                     }
                     if let Some(v) = file.idle_minutes {
-                        cfg.idle_seconds = (v * 60.0).max(5.0);
+                        cfg.idle_seconds = v * 60.0;
                     }
                     if let Some(v) = file.mouse_only {
                         cfg.mouse_only = v;
@@ -518,13 +519,13 @@ pub fn load(args: &Args) -> Result<Config, String> {
         cfg.token = v.clone();
     }
     if let Some(v) = args.display {
-        cfg.display_seconds = v.max(0.5);
+        cfg.display_seconds = v;
     }
     if let Some(v) = args.fade {
-        cfg.fade_seconds = v.max(0.0);
+        cfg.fade_seconds = v;
     }
     if let Some(v) = args.motion_fps {
-        cfg.motion_fps = v.min(120);
+        cfg.motion_fps = v;
     }
     if args.no_motion {
         cfg.ken_burns = false;
@@ -545,7 +546,7 @@ pub fn load(args: &Args) -> Result<Config, String> {
         cfg.hotkey = None;
     }
     if let Some(v) = args.idle {
-        cfg.idle_seconds = (v * 60.0).max(5.0);
+        cfg.idle_seconds = v * 60.0;
     }
     if args.no_transcode {
         cfg.transcode = false;
@@ -565,14 +566,67 @@ pub fn load(args: &Args) -> Result<Config, String> {
         cfg.cache_naming = n;
     }
     if let Some(v) = args.cache_days {
-        cfg.cache_days = v.max(0);
+        cfg.cache_days = v;
     }
     if let Some(v) = args.cache_max_mb {
         cfg.cache_max_mb = v;
     }
 
     cfg.url = cfg.url.trim_end_matches('/').to_string();
+    validate(&cfg)?;
     Ok(cfg)
+}
+
+/// 配置合并完成后统一校验；错误信息带字段名，便于定位命令行或 config.json。
+fn validate(cfg: &Config) -> Result<(), String> {
+    check_seconds(
+        "display_seconds（--display）",
+        cfg.display_seconds,
+        0.1,
+        3600.0,
+    )?;
+    check_seconds("fade_seconds（--fade）", cfg.fade_seconds, 0.0, 60.0)?;
+    check_seconds(
+        "idle_seconds（--idle / idle_minutes）",
+        cfg.idle_seconds,
+        5.0,
+        86_400.0,
+    )?;
+
+    if !(1..=600).contains(&cfg.timeout) {
+        return Err(format!(
+            "timeout 超出允许范围 1..=600 秒，当前为 {}",
+            cfg.timeout
+        ));
+    }
+    if !(0..=36_500).contains(&cfg.cache_days) {
+        return Err(format!(
+            "cache_days 超出允许范围 0..=36500 天，当前为 {}",
+            cfg.cache_days
+        ));
+    }
+    if !(1..=120).contains(&cfg.motion_fps) {
+        return Err(format!(
+            "motion_fps 超出允许范围 1..=120，当前为 {}",
+            cfg.motion_fps
+        ));
+    }
+    Ok(())
+}
+
+/// 校验有限性、范围和到 `Duration` 的可转换性，全部通过后上层不再有 panic 风险。
+fn check_seconds(name: &str, value: f64, min: f64, max: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{name} 必须是有限数值，当前为 {value}"));
+    }
+    if value < min || value > max {
+        return Err(format!(
+            "{name} 超出允许范围 {min}..={max} 秒，当前为 {value}"
+        ));
+    }
+    Duration::try_from_secs_f64(value)
+        .map_err(|err| format!("{name} 无法转换为时间间隔: {err}"))?;
+    Ok(())
 }
 
 /// 配置文件所在目录；相对路径的 `cache_dir` 以它为基准。
@@ -635,5 +689,178 @@ mod tests {
             resolve_path(base, "C:/other/covers"),
             PathBuf::from("C:/other/covers")
         );
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range_values() {
+        fn rejected(field: &str, cfg: Config) {
+            let err = validate(&cfg).expect_err("应拒绝无效配置");
+            assert!(
+                err.contains(field),
+                "错误信息应包含字段名 {field}，实际为 {err}"
+            );
+        }
+
+        rejected(
+            "display_seconds",
+            Config {
+                display_seconds: f64::INFINITY,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "display_seconds",
+            Config {
+                display_seconds: f64::NAN,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "display_seconds",
+            Config {
+                display_seconds: -1.0,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "display_seconds",
+            Config {
+                display_seconds: 0.0,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "display_seconds",
+            Config {
+                display_seconds: 1e308,
+                ..Default::default()
+            },
+        );
+
+        rejected(
+            "fade_seconds",
+            Config {
+                fade_seconds: f64::INFINITY,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "fade_seconds",
+            Config {
+                fade_seconds: -0.1,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "fade_seconds",
+            Config {
+                fade_seconds: 60.1,
+                ..Default::default()
+            },
+        );
+
+        rejected(
+            "idle_seconds",
+            Config {
+                idle_seconds: f64::INFINITY,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "idle_seconds",
+            Config {
+                idle_seconds: f64::NAN,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "idle_seconds",
+            Config {
+                idle_seconds: 4.9,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "idle_seconds",
+            Config {
+                idle_seconds: 86_401.0,
+                ..Default::default()
+            },
+        );
+
+        rejected(
+            "timeout",
+            Config {
+                timeout: 0,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "timeout",
+            Config {
+                timeout: 601,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "cache_days",
+            Config {
+                cache_days: -1,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "cache_days",
+            Config {
+                cache_days: 36_501,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "motion_fps",
+            Config {
+                motion_fps: 0,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "motion_fps",
+            Config {
+                motion_fps: 121,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn accepts_valid_boundaries_and_zero_fade() {
+        let mut cfg = Config::default();
+        cfg.display_seconds = 0.1;
+        cfg.fade_seconds = 0.0;
+        cfg.idle_seconds = 5.0;
+        cfg.timeout = 1;
+        cfg.cache_days = 0;
+        cfg.motion_fps = 1;
+        assert!(
+            validate(&cfg).is_ok(),
+            "最小边界应合法: {:?}",
+            validate(&cfg)
+        );
+
+        cfg.display_seconds = 3600.0;
+        cfg.fade_seconds = 60.0;
+        cfg.idle_seconds = 86_400.0;
+        cfg.timeout = 600;
+        cfg.cache_days = 36_500;
+        cfg.motion_fps = 120;
+        assert!(
+            validate(&cfg).is_ok(),
+            "最大边界应合法: {:?}",
+            validate(&cfg)
+        );
+
+        // 负零按 0 处理，淡入淡出允许关闭。
+        cfg.fade_seconds = -0.0;
+        assert!(validate(&cfg).is_ok());
     }
 }
