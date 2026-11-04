@@ -38,14 +38,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, KillTimer,
-    LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
-    TrackPopupMenu, TranslateMessage, GWL_STYLE, HMENU, IDI_APPLICATION, MENU_ITEM_FLAGS,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNORMAL,
-    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL,
-    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION,
-    WS_MAXIMIZE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    SetTimer, TrackPopupMenu, TranslateMessage, GWL_STYLE, HICON, HMENU, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
+    SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_POWERBROADCAST,
+    WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_MAXIMIZE,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use winit::event_loop::EventLoopProxy;
 use windows::core::PWSTR;
@@ -156,6 +157,34 @@ pub fn start(
     }
 }
 
+/// 优先从 exe 内嵌的 `icon.ico`（资源 ID 1）加载托盘小图标；
+/// 没嵌入资源时退回系统默认图标。
+#[allow(clippy::manual_dangling_ptr)] // Win32 的 MAKEINTRESOURCE(1)，不是可解引用的指针
+fn load_app_icon() -> HICON {
+    unsafe {
+        if let Ok(module) = GetModuleHandleW(None) {
+            let instance = HINSTANCE(module.0);
+            let resource = PCWSTR(1usize as *const u16);
+            let width = GetSystemMetrics(SM_CXSMICON);
+            let height = GetSystemMetrics(SM_CYSMICON);
+            if let Ok(handle) = LoadImageW(
+                instance,
+                resource,
+                IMAGE_ICON,
+                width,
+                height,
+                LR_DEFAULTCOLOR | LR_SHARED,
+            ) {
+                return HICON(handle.0);
+            }
+            if let Ok(icon) = LoadIconW(instance, resource) {
+                return icon;
+            }
+        }
+        LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+    }
+}
+
 fn create_window(
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
@@ -168,8 +197,7 @@ fn create_window(
         let instance = HINSTANCE(module.0);
         let class_name = w!("PlexPosterScreensaverTray");
 
-        let icon =
-            LoadIconW(None, IDI_APPLICATION).map_err(|err| format!("加载托盘图标失败: {err}"))?;
+        let icon = load_app_icon();
 
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),

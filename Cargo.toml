@@ -5,6 +5,9 @@ edition = "2021"
 description = "Windows screensaver that displays your Plex movie and TV posters full-screen, with ambient color glow and Ken Burns motion."
 license = "MIT"
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ureq = { version = "2", features = ["native-tls"] }

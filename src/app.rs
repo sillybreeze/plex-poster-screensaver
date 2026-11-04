@@ -13,6 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::platform::windows::WindowExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -374,6 +375,13 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 const IDLE_GRACE: Duration = Duration::from_millis(700);
 /// 手动拉起（热键 / 再启动）留得久一点：按下和松开热键本身都算输入。
 const MANUAL_GRACE: Duration = Duration::from_millis(1200);
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+fn window_icon() -> Option<winit::window::Icon> {
+    let rgba = image::load_from_memory(WINDOW_ICON_PNG).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
 
 /// 事件循环的自定义事件：托盘、系统会话/电源通知和再启动都会走这里。
 pub enum UserEvent {
@@ -1252,7 +1260,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
+            Ok(w) => {
+                let window = Arc::new(w);
+                if let Some(icon) = window_icon() {
+                    window.set_window_icon(Some(icon.clone()));
+                    window.set_taskbar_icon(Some(icon));
+                }
+                window
+            }
             Err(err) => {
                 log_error!("创建窗口失败: {err}");
                 event_loop.exit();
