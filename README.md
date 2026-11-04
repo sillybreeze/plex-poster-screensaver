@@ -15,6 +15,10 @@ Plex 海报屏保：从媒体库随机取电影/剧集海报全屏轮播，自�
 - **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡
 - **本地缓存 + 离线播放**：`index.json` 记录媒体信息，Plex 断网时继续轮播，并每 30 秒后台重连
 - **常驻等待**：`--watch` 隐藏等待，空闲到点全屏，有输入立刻收起
+- **托盘控制**：查看在线/离线、缓存数量和当前海报；立即播放、暂停 1 小时、恢复、打开配置/缓存/日志、退出
+- **免打扰**：全屏游戏、全屏视频或演示模式时自动暂停；锁屏、显示器关闭、休眠时停止工作，恢复后重建渲染
+- **可排查**：日志写到 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`，托盘菜单可直接打开
+- **缓存维护**：按天数和容量上限清理，海报 thumb 版本变化时自动刷新
 - **尺寸跟随**：分辨率变化时重建交换链、合成尺寸和预取线程
 
 ## 下载
@@ -52,6 +56,19 @@ cargo build --release
 
 没触发时窗口隐藏、不渲染、不 `Present`，D3D11 设备等第一次触发才创建。
 
+### 托盘与免打扰
+
+常驻模式启动后，通知区域会有托盘图标：
+
+- 状态行显示在线/离线、缓存数量和当前海报；鼠标悬停也能看到
+- **立即播放**、**暂停自动触发 1 小时**、**恢复自动触发**
+- 打开配置文件、缓存目录、日志目录
+- 退出程序
+
+全屏游戏、全屏视频、PowerPoint 演示时自动暂停触发；锁屏、显示器关闭、系统休眠时同样暂停并停止渲染，恢复后自动重建 D3D 设备。窗口化的视频/游戏无法可靠识别，需要时用托盘的“暂停 1 小时”。
+
+日志文件在 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`，启动时若超过 5MB 会轮换成 `app.1.log`；后台运行出问题时先看这里。
+
 ### 开机自启
 
 ```powershell
@@ -83,6 +100,7 @@ Copy-Item config.example.json config.json
   "cache_dir": "covers",
   "cache_naming": "title",
   "cache_days": 30,
+  "cache_max_mb": 2048,
   "ken_burns": true,
   "motion_fps": 30
 }
@@ -93,6 +111,8 @@ Copy-Item config.example.json config.json
 **离线播放**：缓存目录的 `index.json` 记录 ratingKey、标题、thumb 和所属媒体库；断网时用缓存轮播，恢复后自动切回在线。旧版 `1479.jpg`、`标题_1479.jpg` 会自动扫描进索引；Plex 不可用且完全没有缓存时，常驻模式会保持后台等待。
 
 **缓存文件名**：默认 `标题_ratingKey.jpg`（如 `阿凡达 水之道_1479.jpg`）；`--cache-naming key` 改为 `1479.jpg`。命中旧命名会直接改名，不重新下载。
+
+**缓存维护**：`cache_days` 按天数清理，`cache_max_mb` 限制总容量（默认 2048，0 表示不限），运行期间每小时或每新下载 50 张检查一次；Plex 海报 thumb 版本变化时会重新下载，不会一直用旧图。
 
 ## 命令行
 
@@ -106,6 +126,7 @@ Copy-Item config.example.json config.json
 | `--no-motion` | 关闭 Ken Burns 动效（轮播继续） |
 | `--cache-dir <目录>` | 缓存位置，`auto` 自动挑选 |
 | `--cache-days <天>` | 缓存保留天数 |
+| `--cache-max-mb <MB>` | 缓存容量上限，0 表示不限 |
 | `--watch` / `--now` | 常驻等待 / 立刻全屏 |
 | `--preview` | 1280x720 窗口预览 |
 | `--self-test <N>` / `--snapshot <png>` | 无界面自检 / 导出结果 |

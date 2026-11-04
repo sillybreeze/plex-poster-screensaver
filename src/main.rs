@@ -32,21 +32,27 @@ mod timer {
     pub fn end() {}
 }
 mod idle;
+mod logging;
+mod platform;
 mod plex;
 mod render;
+mod status;
 mod trigger;
 
 use std::path::Path;
 use std::time::Instant;
 
 use config::Config;
+use logging::{log_error, log_warn};
 use plex::{Cache, Client, Section};
 
 fn main() {
+    logging::init();
+
     let args = match config::parse_args() {
         Ok(a) => a,
         Err(err) => {
-            eprintln!("参数错误: {err}\n\n{}", config::HELP);
+            log_error!("参数错误: {err}\n\n{}", config::HELP);
             std::process::exit(2);
         }
     };
@@ -54,6 +60,8 @@ fn main() {
         print!("{}", config::HELP);
         return;
     }
+
+    let config_path = config::locate_config(args.config.as_deref());
 
     // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
     // 只有真正要开窗口的模式才检查是否已有实例在跑。
@@ -72,12 +80,12 @@ fn main() {
     let cfg = match config::load(&args) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("配置错误: {err}");
+            log_error!("配置错误: {err}");
             std::process::exit(2);
         }
     };
     if cfg.token.is_empty() {
-        eprintln!("缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。");
+        log_error!("缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。");
         std::process::exit(1);
     }
 
@@ -89,6 +97,10 @@ fn main() {
 
     let client = Client::new(&cfg);
     let sections = connect(&client, &cfg.url);
+    let status_handle = status::new();
+    status::update(&status_handle, |current| {
+        current.online = !sections.is_empty();
+    });
 
     let selected = if sections.is_empty() {
         // 连不上也不急着退出：本地索引里有缓存就先用缓存播放。
@@ -97,7 +109,7 @@ fn main() {
         match select_sections(&sections, &wanted) {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("{err}");
+                log_error!("{err}");
                 std::process::exit(1);
             }
         }
@@ -105,7 +117,7 @@ fn main() {
 
     if args.list {
         if selected.is_empty() {
-            eprintln!("无法连接 Plex 或没有可用媒体库");
+            log_error!("无法连接 Plex 或没有可用媒体库");
             std::process::exit(1);
         }
         println!("Plex: {}", cfg.url);
@@ -120,14 +132,15 @@ fn main() {
         match Cache::open(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming) {
             Ok(cache) => cache,
             Err(err) => {
-                eprintln!("{err}");
+                log_error!("{err}");
                 std::process::exit(2);
             }
         }
     } else {
         Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming)
     };
-    cache.prune();
+    cache.set_max_bytes(cfg.cache_max_mb.saturating_mul(1024 * 1024));
+    cache.maintain();
     // 保存完整媒体库列表，离线时才能把 --library 的编号/标题解析回库。
     cache.remember_sections(&sections);
 
@@ -139,18 +152,18 @@ fn main() {
                 && args.self_test.is_none()
                 && args.snapshot.is_none();
             if waiting {
-                eprintln!(
+                log_warn!(
                     "Plex 暂不可用，本地也没有可离线播放的缓存；常驻等待，后台会自动重连"
                 );
             } else {
-                eprintln!(
+                log_error!(
                     "无法连接 Plex，本地也没有可离线播放的缓存: {}",
                     cache.dir.display()
                 );
                 std::process::exit(1);
             }
         } else {
-            eprintln!(
+            log_warn!(
                 "Plex 暂不可用，先用本地缓存播放 {} 张；后台会自动重连",
                 offline.len()
             );
@@ -158,11 +171,27 @@ fn main() {
     }
 
     if let Some(count) = args.self_test {
-        run_self_test(&cfg, client, cache, selected, wanted, count);
+        run_self_test(
+            &cfg,
+            client,
+            cache,
+            selected,
+            wanted,
+            status_handle,
+            count,
+        );
         return;
     }
     if let Some(path) = &args.snapshot {
-        run_snapshot(&cfg, client, cache, selected, wanted, path);
+        run_snapshot(
+            &cfg,
+            client,
+            cache,
+            selected,
+            wanted,
+            status_handle,
+            path,
+        );
         return;
     }
 
@@ -189,11 +218,20 @@ fn main() {
         }
     );
 
-    let app = app::App::new(cfg, args.preview, client, cache, selected, wanted);
+    let app = app::App::new(
+        cfg,
+        args.preview,
+        client,
+        cache,
+        selected,
+        wanted,
+        status_handle,
+        config_path,
+    );
     let result = app.run(trigger_event);
     timer::end();
     if let Err(err) = result {
-        eprintln!("{err}");
+        log_error!("{err}");
         std::process::exit(1);
     }
 }
@@ -207,11 +245,11 @@ fn connect(client: &Client, url: &str) -> Vec<Section> {
     match client.sections() {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
-            eprintln!("服务器上没有找到「电影」或「剧集」类型的媒体库");
+            log_warn!("服务器上没有找到「电影」或「剧集」类型的媒体库");
             Vec::new()
         }
         Err(err) => {
-            eprintln!("无法连接 Plex 服务器 {url}: {err}");
+            log_warn!("无法连接 Plex 服务器 {url}: {err}");
             Vec::new()
         }
     }
@@ -241,10 +279,11 @@ fn run_self_test(
     cache: Cache,
     sections: Vec<Section>,
     wanted: Vec<String>,
+    status: status::Shared,
     count: usize,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size, wanted);
+    let mut source = app::Source::new(client, cache, sections, size, wanted, status);
 
     println!("自检开始：{count} 张，屏幕 {}x{}", size.0, size.1);
     let mut total = 0.0;
@@ -263,7 +302,7 @@ fn run_self_test(
                 );
             }
             Err(err) => {
-                eprintln!("自检失败: {err}");
+                log_error!("自检失败: {err}");
                 std::process::exit(1);
             }
         }
@@ -282,14 +321,15 @@ fn run_snapshot(
     cache: Cache,
     sections: Vec<Section>,
     wanted: Vec<String>,
+    status: status::Shared,
     path: &str,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size, wanted);
+    let mut source = app::Source::new(client, cache, sections, size, wanted, status);
     let slide = match source.next() {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("取图失败: {err}");
+            log_error!("取图失败: {err}");
             std::process::exit(1);
         }
     };
@@ -299,7 +339,7 @@ fn run_snapshot(
     match render::save_png(&buffer, size.0, size.1, Path::new(path)) {
         Ok(()) => println!("已导出渲染结果: {path} （{}）", slide.item.title),
         Err(err) => {
-            eprintln!("{err}");
+            log_error!("{err}");
             std::process::exit(1);
         }
     }

@@ -11,6 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 
+use crate::logging::{log_info, log_warn};
+
 pub const APP_NAME: &str = "PlexPosterScreensaver";
 pub const DEFAULT_URL: &str = "http://127.0.0.1:32400";
 
@@ -179,6 +181,8 @@ pub struct Config {
     /// 显式要求自动挑选（--cache-dir auto）
     pub cache_dir_auto: bool,
     pub cache_days: i64,
+    /// 缓存容量上限（MB）；0 表示不限
+    pub cache_max_mb: u64,
     pub verify_tls: bool,
     pub transcode: bool,
     pub timeout: u64,
@@ -207,6 +211,7 @@ impl Default for Config {
             cache_dir_explicit: false,
             cache_dir_auto: false,
             cache_days: 30,
+            cache_max_mb: 2048,
             verify_tls: true,
             transcode: true,
             timeout: 10,
@@ -253,6 +258,7 @@ pub struct Args {
     pub cache_dir: Option<String>,
     pub cache_naming: Option<Naming>,
     pub cache_days: Option<i64>,
+    pub cache_max_mb: Option<u64>,
     pub config: Option<String>,
     pub self_test: Option<usize>,
     pub snapshot: Option<String>,
@@ -284,6 +290,7 @@ plex-poster-screensaver (Rust)
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
   --cache-days <天数>   缓存保留天数，默认 30
+  --cache-max-mb <MB>   缓存容量上限，默认 2048；0 表示不限
   --cache-naming <方式> 缓存文件名：title=标题_编号（默认），key=只留编号
   --no-transcode        不使用服务端缩图
   --insecure            HTTPS 跳过证书校验
@@ -320,6 +327,7 @@ pub fn parse_args() -> Result<Args, String> {
             "--insecure" => args.insecure = true,
             "--cache-dir" => args.cache_dir = Some(value("--cache-dir")?),
             "--cache-days" => args.cache_days = Some(parse_num(&value("--cache-days")?)?),
+            "--cache-max-mb" => args.cache_max_mb = Some(parse_num(&value("--cache-max-mb")?)?),
             "--cache-naming" => {
                 let raw = value("--cache-naming")?;
                 args.cache_naming =
@@ -362,6 +370,7 @@ struct FileConfig {
     cache_dir: Option<String>,
     cache_naming: Option<String>,
     cache_days: Option<i64>,
+    cache_max_mb: Option<u64>,
     verify_tls: Option<bool>,
     transcode: Option<bool>,
     timeout: Option<u64>,
@@ -425,11 +434,14 @@ pub fn load(args: &Args) -> Result<Config, String> {
                     if let Some(v) = &file.cache_naming {
                         match Naming::parse(v) {
                             Some(n) => cfg.cache_naming = n,
-                            None => eprintln!("config.json 里的 cache_naming 无效（title|key）: {v}"),
+                            None => log_warn!("config.json 里的 cache_naming 无效（title|key）: {v}"),
                         }
                     }
                     if let Some(v) = file.cache_days {
                         cfg.cache_days = v;
+                    }
+                    if let Some(v) = file.cache_max_mb {
+                        cfg.cache_max_mb = v;
                     }
                     if let Some(v) = file.verify_tls {
                         cfg.verify_tls = v;
@@ -462,11 +474,11 @@ pub fn load(args: &Args) -> Result<Config, String> {
                         } else {
                             match Hotkey::parse(v) {
                                 Some(h) => cfg.hotkey = Some(h),
-                                None => eprintln!("config.json 里的 hotkey 无效，已忽略: {v}"),
+                                None => log_warn!("config.json 里的 hotkey 无效，已忽略: {v}"),
                             }
                         }
                     }
-                    eprintln!("已加载配置: {}", path.display());
+                    log_info!("已加载配置: {}", path.display());
                 }
                 Err(err) => {
                     if explicit {
@@ -475,14 +487,14 @@ pub fn load(args: &Args) -> Result<Config, String> {
                             path.display()
                         ));
                     }
-                    eprintln!("配置文件解析失败，已忽略 {}: {err}", path.display());
+                    log_warn!("配置文件解析失败，已忽略 {}: {err}", path.display());
                 }
             },
             Err(err) => {
                 if explicit {
                     return Err(format!("无法读取配置文件 {}: {err}", path.display()));
                 }
-                eprintln!("无法读取配置 {}: {err}", path.display());
+                log_warn!("无法读取配置 {}: {err}", path.display());
             }
         }
     }
@@ -549,6 +561,9 @@ pub fn load(args: &Args) -> Result<Config, String> {
     }
     if let Some(v) = args.cache_days {
         cfg.cache_days = v.max(0);
+    }
+    if let Some(v) = args.cache_max_mb {
+        cfg.cache_max_mb = v;
     }
 
     cfg.url = cfg.url.trim_end_matches('/').to_string();

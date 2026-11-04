@@ -391,11 +391,13 @@ impl Gpu {
         }
     }
 
-    pub fn present(&self) {
+    pub fn present(&self) -> Result<(), String> {
         unsafe {
-            let hr = self.swap.Present(1, Default::default());
-            if hr.is_err() {
-                eprintln!("Present 失败: {hr:?}");
+            let result = self.swap.Present(1, Default::default());
+            if result.is_err() {
+                Err(format!("Present 失败: 0x{:08X}", result.0))
+            } else {
+                Ok(())
             }
         }
     }

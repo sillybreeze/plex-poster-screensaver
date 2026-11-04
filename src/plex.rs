@@ -3,11 +3,12 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Naming};
+use crate::logging::{log_info, log_warn};
 
 /// 本地索引文件名：记录已经缓存过哪些媒体条目，断网时用它枚举缓存。
 const INDEX_FILE: &str = "index.json";
@@ -238,6 +239,10 @@ pub struct Cache {
     pub misses: u64,
     index: Vec<MediaItem>,
     sections: Vec<Section>,
+    /// 容量上限（字节）；None 表示不限
+    max_bytes: Option<u64>,
+    last_maintain: Instant,
+    stores_since_maintain: u32,
 }
 
 impl Cache {
@@ -269,8 +274,8 @@ impl Cache {
         for candidate in candidates {
             if writable(&candidate) {
                 if candidate != preferred {
-                    eprintln!(
-                        "提示: {} 不可写，缓存改存到 {}",
+                    log_warn!(
+                        "{} 不可写，缓存改存到 {}",
                         preferred.display(),
                         candidate.display()
                     );
@@ -278,7 +283,7 @@ impl Cache {
                 return Self::at(&candidate, days, naming);
             }
         }
-        eprintln!("提示: 没有可写的缓存目录，改用内存缓存（显示正常，重启后会重新下载）");
+        log_warn!("没有可写的缓存目录，改用内存缓存（显示正常，重启后会重新下载）");
         Self {
             dir: PathBuf::new(),
             naming,
@@ -287,6 +292,9 @@ impl Cache {
             misses: 0,
             index: Vec::new(),
             sections: Vec::new(),
+            max_bytes: None,
+            last_maintain: Instant::now(),
+            stores_since_maintain: 0,
         }
     }
 
@@ -302,6 +310,9 @@ impl Cache {
             misses: 0,
             index,
             sections,
+            max_bytes: None,
+            last_maintain: Instant::now(),
+            stores_since_maintain: 0,
         }
     }
 
@@ -489,8 +500,21 @@ impl Cache {
             .find(|candidate| *candidate != wanted && is_usable(candidate))
     }
 
+    /// Plex 的 thumb 路径带版本号；版本变了说明海报被换过，旧文件应当视为未命中。
+    fn thumb_changed(&self, item: &MediaItem) -> bool {
+        self.index
+            .iter()
+            .find(|existing| existing.rating_key == item.rating_key)
+            .is_some_and(|existing| {
+                !existing.thumb.is_empty() && !item.thumb.is_empty() && existing.thumb != item.thumb
+            })
+    }
+
     pub fn get(&mut self, item: &MediaItem) -> Option<PathBuf> {
         if !self.is_disk() {
+            return None;
+        }
+        if self.thumb_changed(item) {
             return None;
         }
         let wanted = self.path_for(item);
@@ -527,51 +551,118 @@ impl Cache {
             return None;
         }
         self.misses += 1;
+        self.stores_since_maintain = self.stores_since_maintain.saturating_add(1);
         self.remember(item);
         Some(path)
     }
 
-    /// 只清理本程序自己命名的文件（纯 ratingKey、标题_ratingKey、哈希兜底），
-    /// 旧版 Python 留下的纯标题文件一律不动。
-    pub fn prune(&self) {
+    /// 设置缓存容量上限；0 表示不限。
+    pub fn set_max_bytes(&mut self, bytes: u64) {
+        self.max_bytes = if bytes == 0 { None } else { Some(bytes) };
+    }
+
+    /// 运行期间定时维护：新下载积累到一定数量或距离上次清理超过一小时才真正扫描。
+    pub fn maintain_if_due(&mut self) {
         if !self.is_disk() {
             return;
         }
-        let Some(max_age) = self.max_age else { return };
-        let Ok(entries) = fs::read_dir(&self.dir) else {
+        if self.stores_since_maintain >= 50
+            || self.last_maintain.elapsed() >= Duration::from_secs(3600)
+        {
+            self.maintain();
+        }
+    }
+
+    /// 清理过期文件、按容量上限删除最旧的本程序缓存，并同步裁剪索引。
+    ///
+    /// 只处理本程序自己命名的文件，旧版 Python 留下的纯标题文件一律不动。
+    pub fn maintain(&mut self) {
+        if !self.is_disk() {
             return;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
-                continue;
+        }
+
+        let mut removed = 0usize;
+
+        if let Some(max_age) = self.max_age {
+            if let Ok(entries) = fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !is_cache_file(&path) {
+                        continue;
+                    }
+                    if let Ok(meta) = path.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            let expired = SystemTime::now()
+                                .duration_since(modified)
+                                .map(|age| age > max_age)
+                                .unwrap_or(false);
+                            if expired && fs::remove_file(&path).is_ok() {
+                                removed += 1;
+                            }
+                        }
+                    }
+                }
             }
-            let ours = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(is_ours_stem)
-                .unwrap_or(false);
-            if !ours {
-                continue;
+        }
+
+        if let Some(max_bytes) = self.max_bytes {
+            let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+            let mut total = 0u64;
+            if let Ok(entries) = fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !is_cache_file(&path) {
+                        continue;
+                    }
+                    let Ok(meta) = path.metadata() else { continue };
+                    let size = meta.len();
+                    total = total.saturating_add(size);
+                    files.push((
+                        path,
+                        size,
+                        meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    ));
+                }
             }
-            if let Ok(meta) = path.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if SystemTime::now()
-                        .duration_since(modified)
-                        .map(|age| age > max_age)
-                        .unwrap_or(false)
-                        && fs::remove_file(&path).is_ok()
-                    {
+            if total > max_bytes {
+                files.sort_by_key(|(_, _, modified)| *modified);
+                for (path, size, _) in files {
+                    if total <= max_bytes {
+                        break;
+                    }
+                    if fs::remove_file(&path).is_ok() {
+                        total = total.saturating_sub(size);
                         removed += 1;
                     }
                 }
             }
         }
-        if removed > 0 {
-            eprintln!("已清理 {removed} 个过期封面缓存");
+
+        let old_len = self.index.len();
+        let index = std::mem::take(&mut self.index);
+        self.index = index
+            .into_iter()
+            .filter(|item| self.find(item).is_some())
+            .collect();
+        if removed > 0 || self.index.len() != old_len {
+            log_info!(
+                "缓存维护完成：删除 {removed} 个文件，索引 {} 条",
+                self.index.len()
+            );
+            self.save_index();
         }
+        self.last_maintain = Instant::now();
+        self.stores_since_maintain = 0;
     }
+}
+
+fn is_cache_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("jpg")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(is_ours_stem)
+            .unwrap_or(false)
 }
 
 fn age_limit(days: i64) -> Option<Duration> {
@@ -670,7 +761,7 @@ fn load_index(dir: &Path) -> (Vec<MediaItem>, Vec<Section>) {
     match serde_json::from_str::<IndexFile>(&text) {
         Ok(file) if file.version == INDEX_VERSION => (file.items, file.sections),
         Ok(file) => {
-            eprintln!(
+            log_warn!(
                 "缓存索引版本不支持，已忽略 {}（version={}）",
                 path.display(),
                 file.version
@@ -678,7 +769,7 @@ fn load_index(dir: &Path) -> (Vec<MediaItem>, Vec<Section>) {
             (Vec::new(), Vec::new())
         }
         Err(err) => {
-            eprintln!("缓存索引损坏，已忽略 {}: {err}", path.display());
+            log_warn!("缓存索引损坏，已忽略 {}: {err}", path.display());
             (Vec::new(), Vec::new())
         }
     }
@@ -1089,5 +1180,51 @@ mod tests {
         assert!(is_ours_stem("h1a2b3c4d5e6f7a8b"));
         assert!(!is_ours_stem("蓝色巴士法国足球队罢练事件簿"));
         assert!(!is_ours_stem("Inception"));
+    }
+
+    #[test]
+    fn changed_thumb_invalidates_cached_poster() {
+        let dir = scratch_dir("thumb-change");
+        let mut cache = Cache::at(&dir, 30, Naming::Key);
+        let old = item("1479", "阿凡达");
+        cache.store(&old, b"old-poster").unwrap();
+        assert!(cache.get(&old).is_some());
+
+        let mut refreshed = old.clone();
+        refreshed.thumb = "/library/metadata/1479/thumb/9999999999".to_string();
+        assert!(
+            cache.get(&refreshed).is_none(),
+            "Plex thumb 版本变化后旧缓存应视为未命中"
+        );
+
+        cache.store(&refreshed, b"new-poster").unwrap();
+        assert!(cache.get(&refreshed).is_some());
+        assert_eq!(fs::read(cache.path_for(&refreshed)).unwrap(), b"new-poster");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintain_enforces_cache_size_limit() {
+        let dir = scratch_dir("capacity");
+        let mut cache = Cache::at(&dir, 30, Naming::Key);
+        for index in 0..3 {
+            let it = item(&index.to_string(), &format!("Movie {index}"));
+            cache.store(&it, &[b'x'; 100]).unwrap();
+        }
+
+        cache.set_max_bytes(150);
+        cache.maintain();
+
+        let total: u64 = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jpg"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert!(total <= 150, "清理后缓存仍超过上限: {total}");
+        assert_eq!(cache.offline_items(&[]).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

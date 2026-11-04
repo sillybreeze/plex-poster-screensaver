@@ -14,6 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
 use crate::config::Hotkey;
+use crate::logging::{log_info, log_warn};
 
 const EVENT_NAME: &str = "Local\\PlexPosterScreensaver.StartNow";
 
@@ -60,13 +61,13 @@ pub fn listen_hotkey(hotkey: Hotkey, on_trigger: impl Fn() + Send + 'static) {
         const ID: i32 = 0x5053;
         let mods = HOT_KEY_MODIFIERS(hotkey.mods.0 | MOD_NOREPEAT.0);
         if RegisterHotKey(None, ID, mods, hotkey.vk).is_err() {
-            eprintln!(
+            log_warn!(
                 "热键 {} 注册失败（多半被别的程序占用了），换个组合：--hotkey Ctrl+Alt+其他键",
                 hotkey.label()
             );
             return;
         }
-        eprintln!("热键 {} 已就绪", hotkey.label());
+        log_info!("热键 {} 已就绪", hotkey.label());
 
         let mut msg = MSG::default();
         loop {

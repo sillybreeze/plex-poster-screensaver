@@ -1,6 +1,7 @@
 //! 窗口、事件循环与动效调度（D3D11 渲染）。
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -18,8 +19,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::config::Config;
 use crate::gpu::{Gpu, Textures};
 use crate::idle::{self, Idle};
+use crate::logging::{log_error, log_info, log_warn};
+use crate::platform::Platform;
 use crate::plex::{Cache, Client, MediaItem, Section};
 use crate::render::{self, Composition, DIRECTIONS};
+use crate::status::{self, Shared};
 
 pub struct Slide {
     pub item: MediaItem,
@@ -44,6 +48,7 @@ pub struct Source {
     next_reconnect: Instant,
     /// 用户配置的媒体库筛选；重连时仍然要按它选，不能把没选的库也播出来。
     wanted: Vec<String>,
+    status: Shared,
 }
 
 impl Source {
@@ -53,12 +58,19 @@ impl Source {
         sections: Vec<Section>,
         size: (u32, u32),
         wanted: Vec<String>,
+        status: Shared,
     ) -> Self {
         let buffers = sections
             .iter()
             .map(|s| (s.key.clone(), VecDeque::new()))
             .collect();
         let online = !sections.is_empty();
+        status::update(&status, |current| {
+            current.online = online;
+            if online {
+                current.last_error.clear();
+            }
+        });
         let now = Instant::now();
         let mut source = Self {
             client,
@@ -78,6 +90,7 @@ impl Source {
                 now + RECONNECT_INTERVAL
             },
             wanted,
+            status,
         };
         source.reload_offline();
         source
@@ -101,10 +114,16 @@ impl Source {
 
     fn go_offline(&mut self) {
         if self.online {
-            eprintln!("Plex 暂时取不到图，改用本地缓存离线播放");
+            log_warn!("Plex 暂时取不到图，改用本地缓存离线播放");
         }
         self.online = false;
         self.next_reconnect = Instant::now() + RECONNECT_INTERVAL;
+        status::update(&self.status, |current| {
+            current.online = false;
+            if current.last_error.is_empty() {
+                current.last_error = "Plex 连接不可用，使用本地缓存".to_string();
+            }
+        });
         self.reload_offline();
     }
 
@@ -117,10 +136,10 @@ impl Source {
                 // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
                 let chosen = crate::plex::filter_sections(&sections, &self.wanted);
                 if chosen.is_empty() {
-                    eprintln!("Plex 已恢复，但配置的媒体库一个都没匹配到");
+                    log_warn!("Plex 已恢复，但配置的媒体库一个都没匹配到");
                     return;
                 }
-                eprintln!("已重新连接 Plex：{} 个媒体库", chosen.len());
+                log_info!("已重新连接 Plex：{} 个媒体库", chosen.len());
                 self.sections = chosen;
                 self.buffers = self
                     .sections
@@ -129,9 +148,18 @@ impl Source {
                     .collect();
                 self.rr = 0;
                 self.online = true;
+                status::update(&self.status, |current| {
+                    current.online = true;
+                    current.last_error.clear();
+                });
             }
             Ok(_) => {}
-            Err(err) => eprintln!("重连 Plex 失败: {err}"),
+            Err(err) => {
+                log_warn!("重连 Plex 失败: {err}");
+                status::update(&self.status, |current| {
+                    current.last_error = format!("重连 Plex 失败: {err}");
+                });
+            }
         }
     }
 
@@ -168,7 +196,7 @@ impl Source {
                         // 这个库是空的；所有库都空就别再刷请求了。
                         empty_rounds += 1;
                         if empty_rounds >= self.sections.len() {
-                            eprintln!("Plex 媒体库里没有条目，改用本地缓存");
+                            log_warn!("Plex 媒体库里没有条目，改用本地缓存");
                             self.go_offline();
                             return Ok(None);
                         }
@@ -176,7 +204,10 @@ impl Source {
                     }
                     Ok(_) => empty_rounds = 0,
                     Err(err) => {
-                        eprintln!("补充取图列表失败: {err}");
+                        log_warn!("补充取图列表失败: {err}");
+                        status::update(&self.status, |current| {
+                            current.last_error = format!("补充取图列表失败: {err}");
+                        });
                         self.go_offline();
                         return Ok(None);
                     }
@@ -202,7 +233,10 @@ impl Source {
             match self.slide_for(&item) {
                 Ok(comp) => return Ok(Some(self.finish(item, comp))),
                 Err(err) => {
-                    eprintln!("取图失败 {}: {err}", item.title);
+                    log_warn!("取图失败 {}: {err}", item.title);
+                    status::update(&self.status, |current| {
+                        current.last_error = format!("取图失败: {err}");
+                    });
                     errors += 1;
                     if errors >= 3 {
                         self.go_offline();
@@ -223,7 +257,7 @@ impl Source {
                     return Ok(comp);
                 }
                 Err(err) => {
-                    eprintln!("缓存损坏，删除后重新下载: {err}");
+                    log_warn!("缓存损坏，删除后重新下载: {err}");
                     self.cache.discard(&path);
                 }
             }
@@ -268,23 +302,37 @@ impl Source {
             };
             match self.cached_slide(&item) {
                 Ok(comp) => return Ok(self.finish(item, comp)),
-                Err(err) => eprintln!("离线缓存不可用 {}: {err}", item.title),
+                Err(err) => log_warn!("离线缓存不可用 {}: {err}", item.title),
             }
         }
-        Err("无法连接 Plex，本地缓存也没有可用封面".to_string())
+        let message = "无法连接 Plex，本地缓存也没有可用封面".to_string();
+        status::update(&self.status, |current| {
+            current.last_error = message.clone();
+        });
+        Err(message)
     }
 
     pub fn next(&mut self) -> Result<Slide, String> {
         let now = Instant::now();
+        self.cache.maintain_if_due();
         if !self.online && now >= self.next_reconnect {
             self.try_reconnect(now);
         }
         if self.online {
             match self.online_next() {
-                Ok(Some(slide)) => return Ok(slide),
+                Ok(Some(slide)) => {
+                    status::update(&self.status, |current| {
+                        current.online = true;
+                        current.last_error.clear();
+                    });
+                    return Ok(slide);
+                }
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("在线取图失败: {err}");
+                    log_warn!("在线取图失败: {err}");
+                    status::update(&self.status, |current| {
+                        current.last_error = err.clone();
+                    });
                     self.go_offline();
                 }
             }
@@ -327,9 +375,65 @@ const IDLE_GRACE: Duration = Duration::from_millis(700);
 /// 手动拉起（热键 / 再启动）留得久一点：按下和松开热键本身都算输入。
 const MANUAL_GRACE: Duration = Duration::from_millis(1200);
 
-/// 事件循环的自定义事件：外部（再启动一次 exe）要求立刻开始。
+/// 事件循环的自定义事件：托盘、系统会话/电源通知和再启动都会走这里。
 pub enum UserEvent {
     StartNow,
+    PauseFor(Duration),
+    ResumeAuto,
+    Quit,
+    SessionLocked,
+    SessionUnlocked,
+    PowerSuspend,
+    PowerResume,
+    DisplayOff,
+    DisplayOn,
+}
+
+/// 暂停自动触发的各种原因。手动暂停是有期限的，系统原因由通知开关。
+#[derive(Default)]
+struct PauseState {
+    manual_until: Option<Instant>,
+    locked: bool,
+    suspended: bool,
+    display_off: bool,
+    dnd: bool,
+}
+
+impl PauseState {
+    fn is_paused(&self, now: Instant) -> bool {
+        self.manual_until.is_some_and(|until| now < until)
+            || self.locked
+            || self.suspended
+            || self.display_off
+            || self.dnd
+    }
+
+    fn system_paused(&self) -> bool {
+        self.locked || self.suspended || self.display_off
+    }
+
+    fn reason(&self, now: Instant) -> &'static str {
+        if self.manual_until.is_some_and(|until| now < until) {
+            "手动暂停"
+        } else if self.locked {
+            "锁屏"
+        } else if self.suspended {
+            "休眠"
+        } else if self.display_off {
+            "显示器关闭"
+        } else if self.dnd {
+            "全屏应用/演示"
+        } else {
+            ""
+        }
+    }
+
+    fn clear_expired(&mut self, now: Instant) {
+        if self.manual_until.is_some_and(|until| now >= until) {
+            self.manual_until = None;
+            log_info!("手动暂停到期，恢复自动触发");
+        }
+    }
 }
 
 /// 常驻等待状态：窗口先藏着，空闲到点才全屏。
@@ -363,6 +467,12 @@ pub struct App {
     /// 当前预取线程的取消标志；重建/关闭时置位，失败重试路径也要能退出。
     worker_cancel: Option<Arc<AtomicBool>>,
 
+    status: Shared,
+    config_path: Option<PathBuf>,
+    platform: Option<Platform>,
+    pause: PauseState,
+    next_dnd_check: Instant,
+
     size: (u32, u32),
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -385,6 +495,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: Config,
         preview: bool,
@@ -392,6 +503,8 @@ impl App {
         cache: Cache,
         sections: Vec<Section>,
         wanted: Vec<String>,
+        status: Shared,
+        config_path: Option<PathBuf>,
     ) -> Self {
         let now = Instant::now();
         let watch = if cfg.watch && !preview {
@@ -419,6 +532,11 @@ impl App {
             rx: None,
             pending_slide: None,
             worker_cancel: None,
+            status,
+            config_path,
+            platform: None,
+            pause: PauseState::default(),
+            next_dnd_check: now,
             size: (1920, 1080),
             window: None,
             gpu: None,
@@ -470,9 +588,23 @@ impl App {
             }
         }
 
-        event_loop
+        let tray_proxy = event_loop.create_proxy();
+        match crate::platform::start(
+            tray_proxy,
+            self.status.clone(),
+            self.config_path.clone(),
+            self.cfg.cache_dir.clone(),
+            crate::logging::log_dir(),
+        ) {
+            Ok(platform) => self.platform = Some(platform),
+            Err(err) => log_warn!("托盘初始化失败，继续无托盘运行: {err}"),
+        }
+
+        let result = event_loop
             .run_app(&mut self)
-            .map_err(|e| format!("事件循环异常: {e}"))
+            .map_err(|e| format!("事件循环异常: {e}"));
+        self.platform = None;
+        result
     }
 
     /// 惰性创建 D3D11：常驻模式下第一次触发才建，平时不占显存。
@@ -488,7 +620,7 @@ impl App {
                 windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)
             }
             _ => {
-                eprintln!("无法获取窗口句柄");
+                log_error!("无法获取窗口句柄");
                 return false;
             }
         };
@@ -498,7 +630,7 @@ impl App {
                 true
             }
             Err(err) => {
-                eprintln!("初始化 D3D11 失败: {err}");
+                log_error!("初始化 D3D11 失败: {err}");
                 false
             }
         }
@@ -511,7 +643,11 @@ impl App {
             Some(true) => return,  // 已经在放了
             Some(false) => {}
         }
-        eprintln!("收到启动请求，立刻开始");
+        if self.pause.system_paused() {
+            log_warn!("系统锁屏/休眠/显示器关闭中，忽略立即播放");
+            return;
+        }
+        log_info!("收到启动请求，立刻开始");
         self.show_screensaver(event_loop, Instant::now(), true);
     }
 
@@ -524,13 +660,18 @@ impl App {
             return;
         };
 
+        if !manual && self.pause.is_paused(now) {
+            log_info!("自动触发被暂停（{}），忽略本次", self.pause.reason(now));
+            return;
+        }
+
         // 断网、缓存为空时先留在后台等 Plex，别全屏挂一块黑屏。
         self.poll_pending();
         if self.watch.is_some() && !self.has_content() {
             if let Some(w) = &mut self.watch {
                 if !w.waiting_content {
                     w.waiting_content = true;
-                    eprintln!("暂无可播放的海报，等待 Plex 恢复后再触发");
+                    log_warn!("暂无可播放的海报，等待 Plex 恢复后再触发");
                 }
                 w.next_poll = now + Duration::from_secs(5);
             }
@@ -586,7 +727,7 @@ impl App {
 
     /// 有人动了：收起屏保，回到常驻等待。
     fn hide_screensaver(&mut self, now: Instant) {
-        eprintln!("检测到输入，收起屏保");
+        log_info!("收起屏保");
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
             window.set_visible(false);
@@ -674,9 +815,10 @@ impl App {
         cache.reload_index();
         let sections = self.sections.clone();
         let wanted = self.wanted.clone();
+        let status = self.status.clone();
 
         thread::spawn(move || {
-            let mut source = Source::new(client, cache, sections, size, wanted);
+            let mut source = Source::new(client, cache, sections, size, wanted, status);
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     break;
@@ -688,7 +830,7 @@ impl App {
                         }
                     }
                     Err(err) => {
-                        eprintln!("取图失败: {err}");
+                        log_warn!("取图失败: {err}");
                         // 3 秒分片睡眠，收到取消信号时立刻退出，不再无限重试。
                         for _ in 0..30 {
                             if cancel.load(Ordering::Relaxed) {
@@ -714,7 +856,7 @@ impl App {
         }
 
         if std::env::var_os("PPS_DEBUG").is_some() {
-            eprintln!(
+            log_info!(
                 "尺寸更新: {}x{} -> {}x{}（immediate={immediate}）",
                 self.size.0, self.size.1, size.0, size.1
             );
@@ -731,7 +873,7 @@ impl App {
         if let Some(gpu) = &mut self.gpu {
             if gpu.size() != size {
                 if let Err(err) = gpu.resize(size.0, size.1) {
-                    eprintln!("调整交换链失败: {err}");
+                    log_warn!("调整交换链失败: {err}");
                     resize_failed = true;
                 }
             }
@@ -740,7 +882,7 @@ impl App {
             self.gpu = None;
         }
         if self.gpu.is_none() && self.active() && !self.ensure_gpu() {
-            eprintln!("重建渲染器失败，下一帧再试");
+            log_warn!("重建渲染器失败，下一帧再试");
         }
 
         // 预取队列里是旧尺寸的画面，立即作废；同时取消旧线程，别让它继续重试。
@@ -796,14 +938,17 @@ impl App {
         };
 
         if (slide.comp.width, slide.comp.height) != self.size {
-            eprintln!(
+            log_warn!(
                 "丢弃尺寸不匹配的预取画面: {}x{}（当前 {}x{}）",
                 slide.comp.width, slide.comp.height, self.size.0, self.size.1
             );
             return false;
         }
 
-        eprintln!("显示: {}", slide.item.title);
+        log_info!("显示: {}", slide.item.title);
+        status::update(&self.status, |current| {
+            current.current = slide.item.title.clone();
+        });
         self.slide_index += 1;
 
         let Some(gpu) = &self.gpu else {
@@ -813,7 +958,7 @@ impl App {
             match gpu.upload(&slide.comp.background, &slide.comp.poster, slide.comp.position) {
                 Ok(tex) => tex,
                 Err(err) => {
-                    eprintln!("上传纹理失败: {err}");
+                    log_error!("上传纹理失败: {err}");
                     return false;
                 }
             };
@@ -936,9 +1081,84 @@ impl App {
     }
 
     fn present(&mut self) {
-        if let Some(gpu) = &self.gpu {
-            gpu.present();
+        let lost = if let Some(gpu) = &self.gpu {
+            gpu.present().err()
+        } else {
+            None
+        };
+        if let Some(err) = lost {
+            log_error!("Present 失败，重建渲染器: {err}");
+            self.gpu = None;
+            self.current = None;
+            self.phase = Phase::Idle;
+            self.next_frame_at = Instant::now();
         }
+    }
+
+    fn sync_status(&self, now: Instant) {
+        let paused = self.pause.is_paused(now);
+        let reason = self.pause.reason(now).to_string();
+        status::update(&self.status, |current| {
+            if current.paused != paused || current.pause_reason != reason {
+                current.paused = paused;
+                current.pause_reason = reason;
+            }
+        });
+    }
+
+    /// 只在常驻隐藏时轮询免打扰状态，避免把正在播放的屏保自己判成“全屏应用”。
+    fn check_dnd(&mut self, now: Instant) {
+        let hidden_watch = self.watch.as_ref().is_some_and(|watch| !watch.showing);
+        if !hidden_watch || now < self.next_dnd_check {
+            return;
+        }
+        self.next_dnd_check = now + Duration::from_secs(1);
+        let reason = crate::platform::busy_reason();
+        let busy = reason.is_some();
+        if busy == self.pause.dnd {
+            return;
+        }
+        self.pause.dnd = busy;
+        if let Some(reason) = reason {
+            log_info!("检测到全屏应用/演示（{reason}），暂停自动触发");
+        } else {
+            log_info!("全屏应用/演示结束，恢复自动触发");
+            if let Some(watch) = &mut self.watch {
+                watch.idle.reset(now);
+                watch.next_poll = now + Duration::from_millis(500);
+            }
+        }
+        self.sync_status(now);
+    }
+
+    fn on_system_pause(&mut self, now: Instant) {
+        if self.watch.as_ref().is_some_and(|watch| watch.showing) {
+            self.hide_screensaver(now);
+        }
+        self.stop_worker();
+        self.gpu = None;
+        self.current = None;
+        self.phase = Phase::Idle;
+        self.next_frame_at = now;
+        self.sync_status(now);
+    }
+
+    fn on_system_resume(&mut self, now: Instant) {
+        // 休眠/锁屏后设备可能已失效，下一次按需重建交换链。
+        self.gpu = None;
+        self.current = None;
+        self.phase = Phase::Idle;
+        if self.window.is_some() && !self.pause.system_paused() && self.rx.is_none() {
+            self.start_worker();
+        }
+        if let Some(watch) = &mut self.watch {
+            watch.idle.reset(now);
+            watch.next_poll = now;
+        }
+        self.grace_until = now + Duration::from_millis(1500);
+        self.next_frame_at = now;
+        self.next_dnd_check = now;
+        self.sync_status(now);
     }
 
     fn report(&mut self, now: Instant) {
@@ -950,7 +1170,7 @@ impl App {
             return;
         }
         let n = self.frames as f64;
-        eprintln!(
+        log_info!(
             "fps {:.1} | tick {:.2} ms | present {:.2} ms | progress {:.2}",
             n / elapsed,
             self.tick_us / n,
@@ -966,8 +1186,50 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let now = Instant::now();
         match event {
             UserEvent::StartNow => self.start_now(event_loop),
+            UserEvent::PauseFor(duration) => {
+                self.pause.manual_until = Some(now + duration);
+                log_info!("手动暂停自动触发 {:.0} 分钟", duration.as_secs_f64() / 60.0);
+                self.sync_status(now);
+            }
+            UserEvent::ResumeAuto => {
+                self.pause.manual_until = None;
+                log_info!("手动恢复自动触发");
+                self.sync_status(now);
+            }
+            UserEvent::Quit => event_loop.exit(),
+            UserEvent::SessionLocked => {
+                self.pause.locked = true;
+                log_info!("锁屏，暂停自动触发");
+                self.on_system_pause(now);
+            }
+            UserEvent::SessionUnlocked => {
+                self.pause.locked = false;
+                log_info!("解除锁屏，恢复检测");
+                self.on_system_resume(now);
+            }
+            UserEvent::PowerSuspend => {
+                self.pause.suspended = true;
+                log_info!("系统休眠，暂停自动触发");
+                self.on_system_pause(now);
+            }
+            UserEvent::PowerResume => {
+                self.pause.suspended = false;
+                log_info!("系统唤醒，重建渲染器");
+                self.on_system_resume(now);
+            }
+            UserEvent::DisplayOff => {
+                self.pause.display_off = true;
+                log_info!("显示器关闭，暂停自动触发");
+                self.on_system_pause(now);
+            }
+            UserEvent::DisplayOn => {
+                self.pause.display_off = false;
+                log_info!("显示器恢复，恢复检测");
+                self.on_system_resume(now);
+            }
         }
     }
 
@@ -992,7 +1254,7 @@ impl ApplicationHandler<UserEvent> for App {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(err) => {
-                eprintln!("创建窗口失败: {err}");
+                log_error!("创建窗口失败: {err}");
                 event_loop.exit();
                 return;
             }
@@ -1076,9 +1338,12 @@ impl ApplicationHandler<UserEvent> for App {
 
         // 窗口尺寸稳定后再重建交换链/预取线程。
         self.apply_pending_resize(now);
+        self.pause.clear_expired(now);
+        self.check_dnd(now);
         // 隐藏等待时也预读一张，空闲到点就能判断有没有内容可显示。
         self.poll_pending();
         let content = self.pending_slide.is_some() || self.current.is_some();
+        let paused = self.pause.is_paused(now);
 
         // 常驻模式：藏着的时候数空闲，显示的时候盯输入
         let mut start = false;
@@ -1105,22 +1370,26 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(idle) => {
                         w.idle_failed = false;
                         if std::env::var_os("PPS_DEBUG").is_some() {
-                            eprintln!(
+                            log_info!(
                                 "[watch] 已空闲 {:.1}s / 阈值 {:.0}s",
                                 idle.as_secs_f64(),
                                 w.threshold.as_secs_f64()
                             );
                         }
                         if idle >= w.threshold {
-                            if content {
-                                eprintln!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
+                            if paused {
+                                // 暂停期间保持空闲计时；恢复后不需要再等一个完整阈值。
+                                w.next_poll = now + Duration::from_secs(5);
+                                w.waiting_content = false;
+                            } else if content {
+                                log_info!("空闲 {:.0} 秒，开始屏保", idle.as_secs_f64());
                                 start = true;
                             } else {
                                 // 已经空闲到点但 Plex/缓存还没内容：保留 idle 计时，
                                 // 内容一到就能触发，而不是再等一个完整阈值。
                                 if !w.waiting_content {
                                     w.waiting_content = true;
-                                    eprintln!("已空闲但暂无可播放的海报，等待 Plex 恢复");
+                                    log_warn!("已空闲但暂无可播放的海报，等待 Plex 恢复");
                                 }
                                 w.next_poll = now + Duration::from_secs(5);
                             }
@@ -1133,7 +1402,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // 误当成空闲时间；热键/再启动仍然可以手动拉起。
                         if !w.idle_failed {
                             w.idle_failed = true;
-                            eprintln!(
+                            log_warn!(
                                 "空闲检测不可用（GetLastInputInfo 失败），暂停自动触发；仍可用热键拉起"
                             );
                         }
@@ -1147,11 +1416,18 @@ impl ApplicationHandler<UserEvent> for App {
         if stop {
             self.hide_screensaver(now);
         }
+        self.sync_status(now);
         if let Some(w) = &self.watch {
             if !w.showing {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(w.next_poll));
                 return;
             }
+        }
+
+        // 锁屏/休眠/显示器关闭时，普通全屏模式也不要在后台继续 Present。
+        if self.pause.system_paused() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_secs(1)));
+            return;
         }
 
         if self.window.is_some() && self.active() && self.gpu.is_none() {
