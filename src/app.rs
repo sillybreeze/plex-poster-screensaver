@@ -603,6 +603,11 @@ impl SizeSchedule {
     }
 }
 
+/// 尺寸资源应用的前置条件：不在系统暂停、窗口可见、且未最小化。
+fn can_apply_size(system_paused: bool, active: bool, minimized: bool) -> bool {
+    !system_paused && active && !minimized
+}
+
 /// GPU 故障日志最多每 30 秒汇总一次。
 const GPU_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -706,6 +711,8 @@ pub struct App {
     next_dnd_check: Instant,
 
     size: (u32, u32),
+    /// 最小化时窗口尺寸为 0；此时只记录，不应用尺寸/重建资源。
+    minimized: bool,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     gpu_recovery: GpuRecovery,
@@ -775,6 +782,7 @@ impl App {
             pause: PauseState::default(),
             next_dnd_check: now,
             size: (1920, 1080),
+            minimized: false,
             window: None,
             gpu: None,
             gpu_recovery: GpuRecovery::default(),
@@ -947,6 +955,7 @@ impl App {
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         window.set_visible(true);
         window.focus_window();
+        self.minimized = false;
 
         // 触发时才读主屏尺寸：如果和常驻启动时不同，交换链、合成尺寸、
         // 预取线程都要一起换掉，不能只更新 self.size 就继续用旧画面。
@@ -1129,9 +1138,9 @@ impl App {
         }
     }
 
-    /// 到达稳定时间后统一应用尺寸。系统暂停或常驻隐藏时不执行资源工作。
+    /// 到达稳定时间后统一应用尺寸。系统暂停、隐藏或最小化时不执行资源工作。
     fn apply_pending_resize(&mut self, now: Instant) {
-        if self.pause.system_paused() || !self.active() {
+        if !can_apply_size(self.pause.system_paused(), self.active(), self.minimized) {
             return;
         }
         let Some(target) = self.sizes.take_ready(now) else {
@@ -1147,7 +1156,7 @@ impl App {
 
     /// 把目标尺寸落到交换链、合成缓冲和预取线程。调用方负责暂停/可见性检查。
     fn apply_size(&mut self, target: (u32, u32), now: Instant) {
-        if self.pause.system_paused() {
+        if self.pause.system_paused() || self.minimized {
             return;
         }
         let target = (target.0.max(1), target.1.max(1));
@@ -1589,6 +1598,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.size = (size.width.max(1), size.height.max(1));
 
         self.window = Some(window);
+        self.minimized = false;
 
         if !watching {
             // 首次创建失败不退出：按统一退避在事件循环里重试，避免驱动瞬时故障直接结束进程。
@@ -1613,8 +1623,11 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if size.width == 0 || size.height == 0 {
+                    // 最小化：保留待应用尺寸，等恢复后的非零尺寸再统一处理。
+                    self.minimized = true;
                     return;
                 }
+                self.minimized = false;
                 self.update_size((size.width, size.height), Instant::now());
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1895,6 +1908,40 @@ mod tests {
         let mut sizes = SizeSchedule::default();
         sizes.record((0, 0), now, Duration::ZERO);
         assert_eq!(sizes.take_ready(now), Some((1, 1)));
+    }
+
+    #[test]
+    fn rapid_resize_only_applies_last_size_after_settle() {
+        let start = Instant::now();
+        let settle = Duration::from_millis(250);
+        let mut sizes = SizeSchedule::default();
+
+        // 连续 5 个事件间隔 50ms，全部在稳定期内。
+        for step in 0..5u64 {
+            sizes.record(
+                (800 + step as u32, 600 + step as u32),
+                start + Duration::from_millis(step * 50),
+                settle,
+            );
+        }
+        assert_eq!(
+            sizes.take_ready(start + Duration::from_millis(400)),
+            None,
+            "最后一个事件在 200ms，稳定期到 450ms"
+        );
+        assert_eq!(
+            sizes.take_ready(start + Duration::from_millis(450)),
+            Some((804, 604))
+        );
+        assert_eq!(sizes.pending_size(), None);
+    }
+
+    #[test]
+    fn size_application_requires_visible_unminimized() {
+        assert!(can_apply_size(false, true, false));
+        assert!(!can_apply_size(true, true, false), "系统暂停时不能应用");
+        assert!(!can_apply_size(false, false, false), "隐藏时不能应用");
+        assert!(!can_apply_size(false, true, true), "最小化时不能应用");
     }
 
     #[test]
