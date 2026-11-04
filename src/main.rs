@@ -66,16 +66,29 @@ fn main() {
     // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
     // 只有真正要开窗口的模式才检查是否已有实例在跑。
     let utility = args.list || args.self_test.is_some() || args.snapshot.is_some();
-    let trigger_event = if utility {
+    let instance = if utility {
         None
     } else {
-        if trigger::signal_existing() {
-            println!("已经有一个实例在跑，已通知它立刻开始");
-            return;
+        match trigger::acquire() {
+            Ok(trigger::Startup::First(guard)) => {
+                timer::begin();
+                Some(guard)
+            }
+            Ok(trigger::Startup::Duplicate { notified }) => {
+                if notified {
+                    println!("已经有一个实例在跑，已通知它立刻开始");
+                } else {
+                    println!("已经有一个实例在跑，但启动通知发送失败");
+                }
+                return;
+            }
+            Err(err) => {
+                log_error!("单实例初始化失败: {err}");
+                std::process::exit(1);
+            }
         }
-        timer::begin();
-        trigger::create()
     };
+    let trigger_event = instance.as_ref().and_then(|guard| guard.event());
 
     let cfg = match config::load(&args) {
         Ok(cfg) => cfg,
