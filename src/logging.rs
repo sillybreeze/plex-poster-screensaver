@@ -65,8 +65,8 @@ pub fn init() {
 
 pub fn log(level: Level, args: fmt::Arguments<'_>) {
     let message = args.to_string();
-    // 有控制台时保持原来的可见性；没有控制台时写文件。
-    eprintln!("{message}");
+    // 有控制台时保持原来的可见性；没有控制台/终端被关掉时不要把程序 panic 掉。
+    let _ = writeln!(std::io::stderr(), "{message}");
 
     let Some(logger) = LOGGER.get() else {
         return;

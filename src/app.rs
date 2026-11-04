@@ -558,13 +558,13 @@ impl App {
 
     pub fn run(mut self, trigger: Option<HANDLE>) -> Result<(), String> {
         if let Some(w) = &self.watch {
-            println!(
+            log_info!(
                 "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起",
                 w.threshold.as_secs_f64()
             );
             match self.cfg.hotkey {
-                Some(h) => println!("立刻开始：再启动一次 exe，或按 {}", h.label()),
-                None => println!("立刻开始：再启动一次 exe"),
+                Some(h) => log_info!("立刻开始：再启动一次 exe，或按 {}", h.label()),
+                None => log_info!("立刻开始：再启动一次 exe"),
             }
         }
         let event_loop = EventLoop::<UserEvent>::with_user_event()

@@ -17,7 +17,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Power::{
     RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
     POWERBROADCAST_SETTING,
@@ -46,6 +48,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_MAXIMIZE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use winit::event_loop::EventLoopProxy;
+use windows::core::PWSTR;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::app::UserEvent;
 use crate::logging::{log_info, log_warn};
@@ -111,8 +119,16 @@ pub fn start(
     let (tx, rx) = sync_channel::<Result<usize, String>>(1);
     let thread = thread::Builder::new()
         .name("tray".to_string())
-        .spawn(
-            move || match create_window(proxy, status, config_path, cache_dir, log_dir) {
+        .spawn(move || {
+            // Shell_NotifyIcon/托盘菜单涉及 shell COM；线程自己初始化一次，
+            // 避免在部分系统上只拿到 E_FAIL。
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let com_initialized = com.is_ok();
+            if com.is_err() && com != RPC_E_CHANGED_MODE {
+                log_warn!("托盘线程 COM 初始化失败: 0x{:08X}", com.0);
+            }
+
+            match create_window(proxy, status, config_path, cache_dir, log_dir) {
                 Ok((hwnd, context)) => {
                     CONTEXT.with(|cell| *cell.borrow_mut() = Some(context));
                     let _ = tx.send(Ok(hwnd.0 as usize));
@@ -121,8 +137,12 @@ pub fn start(
                 Err(err) => {
                     let _ = tx.send(Err(err));
                 }
-            },
-        )
+            }
+
+            if com_initialized {
+                unsafe { CoUninitialize() };
+            }
+        })
         .map_err(|err| format!("创建托盘线程失败: {err}"))?;
 
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -205,7 +225,8 @@ fn create_window(
         }
 
         // Explorer 开机时可能还没准备好，加不上就靠定时器重试。
-        if !add_icon(hwnd, &context) {
+        let tip = tooltip_text(&context);
+        if !add_icon(hwnd, context.icon, &tip) {
             log_warn!("托盘图标添加失败，稍后重试");
         }
         let _ = SetTimer(hwnd, TIMER_ID, 5_000, None);
@@ -339,7 +360,8 @@ unsafe fn cleanup(hwnd: HWND) {
 
 fn with_context<T>(f: impl FnOnce(&mut Context) -> T) -> Option<T> {
     CONTEXT.with(|cell| {
-        let mut borrow = cell.borrow_mut();
+        // 模态消息循环可能重入窗口过程；宁可这一次跳过，也不要 panic 掉整个进程。
+        let mut borrow = cell.try_borrow_mut().ok()?;
         borrow.as_mut().map(f)
     })
 }
@@ -353,37 +375,47 @@ fn send_event(event: UserEvent) {
 }
 
 fn ensure_icon(hwnd: HWND) {
-    let _ = with_context(|context| {
-        if !context.icon_added {
-            context.icon_added = add_icon(hwnd, context);
+    let prepared = with_context(|context| {
+        if context.icon_added {
+            None
+        } else {
+            Some((context.icon, tooltip_text(context)))
         }
-    });
+    })
+    .flatten();
+    if let Some((icon, tip)) = prepared {
+        let added = add_icon(hwnd, icon, &tip);
+        let _ = with_context(|context| context.icon_added = added);
+    }
 }
 
-fn add_icon(hwnd: HWND, context: &Context) -> bool {
+fn add_icon(
+    hwnd: HWND,
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    tip: &str,
+) -> bool {
     unsafe {
-        // 分两步加：先建回调，再补图标/提示。某些 shell 状态下一次性 NIM_ADD
-        // 会返回 ERROR_ACCESS_DENIED，分步后至少能先把图标挂上。
+        // 上次崩溃/重启可能留下同 hWnd+uID 的幽灵图标，先删一次再注册。
+        let stale = base_icon_data(hwnd);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &stale);
+
         let mut data = base_icon_data(hwnd);
-        data.uFlags = NIF_MESSAGE;
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_TRAY;
-        if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
-            log_warn!("托盘图标添加失败，错误码 {}", GetLastError().0);
-            return false;
+        data.hIcon = icon;
+        copy_wide(&mut data.szTip, tip);
+        let added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
+        if !added {
+            log_warn!(
+                "托盘图标添加失败，错误码 {}；hwnd={:?} icon={:?} cbSize={} flags=0x{:X}",
+                GetLastError().0,
+                hwnd.0,
+                icon.0,
+                data.cbSize,
+                data.uFlags.0
+            );
         }
-
-        data.uFlags = NIF_ICON;
-        data.hIcon = context.icon;
-        if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
-            log_warn!("托盘图标设置失败，错误码 {}", GetLastError().0);
-        }
-
-        data.uFlags = NIF_TIP;
-        copy_wide(&mut data.szTip, &tooltip_text(context));
-        if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
-            log_warn!("托盘提示设置失败，错误码 {}", GetLastError().0);
-        }
-        true
+        added
     }
 }
 
@@ -395,20 +427,24 @@ fn remove_icon(hwnd: HWND) {
 }
 
 fn update_tooltip(hwnd: HWND) {
-    let _ = with_context(|context| {
+    let prepared = with_context(|context| {
         if !context.icon_added {
-            return;
+            return None;
         }
-        unsafe {
-            let mut data = base_icon_data(hwnd);
-            data.uFlags = NIF_TIP;
-            copy_wide(&mut data.szTip, &tooltip_text(context));
-            if !Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() {
-                // Explorer 重启后图标会丢失，标记为未添加，下一次定时器重加。
-                context.icon_added = false;
-            }
-        }
-    });
+        let mut data = base_icon_data(hwnd);
+        data.uFlags = NIF_TIP;
+        copy_wide(&mut data.szTip, &tooltip_text(context));
+        Some(data)
+    })
+    .flatten();
+    let Some(data) = prepared else {
+        return;
+    };
+    let modified = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() };
+    if !modified {
+        // Explorer 重启后图标会丢失，标记为未添加，下一次定时器重加。
+        let _ = with_context(|context| context.icon_added = false);
+    }
 }
 
 fn base_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -439,76 +475,86 @@ fn tooltip_text(context: &Context) -> String {
 }
 
 fn show_menu(hwnd: HWND) {
-    let _ = with_context(|context| {
-        let status = status::snapshot(&context.status);
+    // 先把需要的数据取出来，不能带着 RefCell 借用去跑 TrackPopupMenu：
+    // 菜单的模态消息循环会重入窗口过程，WM_COMMAND/WM_TIMER 再 borrow_mut 就会 panic。
+    let Some((status, count, bytes, config_available)) = with_context(|context| {
         let (count, bytes) = cache_stats(&context.cache_dir);
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
+        (
+            status::snapshot(&context.status),
+            count,
+            bytes,
+            context.config_path.is_some(),
+        )
+    }) else {
+        return;
+    };
 
-            let state = format!(
-                "状态: {} | 缓存 {} 张 / {} MB",
-                if status.online { "在线" } else { "离线" },
-                count,
-                bytes / (1024 * 1024)
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+
+        let state = format!(
+            "状态: {} | 缓存 {} 张 / {} MB",
+            if status.online { "在线" } else { "离线" },
+            count,
+            bytes / (1024 * 1024)
+        );
+        append(menu, MF_STRING | MF_GRAYED, 0, &state);
+        if !status.current.is_empty() {
+            append(
+                menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                &format!("当前: {}", truncate(&status.current, 48)),
             );
-            append(menu, MF_STRING | MF_GRAYED, 0, &state);
-            if !status.current.is_empty() {
-                append(
-                    menu,
-                    MF_STRING | MF_GRAYED,
-                    0,
-                    &format!("当前: {}", truncate(&status.current, 48)),
-                );
-            }
-            if status.paused {
-                let reason = if status.pause_reason.is_empty() {
-                    "暂停中".to_string()
-                } else {
-                    format!("暂停: {}", status.pause_reason)
-                };
-                append(menu, MF_STRING | MF_GRAYED, 0, &reason);
-            }
-            if !status.last_error.is_empty() {
-                append(
-                    menu,
-                    MF_STRING | MF_GRAYED,
-                    0,
-                    &format!("最近错误: {}", truncate(&status.last_error, 60)),
-                );
-            }
-
-            append(menu, MF_SEPARATOR, 0, "");
-            append(menu, MF_STRING, MENU_PLAY, "立即播放");
-            append(menu, MF_STRING, MENU_PAUSE, "暂停自动触发 1 小时");
-            let resume = if status.paused {
-                MF_STRING
-            } else {
-                MF_STRING | MF_GRAYED
-            };
-            append(menu, resume, MENU_RESUME, "恢复自动触发");
-            append(menu, MF_SEPARATOR, 0, "");
-            let config = if context.config_path.is_some() {
-                MF_STRING
-            } else {
-                MF_STRING | MF_GRAYED
-            };
-            append(menu, config, MENU_CONFIG, "打开配置文件");
-            append(menu, MF_STRING, MENU_CACHE, "打开缓存目录");
-            append(menu, MF_STRING, MENU_LOGS, "打开日志目录");
-            append(menu, MF_SEPARATOR, 0, "");
-            append(menu, MF_STRING, MENU_QUIT, "退出");
-
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            let _ = SetForegroundWindow(hwnd);
-            let flags = TRACK_POPUP_MENU_FLAGS(TPM_RIGHTBUTTON.0 | TPM_BOTTOMALIGN.0);
-            let _ = TrackPopupMenu(menu, flags, point.x, point.y, 0, hwnd, None);
-            let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-            let _ = DestroyMenu(menu);
         }
-    });
+        if status.paused {
+            let reason = if status.pause_reason.is_empty() {
+                "暂停中".to_string()
+            } else {
+                format!("暂停: {}", status.pause_reason)
+            };
+            append(menu, MF_STRING | MF_GRAYED, 0, &reason);
+        }
+        if !status.last_error.is_empty() {
+            append(
+                menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                &format!("最近错误: {}", truncate(&status.last_error, 60)),
+            );
+        }
+
+        append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING, MENU_PLAY, "立即播放");
+        append(menu, MF_STRING, MENU_PAUSE, "暂停自动触发 1 小时");
+        let resume = if status.paused {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        append(menu, resume, MENU_RESUME, "恢复自动触发");
+        append(menu, MF_SEPARATOR, 0, "");
+        let config = if config_available {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        append(menu, config, MENU_CONFIG, "打开配置文件");
+        append(menu, MF_STRING, MENU_CACHE, "打开缓存目录");
+        append(menu, MF_STRING, MENU_LOGS, "打开日志目录");
+        append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING, MENU_QUIT, "退出");
+
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let _ = SetForegroundWindow(hwnd);
+        let flags = TRACK_POPUP_MENU_FLAGS(TPM_RIGHTBUTTON.0 | TPM_BOTTOMALIGN.0);
+        let _ = TrackPopupMenu(menu, flags, point.x, point.y, 0, hwnd, None);
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
 }
 
 fn append(
@@ -530,17 +576,16 @@ fn handle_menu(id: usize) {
         MENU_RESUME => send_event(UserEvent::ResumeAuto),
         MENU_QUIT => send_event(UserEvent::Quit),
         MENU_CONFIG | MENU_CACHE | MENU_LOGS => {
-            let _ = with_context(|context| {
-                let path = match id {
-                    MENU_CONFIG => context.config_path.clone(),
-                    MENU_CACHE => Some(context.cache_dir.clone()),
-                    MENU_LOGS => Some(context.log_dir.clone()),
-                    _ => None,
-                };
-                if let Some(path) = path {
-                    open_path(&path);
-                }
-            });
+            let path = with_context(|context| match id {
+                MENU_CONFIG => context.config_path.clone(),
+                MENU_CACHE => Some(context.cache_dir.clone()),
+                MENU_LOGS => Some(context.log_dir.clone()),
+                _ => None,
+            })
+            .flatten();
+            if let Some(path) = path {
+                open_path(&path);
+            }
         }
         _ => {}
     }
@@ -586,21 +631,22 @@ fn cache_stats(dir: &Path) -> (usize, u64) {
 
 /// 全屏游戏、演示模式或全屏视频时返回一个可诊断的原因。
 pub fn busy_reason() -> Option<&'static str> {
+    let foreground_full = foreground_is_fullscreen();
     unsafe {
         if let Ok(state) = SHQueryUserNotificationState() {
-            if state == QUNS_RUNNING_D3D_FULL_SCREEN {
-                return Some("D3D fullscreen");
-            }
             if state == QUNS_PRESENTATION_MODE {
                 return Some("presentation mode");
             }
-            // QUNS_BUSY 在本程序隐藏窗口存在时也可能误报；必须同时有真正的前台全屏窗口。
-            if state == QUNS_BUSY && foreground_is_fullscreen() {
-                return Some("shell busy + fullscreen");
+            // D3D/BUSY 也要有真正的前台全屏窗口才算；否则 RustDesk 等远程桌面
+            // 窗口会把屏保永久判成“忙”。
+            if foreground_full
+                && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY)
+            {
+                return Some("shell fullscreen");
             }
         }
     }
-    if foreground_is_fullscreen() {
+    if foreground_full {
         Some("foreground fullscreen")
     } else {
         None
@@ -617,6 +663,9 @@ fn foreground_is_fullscreen() -> bool {
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == GetCurrentProcessId() {
+            return false;
+        }
+        if process_image_name(pid).is_some_and(|name| is_remote_control(&name)) {
             return false;
         }
 
@@ -665,6 +714,50 @@ fn foreground_is_fullscreen() -> bool {
     }
 }
 
+fn process_image_name(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 512];
+        let mut length = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+        .is_ok();
+        let _ = CloseHandle(process);
+        if result {
+            Some(String::from_utf16_lossy(&buffer[..length as usize]))
+        } else {
+            None
+        }
+    }
+}
+
+/// 远程桌面/远控窗口经常是全屏的，但它不是用户正在看视频或打游戏。
+fn is_remote_control(image_path: &str) -> bool {
+    let name = Path::new(image_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "rustdesk"
+            | "mstsc"
+            | "teamviewer"
+            | "anydesk"
+            | "todesk"
+            | "sunloginclient"
+            | "vncviewer"
+            | "parsec"
+            | "nomachine"
+            | "screenconnect"
+            | "awerayremote"
+    )
+}
+
 fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -683,4 +776,18 @@ fn truncate(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_remote_control;
+
+    #[test]
+    fn remote_control_windows_are_not_treated_as_media() {
+        assert!(is_remote_control(r"C:\Program Files\RustDesk\rustdesk.exe"));
+        assert!(is_remote_control(r"C:\Windows\System32\mstsc.exe"));
+        assert!(is_remote_control(r"C:\Program Files\TeamViewer\TeamViewer.exe"));
+        assert!(!is_remote_control(r"C:\Program Files\Google\Chrome\chrome.exe"));
+        assert!(!is_remote_control(r"C:\Program Files\VideoLAN\VLC\vlc.exe"));
+    }
 }
