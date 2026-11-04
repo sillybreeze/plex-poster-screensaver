@@ -43,15 +43,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, KillTimer,
-    LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetTimer, TrackPopupMenu, TranslateMessage, GWL_STYLE, HICON, HMENU, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
-    SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_POWERBROADCAST,
-    WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_MAXIMIZE,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, GWL_STYLE, HICON, HMENU,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    PBT_POWERSETTINGCHANGE, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SW_SHOWNORMAL,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION,
+    WS_MAXIMIZE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -79,6 +79,8 @@ struct Context {
     log_dir: PathBuf,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     icon_added: bool,
+    /// Explorer 重启广播；0 表示注册失败。
+    taskbar_created: u32,
     power_notify: Option<HPOWERNOTIFY>,
     display_off: bool,
 }
@@ -197,6 +199,14 @@ fn create_window(
         let class_name = w!("PlexPosterScreensaverTray");
 
         let icon = load_app_icon();
+        // Explorer 重启后会广播这条注册消息；注册失败时只能靠 NIM_MODIFY 兜底。
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        if taskbar_created == 0 {
+            log_warn!(
+                "注册 TaskbarCreated 消息失败: {}；Explorer 重启后托盘恢复可能不及时",
+                std::io::Error::last_os_error()
+            );
+        }
 
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -234,6 +244,7 @@ fn create_window(
             log_dir,
             icon,
             icon_added: false,
+            taskbar_created,
             power_notify: None,
             display_off: false,
         };
@@ -253,7 +264,8 @@ fn create_window(
 
         // Explorer 开机时可能还没准备好，加不上就靠定时器重试。
         let tip = tooltip_text(&context);
-        if !add_icon(hwnd, context.icon, &tip) {
+        context.icon_added = add_icon(hwnd, context.icon, &tip);
+        if !context.icon_added {
             log_warn!("托盘图标添加失败，稍后重试");
         }
         let _ = SetTimer(hwnd, TIMER_ID, 5_000, None);
@@ -295,6 +307,10 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             ensure_icon(hwnd);
             update_tooltip(hwnd);
+            LRESULT(0)
+        }
+        message if message != 0 && message == taskbar_created_message() => {
+            restore_icon_after_explorer(hwnd);
             LRESULT(0)
         }
         WM_WTSSESSION_CHANGE => {
@@ -399,6 +415,17 @@ fn send_event(event: UserEvent) {
             log_warn!("发送界面事件失败: {err}");
         }
     });
+}
+
+fn taskbar_created_message() -> u32 {
+    with_context(|context| context.taskbar_created).unwrap_or(0)
+}
+
+/// Explorer 重启后旧图标已经不存在：清掉状态并立即按最新图标/提示重新添加。
+fn restore_icon_after_explorer(hwnd: HWND) {
+    let _ = with_context(|context| context.icon_added = false);
+    log_info!("Explorer 重启，重新添加托盘图标");
+    ensure_icon(hwnd);
 }
 
 fn ensure_icon(hwnd: HWND) {
