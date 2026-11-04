@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -31,6 +31,40 @@ pub struct Slide {
     pub comp: Composition,
 }
 
+const TASK_CANCELLED: &str = "预取任务已取消";
+
+/// 预取任务代次。只有当前代次且未被取消的任务才能提交缓存、状态和画面。
+#[derive(Clone)]
+struct TaskGuard {
+    generation: u64,
+    current: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl TaskGuard {
+    /// 工具命令/自检使用的常驻有效令牌。
+    fn detached() -> Self {
+        Self {
+            generation: 0,
+            current: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn new(generation: u64, current: Arc<AtomicU64>, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            generation,
+            current,
+            cancel,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        !self.cancel.load(Ordering::Relaxed)
+            && self.current.load(Ordering::Acquire) == self.generation
+    }
+}
+
 /// 断网时每隔多久重试一次 Plex。
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -50,6 +84,7 @@ pub struct Source {
     /// 用户配置的媒体库筛选；重连时仍然要按它选，不能把没选的库也播出来。
     wanted: Vec<String>,
     status: Shared,
+    guard: TaskGuard,
 }
 
 impl Source {
@@ -61,17 +96,31 @@ impl Source {
         wanted: Vec<String>,
         status: Shared,
     ) -> Self {
+        Self::with_guard(
+            client,
+            cache,
+            sections,
+            size,
+            wanted,
+            status,
+            TaskGuard::detached(),
+        )
+    }
+
+    fn with_guard(
+        client: Client,
+        cache: Cache,
+        sections: Vec<Section>,
+        size: (u32, u32),
+        wanted: Vec<String>,
+        status: Shared,
+        guard: TaskGuard,
+    ) -> Self {
         let buffers = sections
             .iter()
             .map(|s| (s.key.clone(), VecDeque::new()))
             .collect();
         let online = !sections.is_empty();
-        status::update(&status, |current| {
-            current.online = online;
-            if online {
-                current.last_error.clear();
-            }
-        });
         let now = Instant::now();
         let mut source = Self {
             client,
@@ -92,9 +141,30 @@ impl Source {
             },
             wanted,
             status,
+            guard,
         };
+        source.update_status(|current| {
+            current.online = online;
+            if online {
+                current.last_error.clear();
+            }
+        });
         source.reload_offline();
         source
+    }
+
+    fn ensure_current(&self) -> Result<(), String> {
+        if self.guard.is_current() {
+            Ok(())
+        } else {
+            Err(TASK_CANCELLED.to_string())
+        }
+    }
+
+    fn update_status(&self, f: impl FnOnce(&mut status::Status)) {
+        if self.guard.is_current() {
+            status::update(&self.status, f);
+        }
     }
 
     fn refill(&mut self, section: &Section) -> Result<usize, String> {
@@ -114,12 +184,15 @@ impl Source {
     }
 
     fn go_offline(&mut self) {
+        if !self.guard.is_current() {
+            return;
+        }
         if self.online {
             log_warn!("Plex 暂时取不到图，改用本地缓存离线播放");
         }
         self.online = false;
         self.next_reconnect = Instant::now() + RECONNECT_INTERVAL;
-        status::update(&self.status, |current| {
+        self.update_status(|current| {
             current.online = false;
             if current.last_error.is_empty() {
                 current.last_error = "Plex 连接不可用，使用本地缓存".to_string();
@@ -130,38 +203,46 @@ impl Source {
 
     fn try_reconnect(&mut self, now: Instant) {
         self.next_reconnect = now + RECONNECT_INTERVAL;
-        match self.client.sections() {
-            Ok(sections) if !sections.is_empty() => {
-                // 记下完整的库列表，离线时才能把 --library 的编号解析回库。
-                self.cache.remember_sections(&sections);
-                // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
-                let chosen = crate::plex::filter_sections(&sections, &self.wanted);
-                if chosen.is_empty() {
-                    log_warn!("Plex 已恢复，但配置的媒体库一个都没匹配到");
-                    return;
-                }
-                log_info!("已重新连接 Plex：{} 个媒体库", chosen.len());
-                self.sections = chosen;
-                self.buffers = self
-                    .sections
-                    .iter()
-                    .map(|s| (s.key.clone(), VecDeque::new()))
-                    .collect();
-                self.rr = 0;
-                self.online = true;
-                status::update(&self.status, |current| {
-                    current.online = true;
-                    current.last_error.clear();
-                });
-            }
-            Ok(_) => {}
+        let sections = match self.client.sections() {
+            Ok(sections) => sections,
             Err(err) => {
-                log_warn!("重连 Plex 失败: {err}");
-                status::update(&self.status, |current| {
-                    current.last_error = format!("重连 Plex 失败: {err}");
-                });
+                if self.guard.is_current() {
+                    log_warn!("重连 Plex 失败: {err}");
+                    self.update_status(|current| {
+                        current.last_error = format!("重连 Plex 失败: {err}");
+                    });
+                }
+                return;
             }
+        };
+        // 网络请求期间可能已被取消：过期任务不得写索引或改状态。
+        if !self.guard.is_current() {
+            return;
         }
+        if sections.is_empty() {
+            return;
+        }
+        // 记下完整的库列表，离线时才能把 --library 的编号解析回库。
+        self.cache.remember_sections(&sections);
+        // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
+        let chosen = crate::plex::filter_sections(&sections, &self.wanted);
+        if chosen.is_empty() {
+            log_warn!("Plex 已恢复，但配置的媒体库一个都没匹配到");
+            return;
+        }
+        log_info!("已重新连接 Plex：{} 个媒体库", chosen.len());
+        self.sections = chosen;
+        self.buffers = self
+            .sections
+            .iter()
+            .map(|s| (s.key.clone(), VecDeque::new()))
+            .collect();
+        self.rr = 0;
+        self.online = true;
+        self.update_status(|current| {
+            current.online = true;
+            current.last_error.clear();
+        });
     }
 
     fn remember(&mut self, key: &str) {
@@ -178,6 +259,7 @@ impl Source {
 
     /// 在线取一张。只有连续多次取图失败才切离线，单个坏条目不至于让整个屏保定格。
     fn online_next(&mut self) -> Result<Option<Slide>, String> {
+        self.ensure_current()?;
         if self.sections.is_empty() {
             self.go_offline();
             return Ok(None);
@@ -186,6 +268,7 @@ impl Source {
         let mut errors = 0;
         let mut empty_rounds = 0;
         for attempt in 0..300 {
+            self.ensure_current()?;
             let section = self.sections[self.rr % self.sections.len()].clone();
             self.rr = self.rr.wrapping_add(1);
             let key = section.key.clone();
@@ -205,8 +288,11 @@ impl Source {
                     }
                     Ok(_) => empty_rounds = 0,
                     Err(err) => {
+                        if !self.guard.is_current() {
+                            return Err(TASK_CANCELLED.to_string());
+                        }
                         log_warn!("补充取图列表失败: {err}");
-                        status::update(&self.status, |current| {
+                        self.update_status(|current| {
                             current.last_error = format!("补充取图列表失败: {err}");
                         });
                         self.go_offline();
@@ -232,10 +318,16 @@ impl Source {
             }
 
             match self.slide_for(&item) {
-                Ok(comp) => return Ok(Some(self.finish(item, comp))),
+                Ok(comp) => {
+                    self.ensure_current()?;
+                    return Ok(Some(self.finish(item, comp)));
+                }
                 Err(err) => {
+                    if !self.guard.is_current() {
+                        return Err(TASK_CANCELLED.to_string());
+                    }
                     log_warn!("取图失败 {}: {err}", item.title);
-                    status::update(&self.status, |current| {
+                    self.update_status(|current| {
                         current.last_error = format!("取图失败: {err}");
                     });
                     errors += 1;
@@ -251,13 +343,18 @@ impl Source {
 
     /// 在线路径：缓存命中直接解码；命中坏缓存则删掉重下；没有缓存则下载。
     fn slide_for(&mut self, item: &MediaItem) -> Result<Composition, String> {
+        self.ensure_current()?;
         if let Some(path) = self.cache.get(item) {
             match render::build(&path, self.size.0, self.size.1) {
                 Ok(comp) => {
+                    self.ensure_current()?;
                     self.cache.remember(item);
                     return Ok(comp);
                 }
                 Err(err) => {
+                    if !self.guard.is_current() {
+                        return Err(TASK_CANCELLED.to_string());
+                    }
                     log_warn!("缓存损坏，删除后重新下载: {err}");
                     self.cache.discard(&path);
                 }
@@ -265,27 +362,36 @@ impl Source {
         }
 
         let data = self.client.fetch_cover(item, self.size.0, self.size.1)?;
+        // 下载完先看任务是否还属于当前代次，过期任务不再解码/落盘。
+        self.ensure_current()?;
         if data.is_empty() {
             return Err(format!("封面内容为空: {}", item.title));
         }
         // 先确认能解码再落盘，避免把坏内容存成 .jpg 后一直命中坏缓存。
         let comp = render::build_from_bytes(&data, self.size.0, self.size.1)?;
+        // 解码后、提交缓存前再检查一次，避免旧任务把结果写进正式索引。
+        self.ensure_current()?;
         self.cache.store(item, &data);
         Ok(comp)
     }
 
     /// 离线路径：只读缓存，绝不访问网络。
     fn cached_slide(&mut self, item: &MediaItem) -> Result<Composition, String> {
+        self.ensure_current()?;
         let path = self
             .cache
             .get(item)
             .ok_or_else(|| format!("缓存文件不存在: {}", item.title))?;
         match render::build(&path, self.size.0, self.size.1) {
             Ok(comp) => {
+                self.ensure_current()?;
                 self.cache.remember(item);
                 Ok(comp)
             }
             Err(err) => {
+                if !self.guard.is_current() {
+                    return Err(TASK_CANCELLED.to_string());
+                }
                 self.cache.discard(&path);
                 Err(err)
             }
@@ -293,27 +399,38 @@ impl Source {
     }
 
     fn offline_next(&mut self) -> Result<Slide, String> {
+        self.ensure_current()?;
         if self.offline.is_empty() {
             self.reload_offline();
         }
         let count = self.offline.len();
         for _ in 0..count {
+            self.ensure_current()?;
             let Some(item) = self.offline.pop_front() else {
                 break;
             };
             match self.cached_slide(&item) {
-                Ok(comp) => return Ok(self.finish(item, comp)),
-                Err(err) => log_warn!("离线缓存不可用 {}: {err}", item.title),
+                Ok(comp) => {
+                    self.ensure_current()?;
+                    return Ok(self.finish(item, comp));
+                }
+                Err(err) => {
+                    if !self.guard.is_current() {
+                        return Err(TASK_CANCELLED.to_string());
+                    }
+                    log_warn!("离线缓存不可用 {}: {err}", item.title);
+                }
             }
         }
         let message = "无法连接 Plex，本地缓存也没有可用封面".to_string();
-        status::update(&self.status, |current| {
+        self.update_status(|current| {
             current.last_error = message.clone();
         });
         Err(message)
     }
 
     pub fn next(&mut self) -> Result<Slide, String> {
+        self.ensure_current()?;
         let now = Instant::now();
         self.cache.maintain_if_due();
         if !self.online && now >= self.next_reconnect {
@@ -322,7 +439,7 @@ impl Source {
         if self.online {
             match self.online_next() {
                 Ok(Some(slide)) => {
-                    status::update(&self.status, |current| {
+                    self.update_status(|current| {
                         current.online = true;
                         current.last_error.clear();
                     });
@@ -330,8 +447,11 @@ impl Source {
                 }
                 Ok(None) => {}
                 Err(err) => {
+                    if !self.guard.is_current() {
+                        return Err(TASK_CANCELLED.to_string());
+                    }
                     log_warn!("在线取图失败: {err}");
-                    status::update(&self.status, |current| {
+                    self.update_status(|current| {
                         current.last_error = err.clone();
                     });
                     self.go_offline();
@@ -576,6 +696,8 @@ pub struct App {
     pending_slide: Option<Slide>,
     /// 当前预取线程的取消标志；重建/关闭时置位，失败重试路径也要能退出。
     worker_cancel: Option<Arc<AtomicBool>>,
+    /// 预取任务代次；每次停止/启动都会递增，让旧任务无法提交结果。
+    worker_generation: Arc<AtomicU64>,
 
     status: Shared,
     config_path: Option<PathBuf>,
@@ -645,6 +767,7 @@ impl App {
             rx: None,
             pending_slide: None,
             worker_cancel: None,
+            worker_generation: Arc::new(AtomicU64::new(0)),
             status,
             config_path,
             platform: None,
@@ -923,11 +1046,13 @@ impl App {
         self.pending_slide.is_some() || self.current.is_some()
     }
 
-    /// 停掉当前预取线程：置取消位、断开接收端，并丢弃待处理画面。
+    /// 停掉当前预取线程：作废旧代次、置取消位、断开接收端，并丢弃待处理画面。
     ///
     /// 只靠 `send()` 失败发现接收端关闭是不够的：取图一直失败时线程永远走不到
-    /// `send()`，反复重建尺寸会积累后台线程和重连请求。
+    /// `send()`，反复重建尺寸会积累后台线程和重连请求。代次在停止时立即失效，
+    /// 旧线程即使在网络/解码中也无法再提交缓存和状态。
     fn stop_worker(&mut self) {
+        self.worker_generation.fetch_add(1, Ordering::AcqRel);
         if let Some(cancel) = self.worker_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -938,37 +1063,42 @@ impl App {
     /// 启动/重启预取线程。
     fn start_worker(&mut self) {
         self.stop_worker();
+        let generation = self.worker_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let size = self.size;
         let (tx, rx): (SyncSender<Slide>, Receiver<Slide>) = sync_channel(1);
         self.rx = Some(rx);
         let cancel = Arc::new(AtomicBool::new(false));
         self.worker_cancel = Some(cancel.clone());
+        let guard = TaskGuard::new(generation, self.worker_generation.clone(), cancel.clone());
 
         let client = self.client.clone();
-        let mut cache = self.cache.clone();
-        // 工作线程自己会更新索引；重建时从磁盘读一次，别用启动时的旧副本。
-        cache.reload_index();
+        // 缓存索引由所有任务共享（内部有锁），不再需要每个线程读一份旧快照。
+        let cache = self.cache.clone();
         let sections = self.sections.clone();
         let wanted = self.wanted.clone();
         let status = self.status.clone();
 
         thread::spawn(move || {
-            let mut source = Source::new(client, cache, sections, size, wanted, status);
+            let mut source =
+                Source::with_guard(client, cache, sections, size, wanted, status, guard.clone());
             loop {
-                if cancel.load(Ordering::Relaxed) {
+                if !guard.is_current() {
                     break;
                 }
                 match source.next() {
                     Ok(slide) => {
-                        if cancel.load(Ordering::Relaxed) || tx.send(slide).is_err() {
+                        if !guard.is_current() || tx.send(slide).is_err() {
                             break;
                         }
                     }
                     Err(err) => {
+                        if !guard.is_current() {
+                            break;
+                        }
                         log_warn!("取图失败: {err}");
-                        // 3 秒分片睡眠，收到取消信号时立刻退出，不再无限重试。
+                        // 3 秒分片睡眠，收到取消/换代信号时立刻退出，不再无限重试。
                         for _ in 0..30 {
-                            if cancel.load(Ordering::Relaxed) {
+                            if !guard.is_current() {
                                 return;
                             }
                             thread::sleep(Duration::from_millis(100));
@@ -1784,5 +1914,24 @@ mod tests {
         pause.dnd = true;
         assert!(pause.is_paused(now));
         assert!(!pause.system_paused());
+    }
+
+    #[test]
+    fn task_guard_rejects_stale_generation() {
+        let current = Arc::new(AtomicU64::new(1));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let guard = TaskGuard::new(1, current.clone(), cancel.clone());
+        assert!(guard.is_current());
+
+        current.store(2, Ordering::Release);
+        assert!(!guard.is_current(), "旧代次必须失效");
+
+        let current_guard = TaskGuard::new(2, current, cancel.clone());
+        assert!(current_guard.is_current());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!current_guard.is_current(), "取消标志也必须生效");
+
+        assert!(TaskGuard::detached().is_current());
     }
 }

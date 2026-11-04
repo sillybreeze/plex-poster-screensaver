@@ -3,6 +3,8 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ const INDEX_FILE: &str = "index.json";
 const INDEX_VERSION: u32 = 1;
 /// 索引最多保留多少条，避免缓存目录长期累积后文件无限增长。
 const MAX_INDEX_ITEMS: usize = 5000;
+/// 临时文件序号，避免同进程内并发写入共用同一个 `.part`/`.tmp`。
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Section {
@@ -224,10 +228,19 @@ struct IndexFile {
     sections: Vec<Section>,
 }
 
+#[derive(Debug, Default)]
+struct IndexData {
+    items: Vec<MediaItem>,
+    sections: Vec<Section>,
+}
+
 /// 封面缓存。默认按「标题_ratingKey」命名，同时认旧版的纯标题和纯 ratingKey 命名。
 ///
 /// 除封面文件外，还在缓存目录里维护一份 `index.json`：记录每个封面对应的
 /// ratingKey / 标题 / thumb。这样 Plex 断网时也能从磁盘枚举出可播放的条目。
+///
+/// 索引放在 `Arc<Mutex<_>>` 里：同一进程内的工作线程、新旧预取线程共享同一份
+/// 索引，读取/合并/落盘都在锁内完成，避免旧线程用启动时的快照覆盖新条目。
 #[derive(Debug, Clone)]
 pub struct Cache {
     pub dir: PathBuf,
@@ -235,8 +248,7 @@ pub struct Cache {
     max_age: Option<Duration>,
     pub hits: u64,
     pub misses: u64,
-    index: Vec<MediaItem>,
-    sections: Vec<Section>,
+    index: Arc<Mutex<IndexData>>,
     /// 容量上限（字节）；None 表示不限
     max_bytes: Option<u64>,
     last_maintain: Instant,
@@ -288,8 +300,7 @@ impl Cache {
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
-            index: Vec::new(),
-            sections: Vec::new(),
+            index: Arc::new(Mutex::new(IndexData::default())),
             max_bytes: None,
             last_maintain: Instant::now(),
             stores_since_maintain: 0,
@@ -306,31 +317,33 @@ impl Cache {
             max_age: age_limit(days),
             hits: 0,
             misses: 0,
-            index,
-            sections,
+            index: Arc::new(Mutex::new(IndexData {
+                items: index,
+                sections,
+            })),
             max_bytes: None,
             last_maintain: Instant::now(),
             stores_since_maintain: 0,
         }
     }
 
-    /// 工作线程重启前从磁盘重新读一次索引；工作线程里的副本可能已经写过新条目。
-    pub fn reload_index(&mut self) {
-        if self.is_disk() {
-            let (mut index, sections) = load_index(&self.dir);
-            merge_scanned_index(&self.dir, &mut index);
-            self.index = index;
-            self.sections = sections;
-        }
+    fn lock_index(&self) -> MutexGuard<'_, IndexData> {
+        self.index
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// 记录上次在线看到的完整媒体库列表；离线时用来解析 --library 的编号/标题。
     pub fn remember_sections(&mut self, sections: &[Section]) {
-        if !self.is_disk() || sections.is_empty() || self.sections == sections {
+        if !self.is_disk() || sections.is_empty() {
             return;
         }
-        self.sections = sections.to_vec();
-        self.save_index();
+        let mut data = self.lock_index();
+        if data.sections == sections {
+            return;
+        }
+        data.sections = sections.to_vec();
+        self.save_index(&data);
     }
 
     /// 本地索引里还有对应缓存文件的条目；断网时按这个列表播放。
@@ -338,24 +351,16 @@ impl Cache {
     /// `wanted` 为空表示不过滤；否则用上次保存的媒体库列表解析编号/标题，
     /// 只返回属于选中媒体库的条目。
     pub fn offline_items(&self, wanted: &[String]) -> Vec<MediaItem> {
-        let selected = self.selected_sections(wanted);
-        self.index
-            .iter()
+        // 先复制索引再查文件，避免长时间持有索引锁。
+        let (items, sections) = {
+            let data = self.lock_index();
+            (data.items.clone(), data.sections.clone())
+        };
+        let selected = selected_sections(&sections, wanted);
+        items
+            .into_iter()
             .filter(|item| self.find(item).is_some() && item_matches(item, wanted, &selected))
-            .cloned()
             .collect()
-    }
-
-    fn selected_sections(&self, wanted: &[String]) -> Option<Vec<String>> {
-        if wanted.is_empty() {
-            return None;
-        }
-        let chosen = filter_sections(&self.sections, wanted);
-        if chosen.is_empty() && self.sections.is_empty() {
-            // 没有保存过媒体库列表（旧缓存）：只能退回到按条目里保存的库标题匹配。
-            return None;
-        }
-        Some(chosen.into_iter().map(|s| s.key).collect())
     }
 
     /// 记住一个封面已经缓存过的媒体条目，写进 `index.json`。
@@ -363,35 +368,10 @@ impl Cache {
         if !self.is_disk() {
             return;
         }
-        if let Some(existing) = self
-            .index
-            .iter_mut()
-            .find(|i| i.rating_key == item.rating_key)
-        {
-            // 旧索引没有媒体库字段；在线播放命中缓存时也要把空字段补齐。
-            // 反过来，扫描旧文件得到的条目字段是空的，不能拿它覆盖已有元数据。
-            let section_changed = (!item.section_key.is_empty()
-                && existing.section_key != item.section_key)
-                || (!item.section_title.is_empty() && existing.section_title != item.section_title);
-            if existing.title != item.title || existing.thumb != item.thumb || section_changed {
-                existing.title = item.title.clone();
-                existing.thumb = item.thumb.clone();
-                // 空媒体库字段不覆盖已有值，避免扫描旧文件时把元数据冲掉。
-                if !item.section_key.is_empty() {
-                    existing.section_key = item.section_key.clone();
-                }
-                if !item.section_title.is_empty() {
-                    existing.section_title = item.section_title.clone();
-                }
-                self.save_index();
-            }
-            return;
+        let mut data = self.lock_index();
+        if merge_item(&mut data.items, item) {
+            self.save_index(&data);
         }
-        self.index.push(item.clone());
-        if self.index.len() > MAX_INDEX_ITEMS {
-            self.index.remove(0);
-        }
-        self.save_index();
     }
 
     /// 删除一个损坏的缓存文件；索引条目会在下次在线取图时重新写回。
@@ -399,33 +379,41 @@ impl Cache {
         let _ = fs::remove_file(path);
     }
 
-    fn save_index(&self) {
+    /// 在索引锁内落盘；调用方已经持有 `IndexData` 的锁。
+    fn save_index(&self, data: &IndexData) {
         if !self.is_disk() {
             return;
         }
-        let data = IndexFile {
+        let index = IndexFile {
             version: INDEX_VERSION,
-            items: self.index.clone(),
-            sections: self.sections.clone(),
+            items: data.items.clone(),
+            sections: data.sections.clone(),
         };
-        let Ok(bytes) = serde_json::to_vec(&data) else {
+        let Ok(bytes) = serde_json::to_vec(&index) else {
             return;
         };
         let path = self.dir.join(INDEX_FILE);
-        // 旧/新工作线程可能短暂并存，临时文件名带时间戳，避免互相覆盖同一个 .tmp。
-        let stamp = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = self
-            .dir
-            .join(format!("index.{}.{stamp}.tmp", std::process::id()));
+        let tmp = self.temp_path("index", "tmp");
         if fs::write(&tmp, bytes).is_err() {
+            let _ = fs::remove_file(&tmp);
             return;
         }
         if fs::rename(&tmp, &path).is_err() {
             let _ = fs::remove_file(&tmp);
         }
+    }
+
+    /// 生成唯一的临时文件名，供索引和海报写入共用。
+    fn temp_path(&self, stem: &str, extension: &str) -> PathBuf {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.dir.join(format!(
+            ".{stem}.{}.{seq}.{stamp}.{extension}",
+            std::process::id()
+        ))
     }
 
     /// 是否真的落盘（内存模式返回 false）
@@ -496,7 +484,8 @@ impl Cache {
 
     /// Plex 的 thumb 路径带版本号；版本变了说明海报被换过，旧文件应当视为未命中。
     fn thumb_changed(&self, item: &MediaItem) -> bool {
-        self.index
+        let data = self.lock_index();
+        data.items
             .iter()
             .find(|existing| existing.rating_key == item.rating_key)
             .is_some_and(|existing| {
@@ -536,13 +525,18 @@ impl Cache {
             return None;
         }
         let path = self.path_for(item);
-        let tmp = path.with_extension("part");
+        // 唯一临时文件：新旧预取线程同时写同一张图也不会互相截断。
+        let tmp = self.temp_path("poster", "part");
         if fs::write(&tmp, data).is_err() {
+            let _ = fs::remove_file(&tmp);
             return None;
         }
         if fs::rename(&tmp, &path).is_err() {
             let _ = fs::remove_file(&tmp);
-            return None;
+            // 另一个写者可能已经提交了同一张图；目标可用就视为成功。
+            if !is_usable(&path) {
+                return None;
+            }
         }
         self.misses += 1;
         self.stores_since_maintain = self.stores_since_maintain.saturating_add(1);
@@ -632,22 +626,65 @@ impl Cache {
             }
         }
 
-        let old_len = self.index.len();
-        let index = std::mem::take(&mut self.index);
-        self.index = index
-            .into_iter()
-            .filter(|item| self.find(item).is_some())
-            .collect();
-        if removed > 0 || self.index.len() != old_len {
+        // 索引过滤与落盘在锁内完成；锁只覆盖内存索引和文件提交，不覆盖网络。
+        let mut data = self.lock_index();
+        let old_len = data.items.len();
+        data.items.retain(|item| self.find(item).is_some());
+        if removed > 0 || data.items.len() != old_len {
             log_info!(
                 "缓存维护完成：删除 {removed} 个文件，索引 {} 条",
-                self.index.len()
+                data.items.len()
             );
-            self.save_index();
+            self.save_index(&data);
         }
+        drop(data);
         self.last_maintain = Instant::now();
         self.stores_since_maintain = 0;
     }
+}
+
+/// 解析 `wanted` 对应的媒体库 key 列表；没有保存过库列表时返回 None，
+/// 由调用方退回按条目里的库标题匹配。
+fn selected_sections(sections: &[Section], wanted: &[String]) -> Option<Vec<String>> {
+    if wanted.is_empty() {
+        return None;
+    }
+    let chosen = filter_sections(sections, wanted);
+    if chosen.is_empty() && sections.is_empty() {
+        // 没有保存过媒体库列表（旧缓存）：只能退回到按条目里保存的库标题匹配。
+        return None;
+    }
+    Some(chosen.into_iter().map(|s| s.key).collect())
+}
+
+/// 把条目合并进索引；返回是否发生了变化。
+///
+/// 规则：空媒体库字段不覆盖已知值；标题/thumb 变化时更新；新条目追加并限制总量。
+fn merge_item(items: &mut Vec<MediaItem>, item: &MediaItem) -> bool {
+    if let Some(existing) = items.iter_mut().find(|i| i.rating_key == item.rating_key) {
+        // 旧索引没有媒体库字段；在线播放命中缓存时也要把空字段补齐。
+        // 反过来，扫描旧文件得到的条目字段是空的，不能拿它覆盖已有元数据。
+        let section_changed = (!item.section_key.is_empty()
+            && existing.section_key != item.section_key)
+            || (!item.section_title.is_empty() && existing.section_title != item.section_title);
+        if existing.title == item.title && existing.thumb == item.thumb && !section_changed {
+            return false;
+        }
+        existing.title = item.title.clone();
+        existing.thumb = item.thumb.clone();
+        if !item.section_key.is_empty() {
+            existing.section_key = item.section_key.clone();
+        }
+        if !item.section_title.is_empty() {
+            existing.section_title = item.section_title.clone();
+        }
+        return true;
+    }
+    items.push(item.clone());
+    if items.len() > MAX_INDEX_ITEMS {
+        items.remove(0);
+    }
+    true
 }
 
 fn is_cache_file(path: &Path) -> bool {
@@ -1218,6 +1255,106 @@ mod tests {
             .sum();
         assert!(total <= 150, "清理后缓存仍超过上限: {total}");
         assert_eq!(cache.offline_items(&[]).len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_clones_share_index_updates() {
+        let dir = scratch_dir("shared-index");
+        let mut first = Cache::at(&dir, 30, Naming::Title);
+        let mut second = first.clone();
+
+        let mut movie = item("101", "Movie");
+        movie.section_key = "1".to_string();
+        movie.section_title = "电影".to_string();
+        let mut anime = item("201", "Anime");
+        anime.section_key = "2".to_string();
+        anime.section_title = "动漫".to_string();
+
+        first.store(&movie, b"movie-poster").unwrap();
+        // second 是在 first 写入前克隆的；共享索引应立即看到新条目。
+        assert_eq!(second.offline_items(&[]).len(), 1);
+        second.store(&anime, b"anime-poster").unwrap();
+
+        first.remember_sections(&[
+            Section {
+                key: "1".to_string(),
+                title: "电影".to_string(),
+                kind: "movie".to_string(),
+            },
+            Section {
+                key: "2".to_string(),
+                title: "动漫".to_string(),
+                kind: "show".to_string(),
+            },
+        ]);
+
+        // 重新打开模拟重启：两个条目和媒体库信息都要保留。
+        let reopened = Cache::at(&dir, 30, Naming::Title);
+        assert_eq!(reopened.offline_items(&[]).len(), 2);
+        let movies = reopened.offline_items(&["电影".to_string()]);
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].rating_key, "101");
+        assert_eq!(movies[0].section_title, "电影");
+        let anime_items = reopened.offline_items(&["2".to_string()]);
+        assert_eq!(anime_items.len(), 1);
+        assert_eq!(anime_items[0].rating_key, "201");
+        assert_eq!(anime_items[0].section_key, "2");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_stores_from_clones_keep_both_entries() {
+        let dir = scratch_dir("concurrent-store");
+        let cache = Cache::at(&dir, 30, Naming::Title);
+        let mut first = cache.clone();
+        let mut second = cache.clone();
+
+        let mut movie = item("101", "Movie");
+        movie.section_key = "1".to_string();
+        movie.section_title = "电影".to_string();
+        let mut anime = item("201", "Anime");
+        anime.section_key = "2".to_string();
+        anime.section_title = "动漫".to_string();
+
+        let a = std::thread::spawn(move || {
+            for _ in 0..20 {
+                first.store(&movie, b"movie-poster").unwrap();
+            }
+        });
+        let b = std::thread::spawn(move || {
+            for _ in 0..20 {
+                second.store(&anime, b"anime-poster").unwrap();
+            }
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let reopened = Cache::at(&dir, 30, Naming::Title);
+        assert_eq!(reopened.offline_items(&[]).len(), 2);
+        assert!(reopened
+            .offline_items(&["电影".to_string()])
+            .iter()
+            .any(|i| i.rating_key == "101"));
+        assert!(reopened
+            .offline_items(&["动漫".to_string()])
+            .iter()
+            .any(|i| i.rating_key == "201"));
+
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "part" || ext == "tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "不应留下临时文件: {leftovers:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }
