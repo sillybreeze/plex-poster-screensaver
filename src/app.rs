@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,11 +33,44 @@ pub struct Slide {
 
 const TASK_CANCELLED: &str = "预取任务已取消";
 
+/// 取消与提交共用的闸门。
+///
+/// 提交必须在锁内检查代次并执行；取消/换代也要拿同一把锁。这样“检查通过后、
+/// 真正写缓存前”被取消的窗口就消失了：要么提交先完成（取消等它），要么取消先
+/// 完成（提交看到代次已变，直接放弃）。
+#[derive(Default)]
+struct TaskGate {
+    current: AtomicU64,
+    commit: Mutex<()>,
+}
+
+impl TaskGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.commit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// 使当前代次失效，并返回下一个可用代次。
+    fn advance(&self) -> u64 {
+        let _guard = self.lock();
+        self.current.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn commit<T>(&self, generation: u64, f: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.lock();
+        if self.current.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(f())
+    }
+}
+
 /// 预取任务代次。只有当前代次且未被取消的任务才能提交缓存、状态和画面。
 #[derive(Clone)]
 struct TaskGuard {
     generation: u64,
-    current: Arc<AtomicU64>,
+    gate: Arc<TaskGate>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -46,22 +79,30 @@ impl TaskGuard {
     fn detached() -> Self {
         Self {
             generation: 0,
-            current: Arc::new(AtomicU64::new(0)),
+            gate: Arc::new(TaskGate::default()),
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn new(generation: u64, current: Arc<AtomicU64>, cancel: Arc<AtomicBool>) -> Self {
+    fn new(generation: u64, gate: Arc<TaskGate>, cancel: Arc<AtomicBool>) -> Self {
         Self {
             generation,
-            current,
+            gate,
             cancel,
         }
     }
 
     fn is_current(&self) -> bool {
         !self.cancel.load(Ordering::Relaxed)
-            && self.current.load(Ordering::Acquire) == self.generation
+            && self.gate.current.load(Ordering::Acquire) == self.generation
+    }
+
+    /// 在取消/换代锁内提交；取消发生后返回 None，闭包不会执行。
+    fn commit<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.gate.commit(self.generation, f)
     }
 }
 
@@ -143,7 +184,7 @@ impl Source {
             status,
             guard,
         };
-        source.update_status(|current| {
+        source.commit_status(|current| {
             current.online = online;
             if online {
                 current.last_error.clear();
@@ -161,10 +202,14 @@ impl Source {
         }
     }
 
-    fn update_status(&self, f: impl FnOnce(&mut status::Status)) {
-        if self.guard.is_current() {
-            status::update(&self.status, f);
-        }
+    fn commit_status(&self, f: impl FnOnce(&mut status::Status)) {
+        self.guard.commit(|| status::update(&self.status, f));
+    }
+
+    /// 在取消/换代锁内提交缓存变更；过期任务不会执行闭包。
+    fn commit_cache<T>(&mut self, f: impl FnOnce(&mut Cache) -> T) -> Option<T> {
+        let guard = self.guard.clone();
+        guard.commit(|| f(&mut self.cache))
     }
 
     fn refill(&mut self, section: &Section) -> Result<usize, String> {
@@ -192,7 +237,7 @@ impl Source {
         }
         self.online = false;
         self.next_reconnect = Instant::now() + RECONNECT_INTERVAL;
-        self.update_status(|current| {
+        self.commit_status(|current| {
             current.online = false;
             if current.last_error.is_empty() {
                 current.last_error = "Plex 连接不可用，使用本地缓存".to_string();
@@ -208,7 +253,7 @@ impl Source {
             Err(err) => {
                 if self.guard.is_current() {
                     log_warn!("重连 Plex 失败: {err}");
-                    self.update_status(|current| {
+                    self.commit_status(|current| {
                         current.last_error = format!("重连 Plex 失败: {err}");
                     });
                 }
@@ -223,7 +268,13 @@ impl Source {
             return;
         }
         // 记下完整的库列表，离线时才能把 --library 的编号解析回库。
-        self.cache.remember_sections(&sections);
+        // 与取消在同一闸门内提交，避免取消后旧任务仍写 sections。
+        if self
+            .commit_cache(|cache| cache.remember_sections(&sections))
+            .is_none()
+        {
+            return;
+        }
         // 重连后仍按 --library/config.libraries 过滤，不能把用户没选的库也播出来。
         let chosen = crate::plex::filter_sections(&sections, &self.wanted);
         if chosen.is_empty() {
@@ -239,7 +290,7 @@ impl Source {
             .collect();
         self.rr = 0;
         self.online = true;
-        self.update_status(|current| {
+        self.commit_status(|current| {
             current.online = true;
             current.last_error.clear();
         });
@@ -292,7 +343,7 @@ impl Source {
                             return Err(TASK_CANCELLED.to_string());
                         }
                         log_warn!("补充取图列表失败: {err}");
-                        self.update_status(|current| {
+                        self.commit_status(|current| {
                             current.last_error = format!("补充取图列表失败: {err}");
                         });
                         self.go_offline();
@@ -327,7 +378,7 @@ impl Source {
                         return Err(TASK_CANCELLED.to_string());
                     }
                     log_warn!("取图失败 {}: {err}", item.title);
-                    self.update_status(|current| {
+                    self.commit_status(|current| {
                         current.last_error = format!("取图失败: {err}");
                     });
                     errors += 1;
@@ -348,7 +399,7 @@ impl Source {
             match render::build(&path, self.size.0, self.size.1) {
                 Ok(comp) => {
                     self.ensure_current()?;
-                    self.cache.remember(item);
+                    let _ = self.commit_cache(|cache| cache.remember(item));
                     return Ok(comp);
                 }
                 Err(err) => {
@@ -356,7 +407,7 @@ impl Source {
                         return Err(TASK_CANCELLED.to_string());
                     }
                     log_warn!("缓存损坏，删除后重新下载: {err}");
-                    self.cache.discard(&path);
+                    let _ = self.commit_cache(|cache| cache.discard(&path));
                 }
             }
         }
@@ -371,7 +422,12 @@ impl Source {
         let comp = render::build_from_bytes(&data, self.size.0, self.size.1)?;
         // 解码后、提交缓存前再检查一次，避免旧任务把结果写进正式索引。
         self.ensure_current()?;
-        self.cache.store(item, &data);
+        if self
+            .commit_cache(|cache| cache.store(item, &data))
+            .is_none()
+        {
+            return Err(TASK_CANCELLED.to_string());
+        }
         Ok(comp)
     }
 
@@ -385,14 +441,14 @@ impl Source {
         match render::build(&path, self.size.0, self.size.1) {
             Ok(comp) => {
                 self.ensure_current()?;
-                self.cache.remember(item);
+                let _ = self.commit_cache(|cache| cache.remember(item));
                 Ok(comp)
             }
             Err(err) => {
                 if !self.guard.is_current() {
                     return Err(TASK_CANCELLED.to_string());
                 }
-                self.cache.discard(&path);
+                let _ = self.commit_cache(|cache| cache.discard(&path));
                 Err(err)
             }
         }
@@ -423,7 +479,7 @@ impl Source {
             }
         }
         let message = "无法连接 Plex，本地缓存也没有可用封面".to_string();
-        self.update_status(|current| {
+        self.commit_status(|current| {
             current.last_error = message.clone();
         });
         Err(message)
@@ -439,7 +495,7 @@ impl Source {
         if self.online {
             match self.online_next() {
                 Ok(Some(slide)) => {
-                    self.update_status(|current| {
+                    self.commit_status(|current| {
                         current.online = true;
                         current.last_error.clear();
                     });
@@ -451,7 +507,7 @@ impl Source {
                         return Err(TASK_CANCELLED.to_string());
                     }
                     log_warn!("在线取图失败: {err}");
-                    self.update_status(|current| {
+                    self.commit_status(|current| {
                         current.last_error = err.clone();
                     });
                     self.go_offline();
@@ -603,9 +659,14 @@ impl SizeSchedule {
     }
 }
 
+/// 所有资源创建入口的公共前置条件：系统未暂停且窗口未最小化。
+fn resources_allowed(system_paused: bool, minimized: bool) -> bool {
+    !system_paused && !minimized
+}
+
 /// 尺寸资源应用的前置条件：不在系统暂停、窗口可见、且未最小化。
 fn can_apply_size(system_paused: bool, active: bool, minimized: bool) -> bool {
-    !system_paused && active && !minimized
+    active && resources_allowed(system_paused, minimized)
 }
 
 /// GPU 故障日志最多每 30 秒汇总一次。
@@ -701,8 +762,8 @@ pub struct App {
     pending_slide: Option<Slide>,
     /// 当前预取线程的取消标志；重建/关闭时置位，失败重试路径也要能退出。
     worker_cancel: Option<Arc<AtomicBool>>,
-    /// 预取任务代次；每次停止/启动都会递增，让旧任务无法提交结果。
-    worker_generation: Arc<AtomicU64>,
+    /// 预取任务代次；每次停止/启动都会推进，提交与取消共用同一闸门。
+    worker_gate: Arc<TaskGate>,
 
     status: Shared,
     config_path: Option<PathBuf>,
@@ -775,7 +836,7 @@ impl App {
             rx: None,
             pending_slide: None,
             worker_cancel: None,
-            worker_generation: Arc::new(AtomicU64::new(0)),
+            worker_gate: Arc::new(TaskGate::default()),
             status,
             config_path,
             platform: None,
@@ -861,7 +922,7 @@ impl App {
         if self.gpu.is_some() {
             return true;
         }
-        if self.pause.system_paused() {
+        if self.pause.system_paused() || self.minimized {
             return false;
         }
         let now = Instant::now();
@@ -1062,7 +1123,8 @@ impl App {
     /// `send()`，反复重建尺寸会积累后台线程和重连请求。代次在停止时立即失效，
     /// 旧线程即使在网络/解码中也无法再提交缓存和状态。
     fn stop_worker(&mut self) {
-        self.worker_generation.fetch_add(1, Ordering::AcqRel);
+        // 推进代次时持有提交锁：在途提交先完成，之后旧任务再也提交不了。
+        let _ = self.worker_gate.advance();
         if let Some(cancel) = self.worker_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -1073,13 +1135,13 @@ impl App {
     /// 启动/重启预取线程。
     fn start_worker(&mut self) {
         self.stop_worker();
-        let generation = self.worker_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.worker_gate.advance();
         let size = self.size;
         let (tx, rx): (SyncSender<Slide>, Receiver<Slide>) = sync_channel(1);
         self.rx = Some(rx);
         let cancel = Arc::new(AtomicBool::new(false));
         self.worker_cancel = Some(cancel.clone());
-        let guard = TaskGuard::new(generation, self.worker_generation.clone(), cancel.clone());
+        let guard = TaskGuard::new(generation, self.worker_gate.clone(), cancel.clone());
 
         let client = self.client.clone();
         // 缓存索引由所有任务共享（内部有锁），不再需要每个线程读一份旧快照。
@@ -1206,9 +1268,12 @@ impl App {
         self.next_frame_at = now;
     }
 
-    /// 在暂停/隐藏检查通过后启动预取线程；重复调用不会叠加线程。
+    /// 在暂停/隐藏/最小化检查通过后启动预取线程；重复调用不会叠加线程。
     fn ensure_worker(&mut self) {
-        if self.pause.system_paused() || self.window.is_none() || self.rx.is_some() {
+        if !resources_allowed(self.pause.system_paused(), self.minimized)
+            || self.window.is_none()
+            || self.rx.is_some()
+        {
             return;
         }
         if self
@@ -1967,20 +2032,74 @@ mod tests {
 
     #[test]
     fn task_guard_rejects_stale_generation() {
-        let current = Arc::new(AtomicU64::new(1));
+        let gate = Arc::new(TaskGate::default());
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let guard = TaskGuard::new(1, current.clone(), cancel.clone());
+        let generation = gate.advance();
+        let guard = TaskGuard::new(generation, gate.clone(), cancel.clone());
         assert!(guard.is_current());
 
-        current.store(2, Ordering::Release);
+        let next_generation = gate.advance();
         assert!(!guard.is_current(), "旧代次必须失效");
 
-        let current_guard = TaskGuard::new(2, current, cancel.clone());
+        let current_guard = TaskGuard::new(next_generation, gate.clone(), cancel.clone());
         assert!(current_guard.is_current());
         cancel.store(true, Ordering::Relaxed);
         assert!(!current_guard.is_current(), "取消标志也必须生效");
 
         assert!(TaskGuard::detached().is_current());
+    }
+
+    #[test]
+    fn task_gate_serializes_cancel_with_inflight_commit() {
+        let gate = Arc::new(TaskGate::default());
+        let generation = gate.advance();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = TaskGuard::new(generation, gate.clone(), cancel);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+
+        let worker = {
+            let guard = guard.clone();
+            let committed = committed.clone();
+            thread::spawn(move || {
+                let result = guard.commit(|| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    committed.store(true, Ordering::SeqCst);
+                });
+                assert!(result.is_some(), "在取消前开始的提交应完成");
+            })
+        };
+
+        started_rx.recv().unwrap();
+        let gate_for_cancel = gate.clone();
+        let canceller = thread::spawn(move || {
+            gate_for_cancel.advance();
+        });
+
+        // 提交闭包仍持有闸门锁，取消必须等它完成。
+        thread::sleep(Duration::from_millis(50));
+        assert!(!committed.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        canceller.join().unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+
+        assert!(
+            guard.commit(|| ()).is_none(),
+            "取消完成后旧任务不能再提交缓存/状态"
+        );
+    }
+
+    #[test]
+    fn minimized_blocks_all_resource_entry_points() {
+        assert!(resources_allowed(false, false));
+        assert!(!resources_allowed(true, false), "系统暂停必须阻止资源");
+        assert!(!resources_allowed(false, true), "最小化必须阻止资源");
+        assert!(!can_apply_size(false, true, true));
     }
 }
