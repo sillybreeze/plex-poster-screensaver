@@ -169,6 +169,17 @@ fn key_label(vk: u32) -> String {
     }
 }
 
+/// 缓存位置策略。三态互斥，避免“显式目录 + auto”同时为真。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLocation {
+    /// 没有显式配置：从默认位置开始自动挑选可写目录。
+    Default,
+    /// 显式要求自动挑选（--cache-dir auto / config 里的 auto）。
+    Auto,
+    /// 严格使用指定目录；不可写就报错。
+    Explicit(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub url: String,
@@ -177,12 +188,9 @@ pub struct Config {
     pub display_seconds: f64,
     pub fade_seconds: f64,
     pub cache_dir: PathBuf,
+    pub cache_location: CacheLocation,
     /// 缓存文件用哪种命名
     pub cache_naming: Naming,
-    /// cache_dir 是配置文件/命令行显式给的（不是默认值）
-    pub cache_dir_explicit: bool,
-    /// 显式要求自动挑选（--cache-dir auto）
-    pub cache_dir_auto: bool,
     pub cache_days: i64,
     /// 缓存容量上限（MB）；0 表示不限
     pub cache_max_mb: u64,
@@ -210,9 +218,8 @@ impl Default for Config {
             display_seconds: 10.0,
             fade_seconds: 1.2,
             cache_dir: app_dir().join("covers"),
+            cache_location: CacheLocation::Default,
             cache_naming: Naming::default(),
-            cache_dir_explicit: false,
-            cache_dir_auto: false,
             cache_days: 30,
             cache_max_mb: 2048,
             verify_tls: true,
@@ -404,6 +411,8 @@ pub fn load(args: &Args) -> Result<Config, String> {
     // 命令行 / 环境变量显式指定的配置文件：读不到或解析失败要明确报错，
     // 不能一边忽略错误一边用默认值继续跑，否则很容易以为配置已经生效。
     let explicit = args.config.is_some() || env::var_os("PLEX_SCREENSAVER_CONFIG").is_some();
+    let mut file_cache_dir: Option<String> = None;
+    let mut file_cache_base: Option<PathBuf> = None;
 
     if let Some(path) = locate_config(args.config.as_deref()) {
         match fs::read_to_string(&path) {
@@ -426,14 +435,8 @@ pub fn load(args: &Args) -> Result<Config, String> {
                         cfg.fade_seconds = v;
                     }
                     if let Some(v) = file.cache_dir {
-                        if v.eq_ignore_ascii_case("auto") {
-                            cfg.cache_dir_auto = true;
-                        } else {
-                            cfg.cache_dir_explicit = true;
-                            // 相对路径以配置文件所在目录为基准，而不是进程 CWD。
-                            // 否则手动启动和开机自启可能写到两个不同位置。
-                            cfg.cache_dir = resolve_path(&base, &v);
-                        }
+                        file_cache_dir = Some(v);
+                        file_cache_base = Some(base);
                     }
                     if let Some(v) = &file.cache_naming {
                         match Naming::parse(v) {
@@ -554,14 +557,6 @@ pub fn load(args: &Args) -> Result<Config, String> {
     if args.insecure {
         cfg.verify_tls = false;
     }
-    if let Some(v) = &args.cache_dir {
-        if v.eq_ignore_ascii_case("auto") {
-            cfg.cache_dir_auto = true;
-        } else {
-            cfg.cache_dir_explicit = true;
-            cfg.cache_dir = PathBuf::from(v);
-        }
-    }
     if let Some(n) = args.cache_naming {
         cfg.cache_naming = n;
     }
@@ -571,6 +566,17 @@ pub fn load(args: &Args) -> Result<Config, String> {
     if let Some(v) = args.cache_max_mb {
         cfg.cache_max_mb = v;
     }
+
+    let default_cache = cfg.cache_dir.clone();
+    let file_base = file_cache_base.as_deref().unwrap_or_else(|| Path::new("."));
+    let (location, dir) = choose_cache_dir(
+        &default_cache,
+        file_cache_dir.as_deref(),
+        args.cache_dir.as_deref(),
+        file_base,
+    );
+    cfg.cache_location = location;
+    cfg.cache_dir = dir;
 
     cfg.url = cfg.url.trim_end_matches('/').to_string();
     validate(&cfg)?;
@@ -627,6 +633,43 @@ fn check_seconds(name: &str, value: f64, min: f64, max: f64) -> Result<(), Strin
     Duration::try_from_secs_f64(value)
         .map_err(|err| format!("{name} 无法转换为时间间隔: {err}"))?;
     Ok(())
+}
+
+/// 决定缓存位置：CLI 覆盖配置文件，三态互斥。
+///
+/// 文件里的相对路径以配置文件目录为基准；CLI 的相对路径以进程 CWD 为基准。
+/// CLI 指定 `auto` 时会清掉文件里的显式目录偏好，重新从默认位置开始自动挑选。
+fn choose_cache_dir(
+    default_dir: &Path,
+    file: Option<&str>,
+    cli: Option<&str>,
+    file_base: &Path,
+) -> (CacheLocation, PathBuf) {
+    let mut location = CacheLocation::Default;
+    let mut dir = default_dir.to_path_buf();
+
+    if let Some(raw) = file {
+        if raw.eq_ignore_ascii_case("auto") {
+            location = CacheLocation::Auto;
+        } else {
+            let path = resolve_path(file_base, raw);
+            location = CacheLocation::Explicit(path.clone());
+            dir = path;
+        }
+    }
+
+    if let Some(raw) = cli {
+        if raw.eq_ignore_ascii_case("auto") {
+            location = CacheLocation::Auto;
+            dir = default_dir.to_path_buf();
+        } else {
+            let path = PathBuf::from(raw);
+            location = CacheLocation::Explicit(path.clone());
+            dir = path;
+        }
+    }
+
+    (location, dir)
 }
 
 /// 配置文件所在目录；相对路径的 `cache_dir` 以它为基准。
@@ -689,6 +732,40 @@ mod tests {
             resolve_path(base, "C:/other/covers"),
             PathBuf::from("C:/other/covers")
         );
+    }
+
+    #[test]
+    fn cache_location_cli_overrides_file_strategy() {
+        let default = Path::new("C:/default/covers");
+        let base = Path::new("C:/configs");
+
+        // 文件 auto -> CLI 显式目录：CLI 必须获胜，且不会被 auto 标签带回自动回退。
+        let (location, dir) = choose_cache_dir(default, Some("auto"), Some("D:/explicit"), base);
+        assert_eq!(
+            location,
+            CacheLocation::Explicit(PathBuf::from("D:/explicit"))
+        );
+        assert_eq!(dir, PathBuf::from("D:/explicit"));
+
+        // 文件显式目录 -> CLI auto：清掉文件里的显式偏好，从默认位置自动挑选。
+        let (location, dir) = choose_cache_dir(default, Some("covers"), Some("auto"), base);
+        assert_eq!(location, CacheLocation::Auto);
+        assert_eq!(dir, default.to_path_buf());
+
+        // 文件相对路径按配置文件目录解析。
+        let (location, dir) = choose_cache_dir(default, Some("covers"), None, base);
+        assert_eq!(location, CacheLocation::Explicit(base.join("covers")));
+        assert_eq!(dir, base.join("covers"));
+
+        // CLI 相对路径按进程 CWD 解析（这里只验证保留相对形式）。
+        let (location, dir) = choose_cache_dir(default, None, Some("relative"), base);
+        assert_eq!(location, CacheLocation::Explicit(PathBuf::from("relative")));
+        assert_eq!(dir, PathBuf::from("relative"));
+
+        // 两边都没配置：默认策略。
+        let (location, dir) = choose_cache_dir(default, None, None, base);
+        assert_eq!(location, CacheLocation::Default);
+        assert_eq!(dir, default.to_path_buf());
     }
 
     #[test]

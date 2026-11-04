@@ -42,7 +42,7 @@ mod trigger;
 use std::path::Path;
 use std::time::Instant;
 
-use config::Config;
+use config::{CacheLocation, Config};
 use logging::{log_error, log_warn};
 use plex::{Cache, Client, Section};
 
@@ -90,7 +90,7 @@ fn main() {
     };
     let trigger_event = instance.as_ref().and_then(|guard| guard.event());
 
-    let cfg = match config::load(&args) {
+    let mut cfg = match config::load(&args) {
         Ok(cfg) => cfg,
         Err(err) => {
             log_error!("配置错误: {err}");
@@ -147,17 +147,22 @@ fn main() {
         return;
     }
 
-    let mut cache = if cfg.cache_dir_explicit && !cfg.cache_dir_auto {
-        match Cache::open(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming) {
+    let mut cache = match &cfg.cache_location {
+        CacheLocation::Explicit(dir) => match Cache::open(dir, cfg.cache_days, cfg.cache_naming) {
             Ok(cache) => cache,
             Err(err) => {
                 log_error!("{err}");
                 std::process::exit(2);
             }
+        },
+        CacheLocation::Default | CacheLocation::Auto => {
+            Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming)
         }
-    } else {
-        Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming)
     };
+    // 让后续托盘菜单/日志显示实际使用的目录（auto 可能回退到别处）。
+    if cache.is_disk() {
+        cfg.cache_dir = cache.dir.clone();
+    }
     cache.set_max_bytes(cfg.cache_max_mb.saturating_mul(1024 * 1024));
     cache.maintain();
     // 保存完整媒体库列表，离线时才能把 --library 的编号/标题解析回库。
