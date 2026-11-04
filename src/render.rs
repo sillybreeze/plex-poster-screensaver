@@ -48,10 +48,7 @@ fn build_from_image(img: RgbImage, width: u32, height: u32) -> Composition {
     let (pw, ph) = fit(img.width(), img.height(), width, height);
     let poster = resize(&img, pw, ph);
     let background = ambient(&poster, width, height);
-    let position = (
-        ((width - pw) / 2) as i32,
-        ((height - ph) / 2) as i32,
-    );
+    let position = (((width - pw) / 2) as i32, ((height - ph) / 2) as i32);
 
     Composition {
         background,
@@ -63,9 +60,7 @@ fn build_from_image(img: RgbImage, width: u32, height: u32) -> Composition {
 }
 
 fn fit(iw: u32, ih: u32, w: u32, h: u32) -> (u32, u32) {
-    let scale = (w as f32 / iw as f32)
-        .min(h as f32 / ih as f32)
-        * POSTER_SCALE;
+    let scale = (w as f32 / iw as f32).min(h as f32 / ih as f32) * POSTER_SCALE;
     (
         ((iw as f32 * scale).round() as u32).max(1),
         ((ih as f32 * scale).round() as u32).max(1),
@@ -86,7 +81,6 @@ fn pack(c: [f32; 3]) -> u32 {
     let b = c[2].clamp(0.0, 255.0) as u32;
     (r << 16) | (g << 8) | b
 }
-
 
 /// 按「占比 × 鲜艳度 × 亮度」挑主色：黑底海报不会得到一片黑。
 fn dominant_colors(poster: &RgbImage) -> ([f32; 3], [f32; 3]) {
@@ -109,20 +103,24 @@ fn dominant_colors(poster: &RgbImage) -> ([f32; 3], [f32; 3]) {
         let b = (idx & 0xf) as f32 * 17.0;
         let high = r.max(g).max(b);
         let low = r.min(g).min(b);
-        let saturation = if high <= 0.0 { 0.0 } else { (high - low) / high };
+        let saturation = if high <= 0.0 {
+            0.0
+        } else {
+            (high - low) / high
+        };
         let luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-        let score = (count as f32 / total as f32).sqrt()
-            * (0.15 + saturation)
-            * luminance.min(0.85);
+        let score =
+            (count as f32 / total as f32).sqrt() * (0.15 + saturation) * luminance.min(0.85);
         scored.push((score, [r, g, b]));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let top = scored.first().map(|v| v.1).unwrap_or([36.0, 36.0, 40.0]);
-    let second = scored
-        .get(1)
-        .map(|v| v.1)
-        .unwrap_or([top[0] * 0.55, top[1] * 0.55, top[2] * 0.55]);
+    let second =
+        scored
+            .get(1)
+            .map(|v| v.1)
+            .unwrap_or([top[0] * 0.55, top[1] * 0.55, top[2] * 0.55]);
     (top, second)
 }
 
@@ -130,7 +128,9 @@ fn box_blur(src: &RgbImage, radius: i32) -> RgbImage {
     let (w, h) = (src.width() as i32, src.height() as i32);
     let mut out = src.clone();
     let get = |x: i32, y: i32| -> [f32; 3] {
-        let px = src.get_pixel(x.clamp(0, w - 1) as u32, y.clamp(0, h - 1) as u32).0;
+        let px = src
+            .get_pixel(x.clamp(0, w - 1) as u32, y.clamp(0, h - 1) as u32)
+            .0;
         [px[0] as f32, px[1] as f32, px[2] as f32]
     };
 
@@ -167,11 +167,7 @@ fn box_blur(src: &RgbImage, radius: i32) -> RgbImage {
             out.put_pixel(
                 x as u32,
                 y as u32,
-                Rgb([
-                    (acc[0] / n) as u8,
-                    (acc[1] / n) as u8,
-                    (acc[2] / n) as u8,
-                ]),
+                Rgb([(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8]),
             );
         }
     }
@@ -380,7 +376,6 @@ fn sample_bilinear(raw: &[u8], iw: i32, ih: i32, x: f32, y: f32) -> u32 {
     }
     out
 }
-
 
 pub fn save_png(out: &[u32], width: u32, height: u32, path: &Path) -> Result<(), String> {
     let mut buf = Vec::with_capacity(out.len() * 3);

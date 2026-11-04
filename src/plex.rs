@@ -107,9 +107,7 @@ impl Client {
             req = req.query(k, v);
         }
         match req.call() {
-            Ok(resp) => resp
-                .into_string()
-                .map_err(|e| format!("读取响应失败: {e}")),
+            Ok(resp) => resp.into_string().map_err(|e| format!("读取响应失败: {e}")),
             Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
             Err(e) => Err(format!("请求失败: {e}")),
         }
@@ -374,12 +372,8 @@ impl Cache {
             // 反过来，扫描旧文件得到的条目字段是空的，不能拿它覆盖已有元数据。
             let section_changed = (!item.section_key.is_empty()
                 && existing.section_key != item.section_key)
-                || (!item.section_title.is_empty()
-                    && existing.section_title != item.section_title);
-            if existing.title != item.title
-                || existing.thumb != item.thumb
-                || section_changed
-            {
+                || (!item.section_title.is_empty() && existing.section_title != item.section_title);
+            if existing.title != item.title || existing.thumb != item.thumb || section_changed {
                 existing.title = item.title.clone();
                 existing.thumb = item.thumb.clone();
                 // 空媒体库字段不覆盖已有值，避免扫描旧文件时把元数据冲掉。

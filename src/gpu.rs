@@ -5,24 +5,23 @@ use std::sync::{Mutex, OnceLock};
 
 use image::RgbImage;
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HWND, FALSE, TRUE};
-use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, FALSE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDeviceAndSwapChain, ID3D11BlendState, ID3D11Buffer, ID3D11Device,
-    ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BLEND_DESC,
-    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA, D3D11_BUFFER_DESC,
-    D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_ALWAYS, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_IMMUTABLE,
-    D3D11_VIEWPORT as D3D11_VIEWPORT_, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_SDK_VERSION, D3D11_CULL_NONE, D3D11_FILL_SOLID,
-    D3D11_RASTERIZER_DESC, ID3D11RasterizerState,
-    D3D11_USAGE_DEFAULT,
+    ID3D11DeviceContext, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA,
+    D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_ALWAYS, D3D11_CULL_NONE,
+    D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_RASTERIZER_DESC,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
+    D3D11_VIEWPORT as D3D11_VIEWPORT_,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
@@ -237,7 +236,10 @@ impl Gpu {
                     ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
                     Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
                 },
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: 2,
                 OutputWindow: hwnd,
@@ -457,12 +459,7 @@ impl Gpu {
         Ok(Textures {
             bg: bg_srv,
             poster: poster_srv,
-            rect: [
-                position.0 as f32,
-                position.1 as f32,
-                pw as f32,
-                ph as f32,
-            ],
+            rect: [position.0 as f32, position.1 as f32, pw as f32, ph as f32],
         })
     }
 
@@ -490,8 +487,14 @@ impl Gpu {
                 color_alpha: [1.0, 1.0, 1.0, alpha.clamp(0.0, 1.0)],
             };
 
-            self.context
-                .UpdateSubresource(&self.cb, 0, None, &params as *const _ as *const _, 0, 0);
+            self.context.UpdateSubresource(
+                &self.cb,
+                0,
+                None,
+                &params as *const _ as *const _,
+                0,
+                0,
+            );
             self.context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
             self.context.RSSetViewports(Some(&[viewport]));
             self.context
@@ -500,9 +503,9 @@ impl Gpu {
             self.context.PSSetShader(&self.ps, None);
             self.context
                 .PSSetShaderResources(0, Some(&[Some(tex.bg.clone()), Some(tex.poster.clone())]));
-            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context
-                .OMSetBlendState(&self.blend, None, 0xffffffff);
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context.OMSetBlendState(&self.blend, None, 0xffffffff);
             self.context.RSSetState(&self.raster);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
@@ -519,10 +522,7 @@ impl Gpu {
         if result.is_ok() {
             return Ok(PresentStatus::Presented);
         }
-        Err(self.error_from(
-            "Present",
-            windows::core::Error::from_hresult(result),
-        ))
+        Err(self.error_from("Present", windows::core::Error::from_hresult(result)))
     }
 
     /// 把尽量多的上下文带进错误：Present 失败后设备原因往往才是根因。
@@ -530,10 +530,7 @@ impl Gpu {
         let mut error = GpuError::from_win(context, err);
         if let Some(reason) = self.device_removed_reason() {
             error.device_lost = true;
-            error.message = format!(
-                "{}；GetDeviceRemovedReason=0x{reason:08X}",
-                error.message
-            );
+            error.message = format!("{}；GetDeviceRemovedReason=0x{reason:08X}", error.message);
         }
         error
     }
@@ -621,7 +618,10 @@ fn create_texture(
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,

@@ -19,7 +19,10 @@ use crate::logging::{log_info, log_warn};
 const EVENT_NAME: &str = "Local\\PlexPosterScreensaver.StartNow";
 
 fn name() -> Vec<u16> {
-    EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect()
+    EVENT_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 已有实例在跑？有的话点亮它的信号灯并返回 true，调用方该退出了。

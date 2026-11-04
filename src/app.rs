@@ -737,8 +737,8 @@ impl App {
     /// 外部要求立刻开始（又启动了一次 exe）。只有常驻模式需要响应。
     fn start_now(&mut self, event_loop: &ActiveEventLoop) {
         match self.watch.as_ref().map(|w| w.showing) {
-            None => return,        // --now 或普通模式，本来就在全屏
-            Some(true) => return,  // 已经在放了
+            None => return,       // --now 或普通模式，本来就在全屏
+            Some(true) => return, // 已经在放了
             Some(false) => {}
         }
         if self.pause.system_paused() {
@@ -808,12 +808,7 @@ impl App {
         self.progress = 0.0;
         self.uv = [0.0, 0.0, 1.0, 1.0];
         self.next_frame_at = now;
-        self.grace_until = now
-            + if manual {
-                MANUAL_GRACE
-            } else {
-                IDLE_GRACE
-            };
+        self.grace_until = now + if manual { MANUAL_GRACE } else { IDLE_GRACE };
 
         if let Some(w) = &mut self.watch {
             w.showing = true;
@@ -956,7 +951,10 @@ impl App {
         if std::env::var_os("PPS_DEBUG").is_some() {
             log_info!(
                 "尺寸更新: {}x{} -> {}x{}（immediate={immediate}）",
-                self.size.0, self.size.1, size.0, size.1
+                self.size.0,
+                self.size.1,
+                size.0,
+                size.1
             );
         }
         self.size = size;
@@ -1038,7 +1036,10 @@ impl App {
         if (slide.comp.width, slide.comp.height) != self.size {
             log_warn!(
                 "丢弃尺寸不匹配的预取画面: {}x{}（当前 {}x{}）",
-                slide.comp.width, slide.comp.height, self.size.0, self.size.1
+                slide.comp.width,
+                slide.comp.height,
+                self.size.0,
+                self.size.1
             );
             return false;
         }
@@ -1052,14 +1053,17 @@ impl App {
         let Some(gpu) = &self.gpu else {
             return false;
         };
-        let new_tex =
-            match gpu.upload(&slide.comp.background, &slide.comp.poster, slide.comp.position) {
-                Ok(tex) => tex,
-                Err(err) => {
-                    log_error!("上传纹理失败: {err}");
-                    return false;
-                }
-            };
+        let new_tex = match gpu.upload(
+            &slide.comp.background,
+            &slide.comp.poster,
+            slide.comp.position,
+        ) {
+            Ok(tex) => tex,
+            Err(err) => {
+                log_error!("上传纹理失败: {err}");
+                return false;
+            }
+        };
 
         match self.current.take() {
             Some(old) => {
@@ -1090,11 +1094,7 @@ impl App {
                 }
                 self.next_frame_at = now + Duration::from_millis(120);
             }
-            Phase::Fade {
-                old,
-                old_uv,
-                start,
-            } => {
+            Phase::Fade { old, old_uv, start } => {
                 let duration = self.cfg.fade_seconds.max(0.01);
                 let t = ((now - start).as_secs_f64() / duration) as f32;
                 if t >= 1.0 {
@@ -1106,11 +1106,7 @@ impl App {
                         gpu.draw(&old, old_uv, 1.0);
                         gpu.draw(current, uv, t * t * (3.0 - 2.0 * t));
                     }
-                    self.phase = Phase::Fade {
-                        old,
-                        old_uv,
-                        start,
-                    };
+                    self.phase = Phase::Fade { old, old_uv, start };
                     self.next_frame_at = now + Duration::from_millis(33);
                 }
             }
@@ -1202,9 +1198,7 @@ impl App {
                     if suppressed == 0 {
                         log_warn!("Present 暂时失败，保留当前设备重试: {err}");
                     } else {
-                        log_warn!(
-                            "Present 持续失败，保留当前设备: {err}；已抑制 {suppressed} 条"
-                        );
+                        log_warn!("Present 持续失败，保留当前设备: {err}；已抑制 {suppressed} 条");
                     }
                 }
                 self.next_frame_at = now + Duration::from_secs(1);
@@ -1595,10 +1589,7 @@ mod tests {
     fn gpu_backoff_follows_schedule_and_caps() {
         let expected = [1u64, 2, 4, 8, 16, 32, 60, 60];
         for (index, secs) in expected.iter().enumerate() {
-            assert_eq!(
-                gpu_backoff(index as u32 + 1),
-                Duration::from_secs(*secs)
-            );
+            assert_eq!(gpu_backoff(index as u32 + 1), Duration::from_secs(*secs));
         }
     }
 
@@ -1614,20 +1605,14 @@ mod tests {
         assert_eq!(recovery.retry_in(now), Duration::from_secs(1));
 
         // 1 秒内的再次失败只累计，不再写日志，退避继续增长。
-        assert_eq!(
-            recovery.record_failure(now + Duration::from_secs(1)),
-            None
-        );
+        assert_eq!(recovery.record_failure(now + Duration::from_secs(1)), None);
         assert_eq!(
             recovery.retry_in(now + Duration::from_secs(1)),
             Duration::from_secs(2)
         );
 
         // “设备创建成功”不会调用 record_success；下一次 Present 失败仍继续退避。
-        assert_eq!(
-            recovery.record_failure(now + Duration::from_secs(3)),
-            None
-        );
+        assert_eq!(recovery.record_failure(now + Duration::from_secs(3)), None);
         assert_eq!(
             recovery.retry_in(now + Duration::from_secs(3)),
             Duration::from_secs(4)

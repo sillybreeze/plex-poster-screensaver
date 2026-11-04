@@ -142,7 +142,9 @@ fn key_code(token: &str) -> Option<u32> {
 
 fn key_label(vk: u32) -> String {
     if (0x30..=0x39).contains(&vk) || (0x41..=0x5A).contains(&vk) {
-        return char::from_u32(vk).map(|c| c.to_string()).unwrap_or_default();
+        return char::from_u32(vk)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
     }
     if (0x70..=0x87).contains(&vk) {
         return format!("F{}", vk - 0x70 + 1);
@@ -330,8 +332,10 @@ pub fn parse_args() -> Result<Args, String> {
             "--cache-max-mb" => args.cache_max_mb = Some(parse_num(&value("--cache-max-mb")?)?),
             "--cache-naming" => {
                 let raw = value("--cache-naming")?;
-                args.cache_naming =
-                    Some(Naming::parse(&raw).ok_or_else(|| format!("无效的命名方式: {raw}（title|key）"))?);
+                args.cache_naming = Some(
+                    Naming::parse(&raw)
+                        .ok_or_else(|| format!("无效的命名方式: {raw}（title|key）"))?,
+                );
             }
             "--config" => args.config = Some(value("--config")?),
             "--watch" => args.watch = true,
@@ -341,10 +345,9 @@ pub fn parse_args() -> Result<Args, String> {
             "--no-hotkey" => args.no_hotkey = true,
             "--hotkey" => {
                 let raw = value("--hotkey")?;
-                args.hotkey = Some(
-                    Hotkey::parse(&raw)
-                        .ok_or_else(|| format!("无效的热键: {raw}（例：Ctrl+Alt+P、Ctrl+Shift+F9）"))?,
-                );
+                args.hotkey = Some(Hotkey::parse(&raw).ok_or_else(|| {
+                    format!("无效的热键: {raw}（例：Ctrl+Alt+P、Ctrl+Shift+F9）")
+                })?);
             }
             "--self-test" => args.self_test = Some(parse_num(&value("--self-test")?)?),
             "--snapshot" => args.snapshot = Some(value("--snapshot")?),
@@ -434,7 +437,9 @@ pub fn load(args: &Args) -> Result<Config, String> {
                     if let Some(v) = &file.cache_naming {
                         match Naming::parse(v) {
                             Some(n) => cfg.cache_naming = n,
-                            None => log_warn!("config.json 里的 cache_naming 无效（title|key）: {v}"),
+                            None => {
+                                log_warn!("config.json 里的 cache_naming 无效（title|key）: {v}")
+                            }
                         }
                     }
                     if let Some(v) = file.cache_days {
@@ -469,7 +474,10 @@ pub fn load(args: &Args) -> Result<Config, String> {
                     }
                     if let Some(v) = &file.hotkey {
                         let v = v.trim();
-                        if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+                        if v.is_empty()
+                            || v.eq_ignore_ascii_case("none")
+                            || v.eq_ignore_ascii_case("off")
+                        {
                             cfg.hotkey = None;
                         } else {
                             match Hotkey::parse(v) {
@@ -482,10 +490,7 @@ pub fn load(args: &Args) -> Result<Config, String> {
                 }
                 Err(err) => {
                     if explicit {
-                        return Err(format!(
-                            "配置文件解析失败 {}: {err}",
-                            path.display()
-                        ));
+                        return Err(format!("配置文件解析失败 {}: {err}", path.display()));
                     }
                     log_warn!("配置文件解析失败，已忽略 {}: {err}", path.display());
                 }

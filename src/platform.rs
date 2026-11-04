@@ -10,7 +10,10 @@ use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use windows::core::PWSTR;
 use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -19,7 +22,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Power::{
     RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
     POWERBROADCAST_SETTING,
@@ -29,6 +31,9 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE,
@@ -40,8 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, KillTimer,
     LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     SetTimer, TrackPopupMenu, TranslateMessage, GWL_STYLE, HICON, HMENU, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
     SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
     TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
     WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_POWERBROADCAST,
@@ -49,12 +54,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use winit::event_loop::EventLoopProxy;
-use windows::core::PWSTR;
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
-};
 
 use crate::app::UserEvent;
 use crate::logging::{log_info, log_warn};
@@ -417,11 +416,7 @@ fn ensure_icon(hwnd: HWND) {
     }
 }
 
-fn add_icon(
-    hwnd: HWND,
-    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
-    tip: &str,
-) -> bool {
+fn add_icon(hwnd: HWND, icon: windows::Win32::UI::WindowsAndMessaging::HICON, tip: &str) -> bool {
     unsafe {
         // 上次崩溃/重启可能留下同 hWnd+uID 的幽灵图标，先删一次再注册。
         let stale = base_icon_data(hwnd);
@@ -667,9 +662,7 @@ pub fn busy_reason() -> Option<&'static str> {
             }
             // D3D/BUSY 也要有真正的前台全屏窗口才算；否则 RustDesk 等远程桌面
             // 窗口会把屏保永久判成“忙”。
-            if foreground_full
-                && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY)
-            {
+            if foreground_full && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY) {
                 return Some("shell fullscreen");
             }
         }
@@ -814,8 +807,12 @@ mod tests {
     fn remote_control_windows_are_not_treated_as_media() {
         assert!(is_remote_control(r"C:\Program Files\RustDesk\rustdesk.exe"));
         assert!(is_remote_control(r"C:\Windows\System32\mstsc.exe"));
-        assert!(is_remote_control(r"C:\Program Files\TeamViewer\TeamViewer.exe"));
-        assert!(!is_remote_control(r"C:\Program Files\Google\Chrome\chrome.exe"));
+        assert!(is_remote_control(
+            r"C:\Program Files\TeamViewer\TeamViewer.exe"
+        ));
+        assert!(!is_remote_control(
+            r"C:\Program Files\Google\Chrome\chrome.exe"
+        ));
         assert!(!is_remote_control(r"C:\Program Files\VideoLAN\VLC\vlc.exe"));
     }
 }

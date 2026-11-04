@@ -85,7 +85,9 @@ fn main() {
         }
     };
     if cfg.token.is_empty() {
-        log_error!("缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。");
+        log_error!(
+            "缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。"
+        );
         std::process::exit(1);
     }
 
@@ -122,7 +124,11 @@ fn main() {
         }
         println!("Plex: {}", cfg.url);
         for (i, s) in selected.iter().enumerate() {
-            let kind = if s.kind == "movie" { "电影" } else { "剧集" };
+            let kind = if s.kind == "movie" {
+                "电影"
+            } else {
+                "剧集"
+            };
             println!("  {}. {}  [{}]  key={}", i + 1, s.title, kind, s.key);
         }
         return;
@@ -147,14 +153,10 @@ fn main() {
     if selected.is_empty() {
         let offline = cache.offline_items(&wanted);
         if offline.is_empty() {
-            let waiting = cfg.watch
-                && !args.preview
-                && args.self_test.is_none()
-                && args.snapshot.is_none();
+            let waiting =
+                cfg.watch && !args.preview && args.self_test.is_none() && args.snapshot.is_none();
             if waiting {
-                log_warn!(
-                    "Plex 暂不可用，本地也没有可离线播放的缓存；常驻等待，后台会自动重连"
-                );
+                log_warn!("Plex 暂不可用，本地也没有可离线播放的缓存；常驻等待，后台会自动重连");
             } else {
                 log_error!(
                     "无法连接 Plex，本地也没有可离线播放的缓存: {}",
@@ -171,27 +173,11 @@ fn main() {
     }
 
     if let Some(count) = args.self_test {
-        run_self_test(
-            &cfg,
-            client,
-            cache,
-            selected,
-            wanted,
-            status_handle,
-            count,
-        );
+        run_self_test(&cfg, client, cache, selected, wanted, status_handle, count);
         return;
     }
     if let Some(path) = &args.snapshot {
-        run_snapshot(
-            &cfg,
-            client,
-            cache,
-            selected,
-            wanted,
-            status_handle,
-            path,
-        );
+        run_snapshot(&cfg, client, cache, selected, wanted, status_handle, path);
         return;
     }
 

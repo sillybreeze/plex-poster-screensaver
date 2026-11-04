@@ -134,10 +134,7 @@ mod tests {
     #[test]
     fn tick_delta_wraps_around() {
         // 回绕边界：now 比 last 小，差值仍然是正确的一小段时间。
-        assert_eq!(
-            tick_elapsed(100, u32::MAX - 50),
-            Duration::from_millis(151)
-        );
+        assert_eq!(tick_elapsed(100, u32::MAX - 50), Duration::from_millis(151));
         assert_eq!(tick_elapsed(1000, 1000), Duration::ZERO);
     }
 }
