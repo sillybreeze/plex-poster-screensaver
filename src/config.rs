@@ -258,6 +258,8 @@ pub struct Args {
     pub token: Option<String>,
     pub library: Vec<String>,
     pub list: bool,
+    /// 等待 N 秒后打印前台窗口诊断信息（T08 排查用）。
+    pub diagnose_foreground: Option<u32>,
     pub preview: bool,
     pub display: Option<f64>,
     pub fade: Option<f64>,
@@ -293,6 +295,7 @@ plex-poster-screensaver (Rust)
   --token <令牌>        Plex Token（也可用环境变量 PLEX_TOKEN）
   --library <编号|名称> 选择媒体库，可重复
   --list                列出媒体库后退出
+  --diagnose-foreground <秒>  等待 N 秒后打印前台窗口诊断信息（全屏识别排查）
   --display <秒>        每张停留时间，默认 10（0.1–3600）
   --fade <秒>           淡入淡出时长，默认 1.2（0–60），0 表示关闭
   --no-motion           关闭 Ken Burns 缓慢推近（轮播继续）
@@ -328,6 +331,13 @@ pub fn parse_args() -> Result<Args, String> {
             "--token" => args.token = Some(value("--token")?),
             "--library" => args.library.push(value("--library")?),
             "--list" => args.list = true,
+            "--diagnose-foreground" => {
+                let seconds = parse_num::<u32>(&value("--diagnose-foreground")?)?;
+                if seconds > 600 {
+                    return Err("--diagnose-foreground 最多等待 600 秒".to_string());
+                }
+                args.diagnose_foreground = Some(seconds);
+            }
             "--preview" => args.preview = true,
             "--display" => args.display = Some(parse_num(&value("--display")?)?),
             "--fade" => args.fade = Some(parse_num(&value("--fade")?)?),

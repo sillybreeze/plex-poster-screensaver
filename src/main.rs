@@ -60,6 +60,10 @@ fn main() {
         print!("{}", config::HELP);
         return;
     }
+    if let Some(seconds) = args.diagnose_foreground {
+        platform::diagnose_foreground(seconds);
+        return;
+    }
 
     let config_path = config::locate_config(args.config.as_deref());
 

@@ -44,8 +44,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, KillTimer,
     LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, GWL_STYLE, HICON, HMENU,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED,
+    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, HICON,
+    HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
     PBT_POWERSETTINGCHANGE, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SM_CYSMICON, SW_SHOWNORMAL,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -698,6 +698,85 @@ pub fn busy_reason() -> Option<&'static str> {
         Some("foreground fullscreen")
     } else {
         None
+    }
+}
+
+/// T08 排查用：等待指定秒数后打印当前前台窗口的识别依据。只读，不改变判定。
+pub fn diagnose_foreground(delay_seconds: u32) {
+    if delay_seconds > 0 {
+        println!("{delay_seconds} 秒后采样前台窗口，请切换到目标全屏应用……");
+        thread::sleep(Duration::from_secs(delay_seconds as u64));
+    }
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            println!("前台窗口: <none>");
+            return;
+        }
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class);
+        let class = if len > 0 {
+            String::from_utf16_lossy(&class[..len as usize])
+        } else {
+            "<unknown>".to_string()
+        };
+        let process = process_image_name(pid).unwrap_or_else(|| "<unknown>".to_string());
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let exstyle = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        let mut rect = RECT::default();
+        let has_rect = GetWindowRect(hwnd, &mut rect).is_ok();
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let has_monitor = GetMonitorInfoW(monitor, &mut info).as_bool();
+
+        println!(
+            "前台窗口: hwnd=0x{:X} class={class} pid={pid} process={process}",
+            hwnd.0 as usize
+        );
+        println!("style=0x{style:08X} exstyle=0x{exstyle:08X}");
+        if has_rect {
+            println!(
+                "window rect: ({}, {}, {}, {})",
+                rect.left, rect.top, rect.right, rect.bottom
+            );
+        } else {
+            println!("window rect: <unavailable>");
+        }
+        if has_monitor {
+            println!(
+                "monitor rect: ({}, {}, {}, {}) work: ({}, {}, {}, {})",
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                info.rcMonitor.right,
+                info.rcMonitor.bottom,
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom
+            );
+        } else {
+            println!("monitor rect: <unavailable>");
+        }
+        println!("foreground_is_fullscreen={}", foreground_is_fullscreen());
+        println!("busy_reason={:?}", busy_reason());
+        match SHQueryUserNotificationState() {
+            Ok(state) => println!(
+                "SHQueryUserNotificationState: presentation={} d3d_fullscreen={} busy={}",
+                state == QUNS_PRESENTATION_MODE,
+                state == QUNS_RUNNING_D3D_FULL_SCREEN,
+                state == QUNS_BUSY
+            ),
+            Err(err) => println!("SHQueryUserNotificationState: <error {err}>"),
+        }
     }
 }
 
