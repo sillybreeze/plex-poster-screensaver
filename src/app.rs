@@ -18,9 +18,9 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::config::Config;
-use crate::gpu::{Gpu, Textures};
+use crate::gpu::{Gpu, GpuError, PresentStatus, Textures};
 use crate::idle::{self, Idle};
-use crate::logging::{log_error, log_info, log_warn};
+use crate::logging::{log_error, log_info, log_warn, Throttle};
 use crate::platform::Platform;
 use crate::plex::{Cache, Client, MediaItem, Section};
 use crate::render::{self, Composition, DIRECTIONS};
@@ -444,6 +444,69 @@ impl PauseState {
     }
 }
 
+/// GPU 故障日志最多每 30 秒汇总一次。
+const GPU_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 设备创建、Present、resize 失败后的统一恢复调度。
+///
+/// 失败次数不会在“设备创建成功”时清零：只有新设备确实成功呈现过一次才算恢复，
+/// 否则会退化成“创建成功 → Present 失败 → 立即重建”的忙循环。
+#[derive(Default)]
+struct GpuRecovery {
+    failures: u32,
+    retry_at: Option<Instant>,
+    recovering: bool,
+    log: Throttle,
+}
+
+/// 1、2、4、8、16、32、60 秒，上限 60 秒。
+fn gpu_backoff(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(4),
+        4 => Duration::from_secs(8),
+        5 => Duration::from_secs(16),
+        6 => Duration::from_secs(32),
+        _ => Duration::from_secs(60),
+    }
+}
+
+impl GpuRecovery {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        self.retry_at
+    }
+
+    fn retry_in(&self, now: Instant) -> Duration {
+        self.retry_at
+            .map(|at| at.saturating_duration_since(now))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn can_attempt(&self, now: Instant) -> bool {
+        self.retry_at.map(|at| now >= at).unwrap_or(true)
+    }
+
+    /// 记录一次失败并推进退避；`Some(n)` 表示本次应写日志，`n` 是被抑制的次数。
+    fn record_failure(&mut self, now: Instant) -> Option<u32> {
+        self.failures = self.failures.saturating_add(1);
+        self.recovering = true;
+        self.retry_at = Some(now + gpu_backoff(self.failures));
+        self.log.record(now, GPU_LOG_INTERVAL)
+    }
+
+    /// 一次成功呈现后恢复；返回此前是否处于故障恢复中。
+    fn record_success(&mut self) -> bool {
+        let recovering = self.recovering;
+        self.reset();
+        recovering
+    }
+}
+
 /// 常驻等待状态：窗口先藏着，空闲到点才全屏。
 struct Watch {
     threshold: Duration,
@@ -484,6 +547,9 @@ pub struct App {
     size: (u32, u32),
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    gpu_recovery: GpuRecovery,
+    /// 非设备类 Present 错误的日志限流，避免瞬时错误刷屏。
+    transient_log: Throttle,
 
     current: Option<Textures>,
     phase: Phase,
@@ -548,6 +614,8 @@ impl App {
             size: (1920, 1080),
             window: None,
             gpu: None,
+            gpu_recovery: GpuRecovery::default(),
+            transient_log: Throttle::default(),
             current: None,
             phase: Phase::Idle,
             slide_index: 0,
@@ -616,9 +684,18 @@ impl App {
     }
 
     /// 惰性创建 D3D11：常驻模式下第一次触发才建，平时不占显存。
+    ///
+    /// 失败时进入统一退避，不在这里立即重试；隐藏或系统暂停期间也不创建。
     fn ensure_gpu(&mut self) -> bool {
         if self.gpu.is_some() {
             return true;
+        }
+        if self.pause.system_paused() {
+            return false;
+        }
+        let now = Instant::now();
+        if !self.gpu_recovery.can_attempt(now) {
+            return false;
         }
         let Some(window) = self.window.clone() else {
             return false;
@@ -638,9 +715,22 @@ impl App {
                 true
             }
             Err(err) => {
-                log_error!("初始化 D3D11 失败: {err}");
+                self.note_gpu_failure(now, &err);
                 false
             }
+        }
+    }
+
+    /// 记录一次 GPU 故障，按退避安排下次尝试并限制日志频率。
+    fn note_gpu_failure(&mut self, now: Instant, err: &GpuError) {
+        let Some(suppressed) = self.gpu_recovery.record_failure(now) else {
+            return;
+        };
+        let retry = self.gpu_recovery.retry_in(now).as_secs().max(1);
+        if suppressed == 0 {
+            log_error!("{err}；{retry} 秒后重试");
+        } else {
+            log_error!("{err}；已抑制 {suppressed} 条同类日志；{retry} 秒后重试");
         }
     }
 
@@ -877,20 +967,20 @@ impl App {
         self.progress = 0.0;
         self.uv = [0.0, 0.0, 1.0, 1.0];
 
-        let mut resize_failed = false;
+        let mut resize_error = None;
         if let Some(gpu) = &mut self.gpu {
             if gpu.size() != size {
                 if let Err(err) = gpu.resize(size.0, size.1) {
-                    log_warn!("调整交换链失败: {err}");
-                    resize_failed = true;
+                    resize_error = Some(err);
                 }
             }
         }
-        if resize_failed {
+        if let Some(err) = resize_error {
+            // resize 失败同样走统一退避；不在事件处理里同步重建，交给 about_to_wait。
             self.gpu = None;
-        }
-        if self.gpu.is_none() && self.active() && !self.ensure_gpu() {
-            log_warn!("重建渲染器失败，下一帧再试");
+            self.current = None;
+            self.phase = Phase::Idle;
+            self.note_gpu_failure(now, &err);
         }
 
         // 预取队列里是旧尺寸的画面，立即作废；同时取消旧线程，别让它继续重试。
@@ -1089,17 +1179,36 @@ impl App {
     }
 
     fn present(&mut self) {
-        let lost = if let Some(gpu) = &self.gpu {
-            gpu.present().err()
-        } else {
-            None
+        let Some(result) = self.gpu.as_ref().map(|gpu| gpu.present()) else {
+            return;
         };
-        if let Some(err) = lost {
-            log_error!("Present 失败，重建渲染器: {err}");
-            self.gpu = None;
-            self.current = None;
-            self.phase = Phase::Idle;
-            self.next_frame_at = Instant::now();
+        let now = Instant::now();
+        match result {
+            Ok(PresentStatus::Presented) | Ok(PresentStatus::Occluded) => {
+                if self.gpu_recovery.record_success() {
+                    log_info!("GPU 已恢复，继续渲染");
+                }
+            }
+            Err(err) if err.device_lost() => {
+                self.gpu = None;
+                self.current = None;
+                self.phase = Phase::Idle;
+                self.note_gpu_failure(now, &err);
+                self.next_frame_at = now;
+            }
+            Err(err) => {
+                // 非设备级错误不销毁设备，避免一次瞬时错误升级成完整重建。
+                if let Some(suppressed) = self.transient_log.record(now, GPU_LOG_INTERVAL) {
+                    if suppressed == 0 {
+                        log_warn!("Present 暂时失败，保留当前设备重试: {err}");
+                    } else {
+                        log_warn!(
+                            "Present 持续失败，保留当前设备: {err}；已抑制 {suppressed} 条"
+                        );
+                    }
+                }
+                self.next_frame_at = now + Duration::from_secs(1);
+            }
         }
     }
 
@@ -1145,6 +1254,8 @@ impl App {
         }
         self.stop_worker();
         self.gpu = None;
+        self.gpu_recovery.reset();
+        self.transient_log.reset();
         self.current = None;
         self.phase = Phase::Idle;
         self.next_frame_at = now;
@@ -1154,6 +1265,8 @@ impl App {
     fn on_system_resume(&mut self, now: Instant) {
         // 休眠/锁屏后设备可能已失效，下一次按需重建交换链。
         self.gpu = None;
+        self.gpu_recovery.reset();
+        self.transient_log.reset();
         self.current = None;
         self.phase = Phase::Idle;
         if self.window.is_some() && !self.pause.system_paused() && self.rx.is_none() {
@@ -1288,9 +1401,9 @@ impl ApplicationHandler<UserEvent> for App {
 
         self.window = Some(window);
 
-        if !watching && !self.ensure_gpu() {
-            event_loop.exit();
-            return;
+        if !watching {
+            // 首次创建失败不退出：按统一退避在事件循环里重试，避免驱动瞬时故障直接结束进程。
+            self.ensure_gpu();
         }
 
         if self.rx.is_none() {
@@ -1445,11 +1558,11 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        if self.window.is_some() && self.active() && self.gpu.is_none() {
-            self.ensure_gpu();
+        if self.window.is_some() && self.active() && self.gpu.is_none() && self.ensure_gpu() {
+            self.next_frame_at = now;
         }
 
-        if self.window.is_some() && now >= self.next_frame_at {
+        if self.window.is_some() && self.gpu.is_some() && now >= self.next_frame_at {
             let t0 = Instant::now();
             self.tick(now);
             let t1 = Instant::now();
@@ -1460,6 +1573,109 @@ impl ApplicationHandler<UserEvent> for App {
             self.present_us += (t2 - t1).as_secs_f64() * 1000.0;
             self.report(t2);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+
+        // 设备退避期间不要按帧空转：把唤醒时间推到下次允许尝试的时刻。
+        // 事件（退出、输入、系统通知）仍会正常唤醒事件循环。
+        let wake = if self.gpu.is_none() {
+            self.gpu_recovery
+                .retry_at()
+                .unwrap_or_else(|| now + Duration::from_secs(1))
+        } else {
+            self.next_frame_at
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_backoff_follows_schedule_and_caps() {
+        let expected = [1u64, 2, 4, 8, 16, 32, 60, 60];
+        for (index, secs) in expected.iter().enumerate() {
+            assert_eq!(
+                gpu_backoff(index as u32 + 1),
+                Duration::from_secs(*secs)
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_recovery_keeps_backoff_until_present_succeeds() {
+        let now = Instant::now();
+        let mut recovery = GpuRecovery::default();
+        assert!(recovery.can_attempt(now));
+
+        assert_eq!(recovery.record_failure(now), Some(0), "首次故障立即记录");
+        assert!(!recovery.can_attempt(now));
+        assert!(recovery.can_attempt(now + Duration::from_secs(1)));
+        assert_eq!(recovery.retry_in(now), Duration::from_secs(1));
+
+        // 1 秒内的再次失败只累计，不再写日志，退避继续增长。
+        assert_eq!(
+            recovery.record_failure(now + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            recovery.retry_in(now + Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+
+        // “设备创建成功”不会调用 record_success；下一次 Present 失败仍继续退避。
+        assert_eq!(
+            recovery.record_failure(now + Duration::from_secs(3)),
+            None
+        );
+        assert_eq!(
+            recovery.retry_in(now + Duration::from_secs(3)),
+            Duration::from_secs(4)
+        );
+
+        assert!(recovery.record_success(), "成功呈现后应报告恢复");
+        assert!(!recovery.record_success(), "正常状态不应重复报告");
+        assert!(recovery.can_attempt(now + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn gpu_recovery_logs_summary_after_interval() {
+        let now = Instant::now();
+        let mut recovery = GpuRecovery::default();
+        assert_eq!(recovery.record_failure(now), Some(0));
+        for step in 1..=3 {
+            assert_eq!(
+                recovery.record_failure(now + Duration::from_millis(step * 100)),
+                None
+            );
+        }
+        assert_eq!(
+            recovery.record_failure(now + GPU_LOG_INTERVAL),
+            Some(3),
+            "30 秒窗口到期后应输出汇总"
+        );
+    }
+
+    #[test]
+    fn two_minute_failure_simulation_follows_backoff() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut recovery = GpuRecovery::default();
+        let mut attempts = Vec::new();
+        let mut logs = 0;
+
+        // 以 100ms 为事件循环步长模拟连续失败 2 分钟。
+        while now.duration_since(start) < Duration::from_secs(120) {
+            if recovery.can_attempt(now) {
+                attempts.push(now.duration_since(start).as_secs());
+                if recovery.record_failure(now).is_some() {
+                    logs += 1;
+                }
+            }
+            now += Duration::from_millis(100);
+        }
+
+        assert_eq!(attempts, vec![0, 1, 3, 7, 15, 31, 63]);
+        assert!(logs <= 5, "2 分钟内日志应受限，实际写了 {logs} 条");
     }
 }

@@ -1,8 +1,11 @@
 //! D3D11 渲染：每张图上传一次纹理，每帧只更新几个 uniform，缩放交给 GPU 采样。
 
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
+
 use image::RgbImage;
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{HWND, FALSE, TRUE};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HWND, FALSE, TRUE};
 use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
@@ -26,8 +29,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGISwapChain, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGISwapChain, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 const SHADER: &str = r#"
@@ -78,6 +82,118 @@ struct Params {
     color_alpha: [f32; 4],
 }
 
+/// GPU 操作错误。保留 HRESULT 与设备移除原因，供上层决定是否重建。
+#[derive(Debug, Clone)]
+pub struct GpuError {
+    context: &'static str,
+    hresult: i32,
+    device_lost: bool,
+    message: String,
+}
+
+impl GpuError {
+    fn from_win(context: &'static str, err: windows::core::Error) -> Self {
+        let hresult = err.code().0;
+        Self {
+            context,
+            hresult,
+            device_lost: is_device_loss(hresult),
+            message: err.message(),
+        }
+    }
+
+    fn text(context: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            context,
+            hresult: 0,
+            device_lost: false,
+            message: message.into(),
+        }
+    }
+
+    /// 是否属于必须重建 D3D 设备的故障。
+    pub fn device_lost(&self) -> bool {
+        self.device_lost
+    }
+}
+
+impl fmt::Display for GpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.hresult == 0 {
+            write!(f, "{}: {}", self.context, self.message)
+        } else {
+            write!(
+                f,
+                "{}: {}（HRESULT 0x{:08X}{}）",
+                self.context,
+                self.message,
+                self.hresult as u32,
+                if self.device_lost {
+                    "，设备已移除"
+                } else {
+                    ""
+                }
+            )
+        }
+    }
+}
+
+/// `Present` 的成功状态。遮挡不是故障，不能因此丢弃设备。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentStatus {
+    Presented,
+    Occluded,
+}
+
+/// DXGI 设备级故障码；其余 HRESULT 视为普通/临时错误。
+fn is_device_loss(hresult: i32) -> bool {
+    [
+        DXGI_ERROR_DEVICE_REMOVED.0,
+        DXGI_ERROR_DEVICE_HUNG.0,
+        DXGI_ERROR_DEVICE_RESET.0,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR.0,
+    ]
+    .contains(&hresult)
+}
+
+#[derive(Clone)]
+struct ShaderBytes {
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+}
+
+static SHADER_CACHE: OnceLock<Mutex<Option<ShaderBytes>>> = OnceLock::new();
+
+/// 编译一次并缓存字节码；重建设备时直接复用。
+fn shader_bytes() -> Result<ShaderBytes, GpuError> {
+    let slot = SHADER_CACHE.get_or_init(|| Mutex::new(None));
+    cache_or_build(slot, || {
+        let vs = compile(SHADER, "VS", "vs_4_0")?;
+        let ps = compile(SHADER, "PS", "ps_4_0")?;
+        Ok(ShaderBytes {
+            vs: blob_bytes(&vs).to_vec(),
+            ps: blob_bytes(&ps).to_vec(),
+        })
+    })
+}
+
+/// 只在成功时写入缓存；编译失败要允许下一次重试。
+fn cache_or_build<T: Clone, E>(
+    slot: &Mutex<Option<T>>,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    {
+        let guard = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(value) = guard.as_ref() {
+            return Ok(value.clone());
+        }
+    }
+    let value = build()?;
+    let mut guard = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    *guard = Some(value.clone());
+    Ok(value)
+}
+
 pub struct Textures {
     bg: ID3D11ShaderResourceView,
     poster: ID3D11ShaderResourceView,
@@ -106,7 +222,8 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, String> {
+    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self, GpuError> {
+        let shaders = shader_bytes()?;
         unsafe {
             let desc = DXGI_SWAP_CHAIN_DESC {
                 BufferDesc: DXGI_MODE_DESC {
@@ -146,30 +263,28 @@ impl Gpu {
                 None,
                 Some(&mut context),
             )
-            .map_err(|e| format!("创建 D3D11 设备失败: {e}"))?;
+            .map_err(|e| GpuError::from_win("创建 D3D11 设备", e))?;
 
-            let swap: IDXGISwapChain = swap.ok_or("没有拿到交换链")?;
-            let device: ID3D11Device = device.ok_or("没有拿到 D3D 设备")?;
-            let context: ID3D11DeviceContext = context.ok_or("没有拿到 D3D 上下文")?;
-
-            let vs_blob = compile(SHADER, "VS", "vs_4_0")?;
-            let ps_blob = compile(SHADER, "PS", "ps_4_0")?;
+            let swap: IDXGISwapChain =
+                swap.ok_or_else(|| GpuError::text("创建 D3D11 设备", "没有拿到交换链"))?;
+            let device: ID3D11Device =
+                device.ok_or_else(|| GpuError::text("创建 D3D11 设备", "没有拿到 D3D 设备"))?;
+            let context: ID3D11DeviceContext =
+                context.ok_or_else(|| GpuError::text("创建 D3D11 设备", "没有拿到 D3D 上下文"))?;
 
             let vs = {
-                let code = blob_bytes(&vs_blob);
                 let mut shader = None;
                 device
-                    .CreateVertexShader(code, None, Some(&mut shader))
-                    .map_err(|e| format!("创建顶点着色器失败: {e}"))?;
-                shader.ok_or("顶点着色器为空")?
+                    .CreateVertexShader(&shaders.vs, None, Some(&mut shader))
+                    .map_err(|e| GpuError::from_win("创建顶点着色器", e))?;
+                shader.ok_or_else(|| GpuError::text("创建顶点着色器", "顶点着色器为空"))?
             };
             let ps = {
-                let code = blob_bytes(&ps_blob);
                 let mut shader = None;
                 device
-                    .CreatePixelShader(code, None, Some(&mut shader))
-                    .map_err(|e| format!("创建像素着色器失败: {e}"))?;
-                shader.ok_or("像素着色器为空")?
+                    .CreatePixelShader(&shaders.ps, None, Some(&mut shader))
+                    .map_err(|e| GpuError::from_win("创建像素着色器", e))?;
+                shader.ok_or_else(|| GpuError::text("创建像素着色器", "像素着色器为空"))?
             };
 
             let cb = {
@@ -184,8 +299,8 @@ impl Gpu {
                 let mut buffer = None;
                 device
                     .CreateBuffer(&desc, None, Some(&mut buffer as *mut _))
-                    .map_err(|e| format!("创建常量缓冲失败: {e}"))?;
-                buffer.ok_or("常量缓冲为空")?
+                    .map_err(|e| GpuError::from_win("创建常量缓冲", e))?;
+                buffer.ok_or_else(|| GpuError::text("创建常量缓冲", "常量缓冲为空"))?
             };
 
             let sampler = {
@@ -204,8 +319,8 @@ impl Gpu {
                 let mut state = None;
                 device
                     .CreateSamplerState(&desc, Some(&mut state as *mut _))
-                    .map_err(|e| format!("创建采样器失败: {e}"))?;
-                state.ok_or("采样器为空")?
+                    .map_err(|e| GpuError::from_win("创建采样器", e))?;
+                state.ok_or_else(|| GpuError::text("创建采样器", "采样器为空"))?
             };
 
             let blend = {
@@ -227,8 +342,8 @@ impl Gpu {
                 let mut state = None;
                 device
                     .CreateBlendState(&desc, Some(&mut state as *mut _))
-                    .map_err(|e| format!("创建混合状态失败: {e}"))?;
-                state.ok_or("混合状态为空")?
+                    .map_err(|e| GpuError::from_win("创建混合状态", e))?;
+                state.ok_or_else(|| GpuError::text("创建混合状态", "混合状态为空"))?
             };
 
             let raster = {
@@ -247,8 +362,8 @@ impl Gpu {
                 let mut state = None;
                 device
                     .CreateRasterizerState(&desc, Some(&mut state as *mut _))
-                    .map_err(|e| format!("创建光栅化状态失败: {e}"))?;
-                state.ok_or("光栅化状态为空")?
+                    .map_err(|e| GpuError::from_win("创建光栅化状态", e))?;
+                state.ok_or_else(|| GpuError::text("创建光栅化状态", "光栅化状态为空"))?
             };
 
             Ok(Self {
@@ -275,9 +390,12 @@ impl Gpu {
     ///
     /// 调用前先清空管线状态，确保没有残留的 render target 引用；
     /// `ResizeBuffers` 成功后，下一帧 `render_target()` 会拿到新尺寸的后缓冲。
-    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), GpuError> {
         if width == 0 || height == 0 {
-            return Err(format!("无效的交换链尺寸: {width}x{height}"));
+            return Err(GpuError::text(
+                "调整交换链尺寸",
+                format!("无效的交换链尺寸: {width}x{height}"),
+            ));
         }
         if width == self.width && height == self.height {
             return Ok(());
@@ -285,15 +403,16 @@ impl Gpu {
         unsafe {
             self.context.ClearState();
             self.context.Flush();
-            self.swap
-                .ResizeBuffers(
-                    0,
-                    width,
-                    height,
-                    DXGI_FORMAT_UNKNOWN,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
-                .map_err(|e| format!("调整交换链尺寸失败: {e}"))?;
+            let result = self.swap.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            );
+            if let Err(err) = result {
+                return Err(self.error_from("调整交换链尺寸", err));
+            }
         }
         self.width = width;
         self.height = height;
@@ -391,15 +510,38 @@ impl Gpu {
         }
     }
 
-    pub fn present(&self) -> Result<(), String> {
-        unsafe {
-            let result = self.swap.Present(1, Default::default());
-            if result.is_err() {
-                Err(format!("Present 失败: 0x{:08X}", result.0))
-            } else {
-                Ok(())
-            }
+    pub fn present(&self) -> Result<PresentStatus, GpuError> {
+        let result = unsafe { self.swap.Present(1, Default::default()) };
+        if result == DXGI_STATUS_OCCLUDED {
+            // 被其他全屏窗口遮住是成功状态，不是设备故障。
+            return Ok(PresentStatus::Occluded);
         }
+        if result.is_ok() {
+            return Ok(PresentStatus::Presented);
+        }
+        Err(self.error_from(
+            "Present",
+            windows::core::Error::from_hresult(result),
+        ))
+    }
+
+    /// 把尽量多的上下文带进错误：Present 失败后设备原因往往才是根因。
+    fn error_from(&self, context: &'static str, err: windows::core::Error) -> GpuError {
+        let mut error = GpuError::from_win(context, err);
+        if let Some(reason) = self.device_removed_reason() {
+            error.device_lost = true;
+            error.message = format!(
+                "{}；GetDeviceRemovedReason=0x{reason:08X}",
+                error.message
+            );
+        }
+        error
+    }
+
+    fn device_removed_reason(&self) -> Option<i32> {
+        unsafe { self.device.GetDeviceRemovedReason() }
+            .err()
+            .map(|err| err.code().0)
     }
 
     fn render_target(&self) -> Option<ID3D11RenderTargetView> {
@@ -414,7 +556,7 @@ impl Gpu {
     }
 }
 
-fn compile(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> {
+fn compile(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, GpuError> {
     unsafe {
         let mut code = None;
         let mut errors = None;
@@ -439,10 +581,15 @@ fn compile(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> 
         if let Err(err) = result {
             let message = errors
                 .map(|b| blob_string(&b))
-                .unwrap_or_else(|| err.to_string());
-            return Err(format!("着色器编译失败: {message}"));
+                .unwrap_or_else(|| err.message());
+            return Err(GpuError {
+                context: "编译着色器",
+                hresult: err.code().0,
+                device_lost: false,
+                message,
+            });
         }
-        code.ok_or_else(|| "着色器编译结果为空".to_string())
+        code.ok_or_else(|| GpuError::text("编译着色器", "着色器编译结果为空"))
     }
 }
 
@@ -504,3 +651,51 @@ const _: u32 = D3D11_BIND_RENDER_TARGET.0 as u32;
 const _: u32 = DXGI_FORMAT_UNKNOWN.0 as u32;
 #[allow(dead_code)]
 const _: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_loss_codes_are_classified() {
+        assert!(is_device_loss(DXGI_ERROR_DEVICE_REMOVED.0));
+        assert!(is_device_loss(DXGI_ERROR_DEVICE_HUNG.0));
+        assert!(is_device_loss(DXGI_ERROR_DEVICE_RESET.0));
+        assert!(is_device_loss(DXGI_ERROR_DRIVER_INTERNAL_ERROR.0));
+        assert!(!is_device_loss(0x8007_0057u32 as i32)); // E_INVALIDARG
+        assert!(!is_device_loss(DXGI_STATUS_OCCLUDED.0));
+    }
+
+    #[test]
+    fn shader_cache_reuses_success_and_retries_failures() {
+        let slot = Mutex::new(None);
+        let mut calls = 0;
+        let first = cache_or_build(&slot, || {
+            calls += 1;
+            Ok::<u32, String>(7)
+        })
+        .unwrap();
+        let second = cache_or_build(&slot, || {
+            calls += 1;
+            Ok::<u32, String>(9)
+        })
+        .unwrap();
+        assert_eq!((first, second), (7, 7));
+        assert_eq!(calls, 1, "成功后应复用缓存的字节码");
+
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let mut calls = 0;
+        let failed = cache_or_build(&slot, || {
+            calls += 1;
+            Err::<u32, String>("boom".to_string())
+        });
+        assert!(failed.is_err());
+        let recovered = cache_or_build(&slot, || {
+            calls += 1;
+            Ok::<u32, String>(5)
+        })
+        .unwrap();
+        assert_eq!(recovered, 5);
+        assert_eq!(calls, 2, "编译失败不能被永久缓存");
+    }
+}
