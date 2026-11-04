@@ -444,6 +444,45 @@ impl PauseState {
     }
 }
 
+/// 尺寸事件只记录最新目标；稳定时间到后由事件循环统一应用。
+///
+/// 把“记录”和“应用”拆开，系统暂停或常驻隐藏时就不会因为尺寸通知去动
+/// 交换链、GPU 或预取线程；暂停期间连续 resize 也只保留最后一个值。
+#[derive(Default)]
+struct SizeSchedule {
+    pending: Option<(Instant, (u32, u32))>,
+}
+
+impl SizeSchedule {
+    fn record(&mut self, size: (u32, u32), now: Instant, settle: Duration) -> Instant {
+        let size = (size.0.max(1), size.1.max(1));
+        let due = now + settle;
+        self.pending = Some((due, size));
+        due
+    }
+
+    fn due(&self) -> Option<Instant> {
+        self.pending.map(|(due, _)| due)
+    }
+
+    fn pending_size(&self) -> Option<(u32, u32)> {
+        self.pending.map(|(_, size)| size)
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Option<(u32, u32)> {
+        let (due, size) = self.pending?;
+        if now < due {
+            return None;
+        }
+        self.pending = None;
+        Some(size)
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+}
+
 /// GPU 故障日志最多每 30 秒汇总一次。
 const GPU_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -560,8 +599,8 @@ pub struct App {
     next_frame_at: Instant,
     grace_until: Instant,
     pointer_start: (f64, f64),
-    /// 窗口连续变化时先等它稳定，再重建交换链和预取线程。
-    pending_resize: Option<(Instant, (u32, u32))>,
+    /// 窗口连续变化时只记录目标，等稳定后再统一重建交换链和预取线程。
+    sizes: SizeSchedule,
     frames: u64,
     last_report: Instant,
     tick_us: f64,
@@ -624,7 +663,7 @@ impl App {
             next_frame_at: now,
             grace_until: now + Duration::from_millis(1500),
             pointer_start: (0.0, 0.0),
-            pending_resize: None,
+            sizes: SizeSchedule::default(),
             frames: 0,
             last_report: now,
             tick_us: 0.0,
@@ -787,9 +826,10 @@ impl App {
 
         // 触发时才读主屏尺寸：如果和常驻启动时不同，交换链、合成尺寸、
         // 预取线程都要一起换掉，不能只更新 self.size 就继续用旧画面。
-        self.pending_resize = None;
+        // 这是可见状态的显式入口，直接落到统一下发阶段。
+        self.sizes.clear();
         if let Some(size) = monitor_size {
-            self.update_size(size, now, true);
+            self.apply_size(size, now);
         }
 
         if !self.ensure_gpu() {
@@ -835,7 +875,9 @@ impl App {
         self.phase = Phase::Idle;
         self.progress = 0.0;
         self.next_frame_at = now;
-        self.pending_resize = None;
+        // 常驻模式收起后窗口尺寸不再有意义；下次显示会按当前显示器重新计算，
+        // 所以这里直接丢弃待应用尺寸，避免隐藏期间按旧尺寸做资源工作。
+        self.sizes.clear();
     }
 
     /// 窗口收到输入。常驻模式收起，普通模式直接退出。
@@ -937,27 +979,64 @@ impl App {
         });
     }
 
-    /// 更新目标尺寸：能立即重建就立即重建；窗口连续拖动时先记下来，等稳定后再重建。
-    fn update_size(&mut self, size: (u32, u32), now: Instant, immediate: bool) {
-        let size = (size.0.max(1), size.1.max(1));
-        if size == self.size {
-            if immediate && self.rx.is_none() {
-                self.start_worker();
-                self.next_frame_at = now;
+    /// 记录最新目标尺寸；实际资源调整统一放在 `apply_pending_resize`。
+    fn update_size(&mut self, size: (u32, u32), now: Instant) {
+        let due = self.sizes.record(size, now, RESIZE_SETTLE);
+        if std::env::var_os("PPS_DEBUG").is_some() {
+            let target = self.sizes.pending_size().unwrap_or(size);
+            log_info!(
+                "尺寸待应用: {}x{} -> {}x{}（稳定期限 {} ms）",
+                self.size.0,
+                self.size.1,
+                target.0,
+                target.1,
+                RESIZE_SETTLE.as_millis()
+            );
+        }
+        if self.next_frame_at > due {
+            self.next_frame_at = due;
+        }
+    }
+
+    /// 到达稳定时间后统一应用尺寸。系统暂停或常驻隐藏时不执行资源工作。
+    fn apply_pending_resize(&mut self, now: Instant) {
+        if self.pause.system_paused() || !self.active() {
+            return;
+        }
+        let Some(target) = self.sizes.take_ready(now) else {
+            if let Some(due) = self.sizes.due() {
+                if self.next_frame_at > due {
+                    self.next_frame_at = due;
+                }
             }
+            return;
+        };
+        self.apply_size(target, now);
+    }
+
+    /// 把目标尺寸落到交换链、合成缓冲和预取线程。调用方负责暂停/可见性检查。
+    fn apply_size(&mut self, target: (u32, u32), now: Instant) {
+        if self.pause.system_paused() {
+            return;
+        }
+        let target = (target.0.max(1), target.1.max(1));
+        if target == self.size {
+            // 同尺寸也可能只是暂停后恢复，需要把预取线程补回来。
+            self.ensure_worker();
+            self.next_frame_at = now;
             return;
         }
 
         if std::env::var_os("PPS_DEBUG").is_some() {
             log_info!(
-                "尺寸更新: {}x{} -> {}x{}（immediate={immediate}）",
+                "应用尺寸: {}x{} -> {}x{}",
                 self.size.0,
                 self.size.1,
-                size.0,
-                size.1
+                target.0,
+                target.1
             );
         }
-        self.size = size;
+        self.size = target;
 
         // 旧纹理是按旧尺寸合成的，留着只会被拉伸；丢掉，等新尺寸的预取画面。
         self.current = None;
@@ -967,53 +1046,40 @@ impl App {
 
         let mut resize_error = None;
         if let Some(gpu) = &mut self.gpu {
-            if gpu.size() != size {
-                if let Err(err) = gpu.resize(size.0, size.1) {
+            if gpu.size() != target {
+                if let Err(err) = gpu.resize(target.0, target.1) {
                     resize_error = Some(err);
                 }
             }
         }
         if let Some(err) = resize_error {
-            // resize 失败同样走统一退避；不在事件处理里同步重建，交给 about_to_wait。
+            // resize 失败同样走统一退避；不在事件处理里同步重建。
             self.gpu = None;
             self.current = None;
             self.phase = Phase::Idle;
             self.note_gpu_failure(now, &err);
         }
 
-        // 预取队列里是旧尺寸的画面，立即作废；同时取消旧线程，别让它继续重试。
+        // 预取队列里是旧尺寸的画面，立即作废；只保留一套新的预取线程。
         self.stop_worker();
-
-        if immediate {
-            self.pending_resize = None;
-            self.start_worker();
-            self.next_frame_at = now;
-        } else {
-            self.pending_resize = Some((now, size));
-            let due = now + RESIZE_SETTLE;
-            if self.next_frame_at > due {
-                self.next_frame_at = due;
-            }
-        }
+        self.ensure_worker();
+        self.next_frame_at = now;
     }
 
-    /// 窗口拖拽/全屏切换会连续触发 Resized；等 250ms 没有新尺寸再真正重建预取。
-    fn apply_pending_resize(&mut self, now: Instant) {
-        let Some((at, size)) = self.pending_resize else {
-            return;
-        };
-        let due = at + RESIZE_SETTLE;
-        if now < due {
-            if self.next_frame_at > due {
-                self.next_frame_at = due;
-            }
+    /// 在暂停/隐藏检查通过后启动预取线程；重复调用不会叠加线程。
+    fn ensure_worker(&mut self) {
+        if self.pause.system_paused() || self.window.is_none() || self.rx.is_some() {
             return;
         }
-        self.pending_resize = None;
-        if self.size == size {
-            self.start_worker();
-            self.next_frame_at = now;
+        if self
+            .sizes
+            .pending_size()
+            .is_some_and(|size| size != self.size)
+        {
+            // 尺寸还没下发，先别按旧尺寸启动预取；等 apply_pending_resize 完成后启动。
+            return;
         }
+        self.start_worker();
     }
 
     fn direction(&self) -> (f32, f32) {
@@ -1263,9 +1329,6 @@ impl App {
         self.transient_log.reset();
         self.current = None;
         self.phase = Phase::Idle;
-        if self.window.is_some() && !self.pause.system_paused() && self.rx.is_none() {
-            self.start_worker();
-        }
         if let Some(watch) = &mut self.watch {
             watch.idle.reset(now);
             watch.next_poll = now;
@@ -1400,9 +1463,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.ensure_gpu();
         }
 
-        if self.rx.is_none() {
-            self.start_worker();
-        }
+        self.ensure_worker();
         let now = Instant::now();
         self.grace_until = now + Duration::from_millis(1500);
         self.next_frame_at = now;
@@ -1422,7 +1483,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if size.width == 0 || size.height == 0 {
                     return;
                 }
-                self.update_size((size.width, size.height), Instant::now(), false);
+                self.update_size((size.width, size.height), Instant::now());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
@@ -1458,9 +1519,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
 
-        // 窗口尺寸稳定后再重建交换链/预取线程。
-        self.apply_pending_resize(now);
         self.pause.clear_expired(now);
+        // 只有非暂停且可见时才把待应用尺寸落到资源；暂停期间保留最新目标。
+        self.apply_pending_resize(now);
         self.check_dnd(now);
         // 隐藏等待时也预读一张，空闲到点就能判断有没有内容可显示。
         self.poll_pending();
@@ -1539,11 +1600,16 @@ impl ApplicationHandler<UserEvent> for App {
             self.hide_screensaver(now);
         }
         self.sync_status(now);
-        if let Some(w) = &self.watch {
-            if !w.showing {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(w.next_poll));
-                return;
-            }
+        if let Some(next_poll) = self
+            .watch
+            .as_ref()
+            .filter(|w| !w.showing)
+            .map(|w| w.next_poll)
+        {
+            // 常驻隐藏时仍保留预取，空闲到点才有内容可显示；暂停时不启动。
+            self.ensure_worker();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_poll));
+            return;
         }
 
         // 锁屏/休眠/显示器关闭时，普通全屏模式也不要在后台继续 Present。
@@ -1551,6 +1617,9 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_secs(1)));
             return;
         }
+
+        // 恢复后只启动一套预取；尺寸变化走上面的统一下发。
+        self.ensure_worker();
 
         if self.window.is_some() && self.active() && self.gpu.is_none() && self.ensure_gpu() {
             self.next_frame_at = now;
@@ -1662,5 +1731,58 @@ mod tests {
 
         assert_eq!(attempts, vec![0, 1, 3, 7, 15, 31, 63]);
         assert!(logs <= 5, "2 分钟内日志应受限，实际写了 {logs} 条");
+    }
+
+    #[test]
+    fn size_schedule_keeps_latest_target_after_settle() {
+        let start = Instant::now();
+        let settle = Duration::from_millis(250);
+        let mut sizes = SizeSchedule::default();
+
+        sizes.record((800, 600), start, settle);
+        sizes.record((1024, 768), start + Duration::from_millis(100), settle);
+
+        assert_eq!(sizes.pending_size(), Some((1024, 768)));
+        assert_eq!(
+            sizes.take_ready(start + Duration::from_millis(300)),
+            None,
+            "新的尺寸事件会重新计算稳定时间"
+        );
+        assert_eq!(
+            sizes.take_ready(start + Duration::from_millis(350)),
+            Some((1024, 768)),
+            "稳定后只应用最后一个尺寸"
+        );
+        assert_eq!(sizes.pending_size(), None);
+        assert_eq!(sizes.take_ready(start + Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn size_schedule_normalizes_zero_sizes() {
+        let now = Instant::now();
+        let mut sizes = SizeSchedule::default();
+        sizes.record((0, 0), now, Duration::ZERO);
+        assert_eq!(sizes.take_ready(now), Some((1, 1)));
+    }
+
+    #[test]
+    fn system_pause_requires_all_reasons_cleared() {
+        let now = Instant::now();
+        let mut pause = PauseState::default();
+        assert!(!pause.system_paused());
+
+        pause.locked = true;
+        pause.display_off = true;
+        assert!(pause.system_paused());
+        pause.locked = false;
+        assert!(pause.system_paused(), "只解除一个原因不能提前恢复");
+        pause.display_off = false;
+        assert!(!pause.system_paused());
+
+        // 手动暂停和免打扰不属于“系统暂停”，不阻止尺寸资源工作。
+        pause.manual_until = Some(now + Duration::from_secs(60));
+        pause.dnd = true;
+        assert!(pause.is_paused(now));
+        assert!(!pause.system_paused());
     }
 }
