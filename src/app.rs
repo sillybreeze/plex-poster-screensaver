@@ -669,6 +669,22 @@ fn can_apply_size(system_paused: bool, active: bool, minimized: bool) -> bool {
     active && resources_allowed(system_paused, minimized)
 }
 
+/// 暂停时先决定等待方式，避免最小化窗口继续使用过期的 GPU 重试/帧截止时间。
+fn render_pause_control_flow(
+    system_paused: bool,
+    minimized: bool,
+    now: Instant,
+) -> Option<ControlFlow> {
+    if system_paused {
+        Some(ControlFlow::WaitUntil(now + Duration::from_secs(1)))
+    } else if minimized {
+        // 恢复窗口、退出、输入和系统通知仍会唤醒事件循环。
+        Some(ControlFlow::Wait)
+    } else {
+        None
+    }
+}
+
 /// GPU 故障日志最多每 30 秒汇总一次。
 const GPU_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -1822,9 +1838,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        // 锁屏/休眠/显示器关闭时，普通全屏模式也不要在后台继续 Present。
-        if self.pause.system_paused() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_secs(1)));
+        // 系统暂停或最小化时跳过渲染与恢复调度；最小化只等窗口/系统事件，
+        // 不复用可能已经过期的 GPU 重试时间，也不清除已有退避状态。
+        if let Some(flow) =
+            render_pause_control_flow(self.pause.system_paused(), self.minimized, now)
+        {
+            event_loop.set_control_flow(flow);
             return;
         }
 
@@ -2101,5 +2120,47 @@ mod tests {
         assert!(!resources_allowed(true, false), "系统暂停必须阻止资源");
         assert!(!resources_allowed(false, true), "最小化必须阻止资源");
         assert!(!can_apply_size(false, true, true));
+    }
+
+    #[test]
+    fn minimized_waits_for_events_after_gpu_retry_expires() {
+        let start = Instant::now();
+        let mut recovery = GpuRecovery::default();
+        recovery.record_failure(start);
+        let now = start + Duration::from_secs(2);
+        assert!(recovery.retry_at().unwrap() < now);
+
+        // 即使重试期限已经过去，多次调度仍只等事件，不进入 WaitUntil(过去时间)。
+        for seconds in [0, 1, 60, 120] {
+            assert_eq!(
+                render_pause_control_flow(false, true, now + Duration::from_secs(seconds)),
+                Some(ControlFlow::Wait)
+            );
+        }
+
+        // 非零尺寸恢复后放行正常调度，原来的故障次数与到期重试仍然有效。
+        assert_eq!(render_pause_control_flow(false, false, now), None);
+        assert!(recovery.can_attempt(now));
+        assert_eq!(recovery.failures, 1);
+    }
+
+    #[test]
+    fn minimizing_preserves_pending_gpu_backoff_and_system_pause_polling() {
+        let now = Instant::now();
+        let mut recovery = GpuRecovery::default();
+        recovery.record_failure(now);
+        let retry_at = recovery.retry_at();
+
+        assert_eq!(
+            render_pause_control_flow(false, true, now),
+            Some(ControlFlow::Wait)
+        );
+        assert_eq!(render_pause_control_flow(false, false, now), None);
+        assert_eq!(recovery.retry_at(), retry_at);
+        assert!(!recovery.can_attempt(now));
+        assert_eq!(
+            render_pause_control_flow(true, true, now),
+            Some(ControlFlow::WaitUntil(now + Duration::from_secs(1)))
+        );
     }
 }
