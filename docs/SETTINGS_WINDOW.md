@@ -17,7 +17,22 @@
 | 动效模式 | 动画 / 静止 | `motion_mode` |
 | 缓慢推近 | Ken Burns 开关 | `ken_burns` |
 
-布局为海报墙或动效为静止时，Ken Burns 复选框禁用但保留当前值。窗口按系统 DPI 缩放；`恢复默认` 只重置这六项，`保存`/`取消` 在底部。
+布局为海报墙或动效为静止时，Ken Burns 复选框禁用但保留当前值。窗口按系统 DPI 缩放；`恢复默认` 只重置这六项，`保存`/`取消` 在底部。底部另有 **查看日志**，把右侧区域切换成只读日志视图；此时按钮变成 **返回预览**。
+
+## 日志查看
+
+- 读取 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log` 最近 300 行，显示在右侧只读多行编辑框中；只读、可滚动。
+- 打开期间每秒检查一次文件长度，有新内容才重新加载并滚到末尾；切回预览后预览定时器恢复。
+- 不读取 5MB 轮换后的 `app.1.log`，只显示当前文件；完整历史可继续用托盘菜单“打开日志目录”。
+- 日志不可读时，视图里显示具体错误和文件路径。
+
+## 控制台
+
+- 正常启动（双击/开机自启/计划任务）时，用 `GetConsoleProcessList` 判断控制台是否独占；独占则 `FreeConsole` 释放，避免留下黑色终端窗口。
+- 从 `cmd`/PowerShell 启动时控制台与 shell 共用，不做处理，保留命令行输出；`--help`、`--list`、`--self-test`、`--snapshot`、`--diagnose-foreground` 仍按原样输出。
+- 控制台不可见或没有控制台时，启动阶段的致命错误（配置解析、缺 Token、缓存目录等）在写日志之外再弹 MessageBox。
+- 正常模式的提示信息改用日志宏输出，避免释放控制台后写 stdout 触发 panic。
+- 只释放控制台，不改变 PE 子系统，因此从终端运行工具命令仍能拿到 stdout。
 
 ## 预览
 
@@ -46,13 +61,15 @@
 
 ## 验证
 
-- `cargo test --release --offline`：100 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
+- `cargo test --release --offline`：101 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
 - 通过隐藏托盘窗口投递 `WM_COMMAND` 打开窗口，验证：
   - 海报墙 + 左侧滑入 + 0.8 秒 + 8 秒 + 静止 + 关闭 Ken Burns 保存后字段正确；
   - `custom_advanced` 等高级字段保留，`fade_seconds` 被移除；
   - `恢复默认` 写回 `single/fade/0.6/10/animated/true`；
   - 保存和取消都能关闭窗口；
-  - 预览能显示 6 张海报墙，并在停留结束后播放左侧滑入。
+  - 预览能显示 6 张海报墙，并在停留结束后播放左侧滑入；
+  - 点击“查看日志”能显示 `app.log` 最近内容，再点“返回预览”恢复预览。
+- 用独立控制台启动时日志记录 `控制台状态: Hidden`，确认 `FreeConsole` 路径生效；`--help` 仍能正常输出到终端。
 
 ## 限制
 

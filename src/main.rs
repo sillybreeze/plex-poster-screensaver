@@ -31,6 +31,54 @@ mod timer {
     pub fn begin() {}
     pub fn end() {}
 }
+#[cfg(windows)]
+mod console {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConsoleState {
+        /// 进程没有控制台（例如计划任务/资源管理器启动）。
+        None,
+        /// 与 shell 共用控制台；不能动，否则会把用户终端一起关掉。
+        Shared,
+        /// 双击等场景单独分配的控制台，已经释放。
+        Hidden,
+    }
+
+    /// 只释放进程独占的控制台。判断依据是同一控制台里是否还有别的进程：
+    /// 从 cmd/PowerShell 启动时 shell 也在列表里，此时保留控制台和命令行输出。
+    pub fn hide_if_private() -> ConsoleState {
+        unsafe {
+            let mut pids = [0u32; 16];
+            let count = GetConsoleProcessList(&mut pids);
+            if count == 0 {
+                return ConsoleState::None;
+            }
+            if count == 1 {
+                return match FreeConsole() {
+                    Ok(()) => ConsoleState::Hidden,
+                    Err(_) => ConsoleState::Shared,
+                };
+            }
+            ConsoleState::Shared
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod console {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConsoleState {
+        None,
+        Shared,
+        Hidden,
+    }
+
+    pub fn hide_if_private() -> ConsoleState {
+        ConsoleState::None
+    }
+}
+
 mod idle;
 mod layout;
 mod logging;
@@ -45,8 +93,37 @@ use std::path::Path;
 use std::time::Instant;
 
 use config::{CacheLocation, Config};
-use logging::{log_error, log_warn};
+use logging::{log_error, log_info, log_warn};
 use plex::{Cache, Client, Section};
+
+/// 记录致命错误；控制台不可见时补一个 MessageBox。
+fn fatal_error(message: &str, code: i32, popup: bool) -> ! {
+    log_error!("{message}");
+    if popup {
+        show_error(message);
+    }
+    std::process::exit(code);
+}
+
+fn show_error(message: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = "Plex 海报屏保"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = MessageBoxW(
+            HWND::default(),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
 
 fn main() {
     logging::init();
@@ -72,6 +149,18 @@ fn main() {
     // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
     // 只有真正要开窗口的模式才检查是否已有实例在跑。
     let utility = args.list || args.self_test.is_some() || args.snapshot.is_some();
+    // 双击/计划任务启动时 Windows 会给一个独立控制台；把它释放掉，避免平时
+    // 常驻时挂着一个黑色终端。从 cmd/PowerShell 启动时控制台是共用的，保留输出。
+    let console_state = if utility {
+        console::ConsoleState::Shared
+    } else {
+        console::hide_if_private()
+    };
+    // 控制台不可见时，致命错误改用 MessageBox，避免程序一闪而过没有任何提示。
+    let popup_errors = !matches!(console_state, console::ConsoleState::Shared);
+    if std::env::var_os("PPS_DEBUG").is_some() {
+        log_info!("控制台状态: {console_state:?}");
+    }
     let instance = if utility {
         None
     } else {
@@ -82,15 +171,14 @@ fn main() {
             }
             Ok(trigger::Startup::Duplicate { notified }) => {
                 if notified {
-                    println!("已经有一个实例在跑，已通知它立刻开始");
+                    log_info!("已经有一个实例在跑，已通知它立刻开始");
                 } else {
-                    println!("已经有一个实例在跑，但启动通知发送失败");
+                    log_info!("已经有一个实例在跑，但启动通知发送失败");
                 }
                 return;
             }
             Err(err) => {
-                log_error!("单实例初始化失败: {err}");
-                std::process::exit(1);
+                fatal_error(&format!("单实例初始化失败: {err}"), 1, popup_errors);
             }
         }
     };
@@ -99,15 +187,15 @@ fn main() {
     let mut cfg = match config::load(&args) {
         Ok(cfg) => cfg,
         Err(err) => {
-            log_error!("配置错误: {err}");
-            std::process::exit(2);
+            fatal_error(&format!("配置错误: {err}"), 2, popup_errors);
         }
     };
     if cfg.token.is_empty() {
-        log_error!(
-            "缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。"
+        fatal_error(
+            "缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。",
+            1,
+            popup_errors,
         );
-        std::process::exit(1);
     }
 
     let wanted = if !args.library.is_empty() {
@@ -130,8 +218,7 @@ fn main() {
         match select_sections(&sections, &wanted) {
             Ok(v) => v,
             Err(err) => {
-                log_error!("{err}");
-                std::process::exit(1);
+                fatal_error(&err, 1, popup_errors);
             }
         }
     };
@@ -157,8 +244,7 @@ fn main() {
         CacheLocation::Explicit(dir) => match Cache::open(dir, cfg.cache_days, cfg.cache_naming) {
             Ok(cache) => cache,
             Err(err) => {
-                log_error!("{err}");
-                std::process::exit(2);
+                fatal_error(&err, 2, popup_errors);
             }
         },
         CacheLocation::Default | CacheLocation::Auto => {
@@ -182,11 +268,14 @@ fn main() {
             if waiting {
                 log_warn!("Plex 暂不可用，本地也没有可离线播放的缓存；常驻等待，后台会自动重连");
             } else {
-                log_error!(
-                    "无法连接 Plex，本地也没有可离线播放的缓存: {}",
-                    cache.dir.display()
+                fatal_error(
+                    &format!(
+                        "无法连接 Plex，本地也没有可离线播放的缓存: {}",
+                        cache.dir.display()
+                    ),
+                    1,
+                    popup_errors,
                 );
-                std::process::exit(1);
             }
         } else {
             log_warn!(
@@ -214,7 +303,7 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    println!(
+    log_info!(
         "媒体库: {} | 缓存: {}",
         libraries,
         if cache.is_disk() {
@@ -241,8 +330,7 @@ fn main() {
     let result = app.run(trigger_event);
     timer::end();
     if let Err(err) = result {
-        log_error!("{err}");
-        std::process::exit(1);
+        fatal_error(&err, 1, popup_errors);
     }
 }
 

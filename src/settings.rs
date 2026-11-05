@@ -6,8 +6,9 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 use image::RgbImage;
@@ -31,11 +32,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowTextW, IsIconic, IsWindow, KillTimer, LoadCursorW, MessageBoxW,
     RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow,
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN,
-    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, HICON, HMENU, IDC_ARROW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SETFONT, WM_TIMER,
-    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_READONLY, HICON, HMENU, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, SM_CXSCREEN,
+    SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{
@@ -55,14 +57,20 @@ const ID_DISPLAY_SECONDS: i32 = 1004;
 const ID_MOTION: i32 = 1005;
 const ID_KEN_BURNS: i32 = 1006;
 const ID_PREVIEW: i32 = 1010;
+const ID_LOG_VIEW: i32 = 1012;
 const ID_DEFAULTS: i32 = 1100;
 const ID_CANCEL: i32 = 1101;
 const ID_SAVE: i32 = 1102;
+const ID_LOG_BUTTON: i32 = 1103;
 
 const PREVIEW_TIMER: usize = 11;
 const PREVIEW_INTERVAL_MS: u32 = 33;
 const BST_CHECKED_VALUE: usize = 1;
 const PREVIEW_MAX_HOLD: f64 = 4.0;
+const LOG_TAIL_LINES: usize = 300;
+const LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const EM_SETSEL: u32 = 0x00B1;
+const EM_SCROLLCARET: u32 = 0x00B7;
 
 const LAYOUT_LABELS: [&str; 2] = ["单张海报", "6 张海报墙（3×2）"];
 const TRANSITION_LABELS: [&str; 6] = [
@@ -96,10 +104,16 @@ struct PreviewState {
 struct SettingsState {
     hwnd: HWND,
     preview_hwnd: HWND,
+    log_view: HWND,
+    log_button: HWND,
+    hint: HWND,
     path: Option<PathBuf>,
     font: HFONT,
     font_owned: bool,
     load_error: Option<String>,
+    log_mode: bool,
+    last_log_refresh: Instant,
+    last_log_len: u64,
     preview: PreviewState,
 }
 
@@ -440,6 +454,32 @@ fn create_controls(
         font,
     )?;
 
+    // 日志视图和预览共用右侧区域；默认隐藏，点“查看日志”时切换。
+    let log_height = preview_h + s(46);
+    let log_view = unsafe {
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD
+                | WS_VSCROLL
+                | WS_TABSTOP
+                | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                    (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32,
+                ),
+            preview_x,
+            preview_y,
+            preview_w,
+            log_height,
+            hwnd,
+            HMENU(ID_LOG_VIEW as usize as *mut c_void),
+            instance,
+            None,
+        )
+    }
+    .map_err(|err| format!("创建日志视图失败: {err}"))?;
+    set_font(log_view, font);
+
     let button_y = s(344);
     let button_h = s(30);
     let button_w = s(90);
@@ -453,6 +493,17 @@ fn create_controls(
         s(120),
         button_h,
         ID_DEFAULTS,
+        instance,
+        font,
+    )?;
+    let log_button = create_button(
+        hwnd,
+        "查看日志",
+        form_x + s(128),
+        button_y,
+        s(100),
+        button_h,
+        ID_LOG_BUTTON,
         instance,
         font,
     )?;
@@ -506,10 +557,16 @@ fn create_controls(
     Ok(SettingsState {
         hwnd,
         preview_hwnd: preview,
+        log_view,
+        log_button,
+        hint,
         path,
         font,
         font_owned,
         load_error,
+        log_mode: false,
+        last_log_refresh: Instant::now(),
+        last_log_len: 0,
         preview: preview_state,
     })
 }
@@ -907,10 +964,75 @@ impl SettingsState {
         self.invalidate_preview();
     }
 
+    fn toggle_log(&mut self) {
+        self.log_mode = !self.log_mode;
+        if self.log_mode {
+            self.refresh_log(true);
+            self.last_log_refresh = Instant::now();
+            unsafe {
+                let _ = ShowWindow(self.preview_hwnd, SW_HIDE);
+                let _ = ShowWindow(self.hint, SW_HIDE);
+                let _ = ShowWindow(self.log_view, SW_SHOW);
+            }
+            set_window_text(self.log_button, "返回预览");
+        } else {
+            unsafe {
+                let _ = ShowWindow(self.log_view, SW_HIDE);
+                let _ = ShowWindow(self.preview_hwnd, SW_SHOW);
+                let _ = ShowWindow(self.hint, SW_SHOW);
+            }
+            set_window_text(self.log_button, "查看日志");
+            self.invalidate_preview();
+        }
+    }
+
+    fn refresh_log(&mut self, force: bool) {
+        let path = crate::logging::log_dir().join("app.log");
+        let file_len = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if !force && file_len == self.last_log_len {
+            return;
+        }
+        self.last_log_len = file_len;
+        let text = read_log_file(&path, LOG_TAIL_LINES);
+        set_window_text(self.log_view, &text);
+        let len = text.encode_utf16().count();
+        unsafe {
+            SendMessageW(self.log_view, EM_SETSEL, WPARAM(len), LPARAM(len as isize));
+            SendMessageW(self.log_view, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+        }
+    }
+
     fn invalidate_preview(&self) {
         unsafe {
             let _ = InvalidateRect(self.preview_hwnd, None, FALSE);
         }
+    }
+}
+
+fn read_log_file(path: &std::path::Path, limit: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(limit);
+            let mut out = format!("日志文件: {}\r\n", path.display());
+            out.push_str(&format!(
+                "最近 {} 行；打开期间每秒刷新。\r\n\r\n",
+                lines.len() - start
+            ));
+            if lines.is_empty() {
+                out.push_str("（日志为空）\r\n");
+            } else {
+                for line in &lines[start..] {
+                    out.push_str(line);
+                    out.push_str("\r\n");
+                }
+            }
+            out
+        }
+        Err(err) => format!(
+            "日志文件: {}\r\n\r\n无法读取日志: {err}\r\n",
+            path.display()
+        ),
     }
 }
 
@@ -990,6 +1112,9 @@ unsafe extern "system" fn settings_proc(
                 ID_DEFAULTS if code == 0 => {
                     with_state_mut(|state| state.reset_defaults());
                 }
+                ID_LOG_BUTTON if code == 0 => {
+                    with_state_mut(|state| state.toggle_log());
+                }
                 ID_CANCEL if code == 0 => {
                     let _ = unsafe { DestroyWindow(hwnd) };
                 }
@@ -1012,10 +1137,18 @@ unsafe extern "system" fn settings_proc(
         WM_TIMER => {
             if wparam.0 == PREVIEW_TIMER {
                 let preview = with_state_mut(|state| {
-                    state.preview.update_frame(Instant::now());
-                    state.preview_hwnd
+                    if state.log_mode {
+                        if state.last_log_refresh.elapsed() >= LOG_REFRESH_INTERVAL {
+                            state.last_log_refresh = Instant::now();
+                            state.refresh_log(false);
+                        }
+                        None
+                    } else {
+                        state.preview.update_frame(Instant::now());
+                        Some(state.preview_hwnd)
+                    }
                 });
-                if let Some(preview) = preview {
+                if let Some(preview) = preview.flatten() {
                     unsafe {
                         let _ = InvalidateRect(preview, None, FALSE);
                     }
@@ -1495,5 +1628,33 @@ mod tests {
         assert_eq!(parse_seconds("0.6"), Some(0.6));
         assert_eq!(parse_seconds(" 2,5 秒"), Some(2.5));
         assert_eq!(parse_seconds("abc"), None);
+    }
+
+    #[test]
+    fn log_tail_keeps_only_last_lines() {
+        // 不用 %TEMP%：受限环境可能拒绝写入；放在 target 下。
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("settings-log-tests")
+            .join(format!("{}-{stamp}", std::process::id()));
+        let path = dir.join("app.log");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let text = read_log_file(&path, 2);
+        assert!(text.contains("three"));
+        assert!(text.contains("four"));
+        assert!(!text.contains("one"));
+        assert!(text.contains("最近 2 行"));
+
+        let missing = read_log_file(&dir.join("missing.log"), 2);
+        assert!(missing.contains("无法读取日志"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

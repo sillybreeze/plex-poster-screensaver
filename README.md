@@ -142,7 +142,15 @@ Copy-Item config.example.json config.json
 
 右侧预览会按当前组合循环播放（加速演示；缓存不足时用占位色块）。**恢复默认**只重置这些常用项；**保存**只写入 `config.json` 的常用字段，`plex_token`、缓存、热键等高级项原样保留，旧的 `fade_seconds` 会迁移成 `transition_seconds`。
 
+底部 **查看日志** 会把右侧区域切换成只读日志视图，显示 `app.log` 最近 300 行并每秒刷新；再点 **返回预览** 回到动效预览。日志超过 5MB 时轮换成 `app.1.log`，只保留两份。
+
 设置**下次启动屏保时生效**；命令行参数仍然在启动时覆盖配置文件中的对应项。配置文件不存在时，会在 exe 目录或 `%LOCALAPPDATA%\PlexPosterScreensaver\` 下新建；两处都不可写时保存按钮会禁用。
+
+### 控制台与日志
+
+双击、开机自启或计划任务启动时，如果控制台是本进程独占的，程序会主动释放它，不再一直挂着一个黑色终端窗口。从 `cmd` / PowerShell 启动时会保留共用的控制台，`--help`、`--list`、`--self-test`、`--snapshot` 等命令的输出仍然可见。
+
+日志始终写到 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`（超过 5MB 轮换），托盘菜单的“打开日志目录”和设置窗口的“查看日志”都可以查看。控制台不可见时，致命配置/启动错误会额外弹一个 MessageBox，避免程序一闪而过没有任何提示。
 
 实现与验收记录见 [docs/SETTINGS_WINDOW.md](docs/SETTINGS_WINDOW.md)。
 
