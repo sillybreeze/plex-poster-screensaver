@@ -79,6 +79,8 @@
 - `src/settings/pages.rs`：六个页面的原生控件布局和尺寸。
 - `src/settings_apply.rs`：配置保存、自启同步、重启请求的顺序与失败语义；带可注入的保存失败/自启失败/重启测试。
 - `src/settings_preview.rs`：CPU 预览合成，移到独立模块。
+- `src/plex.rs`：Plex HTTP 客户端与媒体模型。
+- `src/cache.rs`：封面磁盘缓存、索引和清理。
 - `src/autostart.rs`：启动文件夹 VBS 的读写。
 - `src/platform.rs`：托盘菜单（含“重启程序”）、跨进程重启消息、设置路径/缓存/覆盖信息传递。
 - `src/app.rs` / `src/main.rs`：覆盖信息传递、`RunOutcome` 重启、无参数设置入口、GUI 子系统与父控制台附着、后台进程标准句柄置空。

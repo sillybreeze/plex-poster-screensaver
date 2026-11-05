@@ -9,6 +9,7 @@
 
 mod app;
 mod autostart;
+mod cache;
 mod cli;
 mod config;
 mod config_file;
