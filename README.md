@@ -72,12 +72,16 @@ cargo build --release
 
 ### 开机自启
 
+优先在设置中心的“启动与热键”页勾选；程序会写一个隐藏运行的启动文件夹 VBS。
+
+手动创建快捷方式时，参数必须带 `--background`，否则双击/登录会打开设置页而不是后台运行；登录后是否先等待空闲由设置里的“常驻等待”决定：
+
 ```powershell
 $startup = [Environment]::GetFolderPath('Startup')
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut("$startup\Plex 海报屏保.lnk")
 $lnk.TargetPath = "D:\path\to\plex-poster-screensaver.exe"
-$lnk.Arguments = '--config "D:\path\to\config.json" --watch'
+$lnk.Arguments = '--background --config "D:\path\to\config.json"'
 $lnk.Save()
 ```
 
@@ -138,22 +142,26 @@ Copy-Item config.example.json config.json
 |---|---|
 | 显示 | 布局、切换效果/时长、停留时间、动效模式、Ken Burns、实时预览 |
 | Plex 服务器 | 地址、Token（掩码）、验证 HTTPS、超时、测试连接、媒体库勾选 |
-| 启动与热键 | 常驻等待、空闲分钟数、只算鼠标、全局热键 |
-| 缓存 | 缓存目录/自动选择、命名、保留天数、容量上限、服务端缩图 |
+| 启动与热键 | 常驻等待、空闲分钟数、只算鼠标、全局热键、开机自启 |
+| 缓存 | 缓存目录/自动选择、命名、保留天数、容量上限、服务端缩图、统计/清理 |
 | 高级 | 动效帧率、配置文件路径、打开配置文件/日志目录 |
 | 日志 | `app.log` 最近 300 行，只读、可滚动、每秒刷新 |
 
-第一次启动没有 Token 时，会先弹出 Plex 配置页：填写地址和 Token、测试连接、勾选媒体库、保存，随后继续启动，不需要手动创建 `config.json`。
+第一次启动没有 Token 时，会先弹出 Plex 配置页：填写地址和 Token、测试连接、勾选媒体库、保存，随后自动启动后台实例，不需要手动创建 `config.json`。
 
 Plex 测试连接在后台线程执行，不会卡住窗口；连接结果会区分成功、HTTP 错误、超时等。Token 默认掩码显示，可勾选“显示 Token”。
 
-**保存**只覆盖界面中的持久字段，配置里未知/高级字段原样保留；旧 `fade_seconds` 会迁移成 `transition_seconds`。保存后**下次启动生效**；命令行参数仍优先于文件，窗口顶部会提示当前被哪些启动参数/环境变量覆盖。
+**保存**只覆盖界面中的持久字段，配置里未知/高级字段原样保留；旧 `fade_seconds` 会迁移成 `transition_seconds`。保存会**立即重启正在运行的后台实例**；如果是双击 exe 打开的独立设置窗口且当前没有实例，保存后会自动按新配置启动后台。命令行参数仍优先于文件，窗口顶部会提示当前被哪些启动参数/环境变量覆盖。
+
+**开机自启**写入当前用户的“启动”文件夹（隐藏运行的 VBS，带 `--background` 和当前配置路径）；登录后按“常驻等待”设置运行，不申请管理员权限，取消勾选会删除该脚本。
+
+**双击 exe（无参数）只打开设置页，不直接后台运行**；后台运行使用 `--background`（开机自启脚本内部就是这样启动的）。托盘菜单新增 **重启程序**。
 
 配置文件不存在时，会在 exe 目录或 `%LOCALAPPDATA%\PlexPosterScreensaver\` 下新建；两处都不可写时保存按钮会禁用。高级页可以直接打开配置文件；不常见的部署/自动化场景仍可继续手写 JSON。
 
 ### 控制台与日志
 
-双击、开机自启或计划任务启动时，如果控制台是本进程独占的，程序会主动释放它，不再一直挂着一个黑色终端窗口。从 `cmd` / PowerShell 启动时会保留共用的控制台，`--help`、`--list`、`--self-test`、`--snapshot` 等命令的输出仍然可见。
+后台启动（`--background`、开机自启或计划任务）时，如果控制台是本进程独占的，程序会主动释放它，不再一直挂着一个黑色终端窗口。从 `cmd` / PowerShell 启动时会保留共用的控制台，`--help`、`--list`、`--self-test`、`--snapshot` 等命令的输出仍然可见。
 
 日志始终写到 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`（超过 5MB 轮换），托盘菜单的“打开日志目录”和设置中心的“日志”页都可以查看。控制台不可见时，致命配置/启动错误会额外弹一个 MessageBox，避免程序一闪而过没有任何提示。
 
@@ -183,6 +191,7 @@ Plex 测试连接在后台线程执行，不会卡住窗口；连接结果会区
 | `--cache-days <天>` | 缓存保留天数 |
 | `--cache-max-mb <MB>` | 缓存容量上限，0 表示不限 |
 | `--watch` / `--now` | 常驻等待 / 立刻全屏 |
+| `--background` | 后台运行，不打开设置页（开机自启/重启使用） |
 | `--preview` | 1280x720 窗口预览 |
 | `--self-test <N>` / `--snapshot <png>` | 无界面自检 / 导出结果（按当前布局） |
 

@@ -421,6 +421,70 @@ impl Cache {
         !self.dir.as_os_str().is_empty()
     }
 
+    /// 当前缓存目录里的封面数量与总字节数（只统计 jpg）。
+    pub fn stats(&self) -> (usize, u64) {
+        if !self.is_disk() {
+            return (0, 0);
+        }
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return (0, 0);
+        };
+        let mut count = 0;
+        let mut bytes = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+            {
+                continue;
+            }
+            count += 1;
+            bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+        (count, bytes)
+    }
+
+    /// 清空当前磁盘缓存：删除封面和未完成临时文件，保留媒体库列表索引。
+    pub fn clear(&mut self) -> Result<(usize, u64), String> {
+        if !self.is_disk() {
+            return Err("当前缓存是内存模式，没有可清理的文件".to_string());
+        }
+        let entries = fs::read_dir(&self.dir).map_err(|err| format!("读取缓存目录失败: {err}"))?;
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase());
+            if !matches!(extension.as_deref(), Some("jpg" | "part")) {
+                continue;
+            }
+            let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+                bytes += size;
+            }
+        }
+        {
+            let mut data = self.lock_index();
+            data.items.clear();
+            self.save_index(&data);
+        }
+        self.hits = 0;
+        self.misses = 0;
+        self.stores_since_maintain = 0;
+        self.last_maintain = Instant::now();
+        Ok((removed, bytes))
+    }
+
     /// 新建缓存时用的文件名。
     pub fn path_for(&self, item: &MediaItem) -> PathBuf {
         self.dir.join(format!("{}.jpg", self.preferred_stem(item)))
@@ -1088,6 +1152,22 @@ mod tests {
         fs::remove_file(dir.join("1479.jpg")).unwrap();
         assert!(cache.offline_items(&[]).is_empty());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_stats_and_clear_disk_files() {
+        let dir = scratch_dir("clear");
+        fs::write(dir.join("a.jpg"), b"abcd").unwrap();
+        fs::write(dir.join("b.part"), b"12").unwrap();
+        fs::write(dir.join("keep.txt"), b"x").unwrap();
+        let mut cache = Cache::at(&dir, 30, Naming::Title);
+        assert_eq!(cache.stats(), (1, 4));
+        assert_eq!(cache.clear().unwrap(), (2, 6));
+        assert!(!dir.join("a.jpg").exists());
+        assert!(!dir.join("b.part").exists());
+        assert!(dir.join("keep.txt").exists());
+        assert_eq!(cache.stats(), (0, 0));
         let _ = fs::remove_dir_all(&dir);
     }
 

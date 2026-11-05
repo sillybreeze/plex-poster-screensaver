@@ -826,6 +826,7 @@ pub enum UserEvent {
     StartNow,
     PauseFor(Duration),
     ResumeAuto,
+    Restart,
     Quit,
     SessionLocked,
     SessionUnlocked,
@@ -833,6 +834,13 @@ pub enum UserEvent {
     PowerResume,
     DisplayOff,
     DisplayOn,
+}
+
+/// 事件循环结束后的去向：正常退出或由托盘/设置保存触发重启。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Exit,
+    Restart,
 }
 
 /// 暂停自动触发的各种原因。手动暂停是有期限的，系统原因由通知开关。
@@ -1059,6 +1067,7 @@ pub struct App {
     status: Shared,
     config_path: Option<PathBuf>,
     platform: Option<Platform>,
+    restart_requested: bool,
     pause: PauseState,
     next_dnd_check: Instant,
 
@@ -1139,6 +1148,7 @@ impl App {
             status,
             config_path,
             platform: None,
+            restart_requested: false,
             pause: PauseState::default(),
             next_dnd_check: now,
             size: (1920, 1080),
@@ -1169,7 +1179,7 @@ impl App {
         }
     }
 
-    pub fn run(mut self, trigger: Option<HANDLE>) -> Result<(), String> {
+    pub fn run(mut self, trigger: Option<HANDLE>) -> Result<RunOutcome, String> {
         log_info!(
             "显示设置：布局={}（{}） 转场={}（{}，{:.1} 秒） 动效={}（{}） KenBurns={}",
             self.cfg.display_layout.as_str(),
@@ -1232,7 +1242,12 @@ impl App {
             .run_app(&mut self)
             .map_err(|e| format!("事件循环异常: {e}"));
         self.platform = None;
-        result
+        result?;
+        Ok(if self.restart_requested {
+            RunOutcome::Restart
+        } else {
+            RunOutcome::Exit
+        })
     }
 
     /// 惰性创建 D3D11：常驻模式下第一次触发才建，平时不占显存。
@@ -2007,6 +2022,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pause.manual_until = None;
                 log_info!("手动恢复自动触发");
                 self.sync_status(now);
+            }
+            UserEvent::Restart => {
+                log_info!("请求重启程序");
+                self.restart_requested = true;
+                event_loop.exit();
             }
             UserEvent::Quit => event_loop.exit(),
             UserEvent::SessionLocked => {

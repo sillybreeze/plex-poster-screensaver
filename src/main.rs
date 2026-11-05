@@ -3,6 +3,7 @@
 //! 从 Plex 媒体库随机取海报全屏轮播，自动提取主色做氛围光，并带 Ken Burns 缓慢推近。
 
 mod app;
+mod autostart;
 mod config;
 mod gpu;
 
@@ -90,12 +91,18 @@ mod settings_preview;
 mod status;
 mod trigger;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
+use app::RunOutcome;
 use config::{CacheLocation, Config};
 use logging::{log_error, log_info, log_warn};
 use plex::{Cache, Client, Section};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 记录致命错误；控制台不可见时补一个 MessageBox。
 fn fatal_error(message: &str, code: i32, popup: bool) -> ! {
@@ -124,6 +131,56 @@ fn show_error(message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+/// 无参数双击 exe：只打开设置页，不启动屏保进程。
+///
+/// 保存成功且没有正在运行的后台实例时，保存后按新配置启动一个
+/// `--background` 实例；如果已有实例，设置保存会请求它重启。
+fn run_settings_only(args: &config::Args, config_path: Option<PathBuf>) -> Result<(), String> {
+    let cfg = config::load(args)?;
+    let path = config::display_settings_path(config_path.as_deref());
+    let cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
+    let overrides = config::SettingsOverrides::from_args(args);
+    let page = if cfg.token.is_empty() {
+        settings::Page::Plex
+    } else {
+        settings::Page::Display
+    };
+    let outcome = settings::run_modal(path.clone(), cache, overrides, page)?;
+    if outcome.saved && !outcome.restart_requested {
+        launch_background(path.as_deref())?;
+    }
+    Ok(())
+}
+
+fn launch_background(config_path: Option<&Path>) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("获取当前 exe 路径失败: {err}"))?;
+    let mut command = Command::new(exe);
+    command.arg("--background");
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("启动后台实例失败: {err}"))
+}
+
+fn relaunch_current() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("获取当前 exe 路径失败: {err}"))?;
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.is_empty() {
+        // 旧快捷键/旧启动方式没有参数；现在无参数表示打开设置，重启时必须显式后台。
+        args.push(OsString::from("--background"));
+    }
+    Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("重启程序失败: {err}"))
 }
 
 fn main() {
@@ -162,6 +219,15 @@ fn main() {
     if std::env::var_os("PPS_DEBUG").is_some() {
         log_info!("控制台状态: {console_state:?}");
     }
+    // 无参数双击：只打开设置页。后台运行必须显式 --background（开机自启用它），
+    // 否则无参数启动会变成设置页，无法区分“配置”和“常驻”。
+    if !utility && !args.background && std::env::args_os().len() == 1 {
+        log_info!("无参数启动：打开设置页");
+        if let Err(err) = run_settings_only(&args, config_path.clone()) {
+            fatal_error(&format!("设置启动失败: {err}"), 1, popup_errors);
+        }
+        return;
+    }
     let instance = if utility {
         None
     } else {
@@ -192,7 +258,7 @@ fn main() {
         }
     };
     let settings_overrides = config::SettingsOverrides::from_args(&args);
-    if cfg.token.is_empty() && !utility {
+    if cfg.token.is_empty() && !utility && !args.background {
         log_warn!("未配置 Plex Token，先打开首次设置");
         let preview_cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
         let settings_path = config::display_settings_path(config_path.as_deref());
@@ -348,10 +414,18 @@ fn main() {
         config_path,
         settings_overrides,
     );
-    let result = app.run(trigger_event);
+    let outcome = app.run(trigger_event);
     timer::end();
-    if let Err(err) = result {
-        fatal_error(&err, 1, popup_errors);
+    // 重启前先释放单实例锁，否则新进程会被旧实例拦住。
+    drop(instance);
+    match outcome {
+        Err(err) => fatal_error(&err, 1, popup_errors),
+        Ok(RunOutcome::Exit) => {}
+        Ok(RunOutcome::Restart) => {
+            if let Err(err) = relaunch_current() {
+                fatal_error(&err, 1, popup_errors);
+            }
+        }
     }
 }
 

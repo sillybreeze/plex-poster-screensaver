@@ -1004,6 +1004,8 @@ pub struct Args {
     /// 等待 N 秒后打印前台窗口诊断信息（T08 排查用）。
     pub diagnose_foreground: Option<u32>,
     pub preview: bool,
+    /// 无界面后台运行：开机自启/重启时使用，不打开设置页。
+    pub background: bool,
     pub display: Option<f64>,
     pub fade: Option<f64>,
     pub layout: Option<DisplayLayout>,
@@ -1036,6 +1038,9 @@ plex-poster-screensaver (Rust)
 用法:
   plex-poster-screensaver [选项]
 
+说明:
+  不加参数启动会直接打开设置页；后台运行请用 --background。
+
 选项:
   --url <地址>          Plex 地址，默认 http://127.0.0.1:32400
   --token <令牌>        Plex Token（也可用环境变量 PLEX_TOKEN）
@@ -1059,6 +1064,7 @@ plex-poster-screensaver (Rust)
   --no-transcode        不使用服务端缩图
   --insecure            HTTPS 跳过证书校验
   --preview             以 1280x720 窗口预览
+  --background          后台运行，不打开设置页（开机自启/重启使用）
   --watch               常驻等待：空闲到点后自动全屏，有输入就收起
   --now                 立刻全屏，不等空闲（覆盖配置里的 watch）
   --idle <分钟>         空闲多久触发，默认 5（0.0833–1440，即 5 秒–24 小时）
@@ -1094,6 +1100,7 @@ fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String
                 args.diagnose_foreground = Some(seconds);
             }
             "--preview" => args.preview = true,
+            "--background" => args.background = true,
             "--display" => args.display = Some(parse_num(&value("--display")?)?),
             "--fade" => args.fade = Some(parse_num(&value("--fade")?)?),
             "--layout" => {

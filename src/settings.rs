@@ -3,7 +3,7 @@
 //! 左侧分页，覆盖 Plex、显示、启动、缓存、高级和日志。保存仍然只写 config.json
 //! 中已知的持久字段，未知字段原样保留；命令行/环境变量仍优先于文件。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,19 +38,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowTextW, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
     CBN_EDITCHANGE, CBN_SELCHANGE, CBS_DROPDOWN, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
     CB_SETCURSEL, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY, HICON,
-    HMENU, IDC_ARROW, LBS_MULTIPLESEL, LBS_NOINTEGRALHEIGHT, LB_ADDSTRING, LB_GETCOUNT, LB_GETSEL,
-    LB_GETTEXT, LB_RESETCONTENT, LB_SETSEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG,
-    SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    HMENU, IDC_ARROW, IDYES, LBS_MULTIPLESEL, LBS_NOINTEGRALHEIGHT, LB_ADDSTRING, LB_GETCOUNT,
+    LB_GETSEL, LB_GETTEXT, LB_RESETCONTENT, LB_SETSEL, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SETFONT,
+    WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{
     self, Config, DisplayLayout, DisplaySettings, EditableSettings, MotionMode, Naming,
     SettingsOverrides, Transition,
 };
-use crate::logging::{log_info, log_warn};
+use crate::logging::{log_error, log_info, log_warn};
 use crate::plex::{Cache, Client, Section};
 use crate::settings_preview::{load_preview_images, PreviewState};
 
@@ -79,6 +79,7 @@ const ID_WATCH: i32 = 4001;
 const ID_IDLE: i32 = 4002;
 const ID_MOUSE_ONLY: i32 = 4003;
 const ID_HOTKEY: i32 = 4004;
+const ID_AUTOSTART: i32 = 4005;
 
 const ID_CACHE_DIR: i32 = 5001;
 const ID_BROWSE: i32 = 5002;
@@ -88,6 +89,9 @@ const ID_CACHE_DAYS: i32 = 5005;
 const ID_CACHE_MAX_MB: i32 = 5006;
 const ID_TRANSCODE: i32 = 5007;
 const ID_CACHE_INFO: i32 = 5008;
+const ID_CACHE_STATS: i32 = 5009;
+const ID_REFRESH_CACHE: i32 = 5010;
+const ID_CLEAN_CACHE: i32 = 5011;
 
 const ID_MOTION_FPS: i32 = 6001;
 const ID_CONFIG_PATH: i32 = 6002;
@@ -168,6 +172,7 @@ struct SettingsState {
     load_error: Option<String>,
     page: Page,
     page_controls: [Vec<HWND>; 6],
+    cache: Cache,
     preview: PreviewState,
     test_rx: Option<Receiver<Result<Vec<Section>, String>>>,
     sections: Vec<Section>,
@@ -178,6 +183,15 @@ struct SettingsState {
 
 thread_local! {
     static STATE: RefCell<Option<SettingsState>> = const { RefCell::new(None) };
+    static MODAL_SAVED: Cell<bool> = const { Cell::new(false) };
+    static MODAL_RESTARTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 独立设置进程关闭时的结果；只有保存成功才考虑启动/重启后台实例。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModalOutcome {
+    pub saved: bool,
+    pub restart_requested: bool,
 }
 
 fn with_state<T>(f: impl FnOnce(&SettingsState) -> T) -> Option<T> {
@@ -232,7 +246,9 @@ pub fn run_modal(
     cache: Cache,
     overrides: SettingsOverrides,
     page: Page,
-) -> Result<(), String> {
+) -> Result<ModalOutcome, String> {
+    MODAL_SAVED.set(false);
+    MODAL_RESTARTED.set(false);
     // 主线程在启动 App 前没有初始化 COM；缓存目录的“浏览…”用新版文件夹
     // 选择器时依赖 COM，这里先按 STA 初始化，窗口关闭后配对释放。
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -270,7 +286,10 @@ pub fn run_modal(
             CoUninitialize();
         }
     }
-    Ok(())
+    Ok(ModalOutcome {
+        saved: MODAL_SAVED.with(Cell::get),
+        restart_requested: MODAL_RESTARTED.with(Cell::get),
+    })
 }
 
 pub fn close() {
@@ -636,7 +655,7 @@ fn create_controls(
 
     let hint = create_static_id(
         hwnd,
-        "预览为加速循环。保存后下次启动生效；命令行参数仍会覆盖对应项。",
+        "预览为加速循环。保存后会重启后台实例以立即生效；命令行参数仍会覆盖对应项。",
         preview_x,
         preview_y + preview_h + s(8),
         preview_w,
@@ -903,6 +922,27 @@ fn create_controls(
         instance,
         font,
     )?);
+    startup.push(create_checkbox(
+        hwnd,
+        "开机自启（当前用户，后台运行）",
+        form_x,
+        s(272),
+        s(420),
+        s(24),
+        ID_AUTOSTART,
+        instance,
+        font,
+    )?);
+    startup.push(create_static(
+        hwnd,
+        "登录后按“常驻等待”设置运行（未勾选则直接全屏）；不申请管理员权限。",
+        s(270),
+        s(304),
+        s(560),
+        s(40),
+        instance,
+        font,
+    )?);
     pages[Page::Startup.index()] = startup;
 
     // 缓存页
@@ -1061,8 +1101,41 @@ fn create_controls(
         s(270),
         s(304),
         s(580),
-        s(60),
+        s(40),
         ID_CACHE_INFO,
+        instance,
+        font,
+    )?);
+    cache_page.push(create_static_id(
+        hwnd,
+        "",
+        s(270),
+        s(350),
+        s(580),
+        s(20),
+        ID_CACHE_STATS,
+        instance,
+        font,
+    )?);
+    cache_page.push(create_button(
+        hwnd,
+        "刷新统计",
+        s(270),
+        s(382),
+        s(120),
+        s(28),
+        ID_REFRESH_CACHE,
+        instance,
+        font,
+    )?);
+    cache_page.push(create_button(
+        hwnd,
+        "清理缓存",
+        s(402),
+        s(382),
+        s(120),
+        s(28),
+        ID_CLEAN_CACHE,
         instance,
         font,
     )?);
@@ -1225,6 +1298,7 @@ fn create_controls(
         load_error,
         page: Page::Display,
         page_controls: pages,
+        cache: cache.clone(),
         preview: preview_state,
         test_rx: None,
         sections: Vec::new(),
@@ -1264,6 +1338,12 @@ fn populate_controls(
     set_window_text(hwnd, ID_IDLE, &format_number(settings.idle_minutes));
     set_checked(hwnd, ID_MOUSE_ONLY, settings.mouse_only);
     set_window_text(hwnd, ID_HOTKEY, &settings.hotkey);
+    set_checked(hwnd, ID_AUTOSTART, crate::autostart::is_enabled());
+    if let Ok(control) = get_control(hwnd, ID_AUTOSTART) {
+        unsafe {
+            let _ = EnableWindow(control, path.is_some());
+        }
+    }
 
     set_window_text(hwnd, ID_CACHE_DIR, &settings.cache_dir);
     set_checked(hwnd, ID_CACHE_AUTO, settings.cache_auto);
@@ -1395,6 +1475,9 @@ impl SettingsState {
         }
         if page == Page::Display {
             self.invalidate_preview();
+        }
+        if page == Page::Cache {
+            self.update_cache_stats();
         }
     }
 
@@ -1561,6 +1644,56 @@ impl SettingsState {
             let _ = SendMessageW(self.log_view, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
         }
     }
+
+    fn update_cache_stats(&self) {
+        let (count, bytes) = self.cache.stats();
+        let text = if self.cache.is_disk() {
+            format!(
+                "当前运行缓存：{} 张，{}（{}）",
+                count,
+                format_bytes(bytes),
+                self.cache.dir.display()
+            )
+        } else {
+            "当前运行缓存：内存模式，未落盘".to_string()
+        };
+        set_window_text(self.hwnd, ID_CACHE_STATS, &text);
+    }
+
+    fn clear_cache(&mut self) {
+        if !self.cache.is_disk() {
+            message_error(self.hwnd, "当前缓存是内存模式，没有可清理的文件。");
+            return;
+        }
+        let (count, bytes) = self.cache.stats();
+        if count == 0 {
+            message_info(self.hwnd, "缓存已经是空的。");
+            self.update_cache_stats();
+            return;
+        }
+        let prompt = format!(
+            "确定清理当前缓存吗？\n{} 张，{}\n之后会按需重新下载。",
+            count,
+            format_bytes(bytes)
+        );
+        if !confirm(self.hwnd, &prompt) {
+            return;
+        }
+        match self.cache.clear() {
+            Ok((removed, freed)) => {
+                log_info!("已清理缓存: {removed} 个文件，{}", format_bytes(freed));
+                self.update_cache_stats();
+                message_info(
+                    self.hwnd,
+                    &format!(
+                        "已清理 {removed} 个缓存文件，释放 {}。",
+                        format_bytes(freed)
+                    ),
+                );
+            }
+            Err(err) => message_error(self.hwnd, &format!("清理缓存失败：{err}")),
+        }
+    }
 }
 
 fn read_display(hwnd: HWND) -> Result<DisplaySettings, String> {
@@ -1635,11 +1768,12 @@ fn read_editable(hwnd: HWND, sections_loaded: bool) -> Result<EditableSettings, 
 }
 
 fn save_settings(hwnd: HWND) {
-    let Some((path, load_error, settings)) = with_state(|state| {
+    let Some((path, load_error, settings, autostart)) = with_state(|state| {
         (
             state.path.clone(),
             state.load_error.clone(),
             read_editable(state.hwnd, state.sections_loaded),
+            checked(state.hwnd, ID_AUTOSTART),
         )
     }) else {
         return;
@@ -1655,43 +1789,72 @@ fn save_settings(hwnd: HWND) {
             return;
         }
     };
-    match config::save_editable_settings(path.as_deref(), &settings) {
-        Ok(()) => {
-            log_info!(
-                "设置已保存: {}",
-                path.as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "(无配置文件)".to_string())
-            );
-            message_info(
-                hwnd,
-                "设置已保存，下次启动屏保时生效。\n命令行参数/环境变量仍会覆盖对应项。",
-            );
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-        }
-        Err(err) => message_error(hwnd, &err),
+    if let Err(err) = config::save_editable_settings(path.as_deref(), &settings) {
+        message_error(hwnd, &err);
+        return;
+    }
+    log_info!(
+        "设置已保存: {}",
+        path.as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(无配置文件)".to_string())
+    );
+
+    // 开机自启是 OS 状态，不进 config.json；保存成功后同步。
+    log_info!(
+        "开机自启: 请求={autostart}, 当前={}",
+        crate::autostart::is_enabled()
+    );
+    let autostart_result = if autostart {
+        crate::autostart::enable(path.as_deref())
+    } else if crate::autostart::is_enabled() {
+        crate::autostart::disable()
+    } else {
+        Ok(())
+    };
+    if let Err(err) = autostart_result {
+        log_error!("开机自启更新失败: {err}");
+        message_error(hwnd, &format!("配置已保存，但开机自启更新失败：\n{err}"));
+        return;
+    }
+
+    let restarted = crate::platform::request_restart();
+    MODAL_SAVED.set(true);
+    MODAL_RESTARTED.set(restarted);
+    log_info!("设置已保存，重启请求={restarted}");
+    unsafe {
+        let _ = DestroyWindow(hwnd);
     }
 }
 
 fn message_error(hwnd: HWND, text: &str) {
-    message_box(hwnd, text, MB_OK | MB_ICONERROR);
+    let _ = message_box(hwnd, text, MB_OK | MB_ICONERROR);
 }
 
 fn message_info(hwnd: HWND, text: &str) {
-    message_box(hwnd, text, MB_OK | MB_ICONINFORMATION);
+    let _ = message_box(hwnd, text, MB_OK | MB_ICONINFORMATION);
+}
+
+fn confirm(hwnd: HWND, text: &str) -> bool {
+    message_box(hwnd, text, MB_YESNO | MB_ICONWARNING) == IDYES
 }
 
 fn message_box(
     hwnd: HWND,
     text: &str,
     flags: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
-) {
+) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
     let text = wide(text);
     let caption = wide("设置");
-    unsafe {
-        MessageBoxW(hwnd, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), flags);
+    unsafe { MessageBoxW(hwnd, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), flags) }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
     }
 }
 
@@ -1741,6 +1904,12 @@ unsafe extern "system" fn settings_proc(
                     }
                     ID_BROWSE if code == 0 => {
                         with_state_mut(|state| state.browse_cache_dir());
+                    }
+                    ID_REFRESH_CACHE if code == 0 => {
+                        with_state_mut(|state| state.update_cache_stats());
+                    }
+                    ID_CLEAN_CACHE if code == 0 => {
+                        with_state_mut(|state| state.clear_cache());
                     }
                     ID_OPEN_CONFIG if code == 0 => {
                         let path = with_state(|state| state.path.clone()).flatten();

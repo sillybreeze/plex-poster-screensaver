@@ -41,7 +41,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
+    DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, KillTimer,
     LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, HICON,
@@ -73,7 +73,11 @@ const MENU_CONFIG: usize = 20;
 const MENU_CACHE: usize = 21;
 const MENU_LOGS: usize = 22;
 const MENU_SETTINGS: usize = 23;
+const MENU_RESTART: usize = 24;
 const MENU_QUIT: usize = 30;
+
+/// 设置进程通过这个窗口消息请求正在运行的后台实例重启。
+const WM_RESTART: u32 = WM_APP + 42;
 
 struct Context {
     proxy: EventLoopProxy<UserEvent>,
@@ -396,6 +400,11 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(1)
         }
+        WM_RESTART => {
+            log_info!("收到重启请求");
+            send_event(UserEvent::Restart);
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -444,6 +453,28 @@ fn send_event(event: UserEvent) {
             log_warn!("发送界面事件失败: {err}");
         }
     });
+}
+
+/// 请求后台实例重启。设置窗口可能位于同一进程（托盘线程），也可能是
+/// 双击 exe 启用的独立设置进程；后者用托盘窗口消息跨进程通知。
+pub fn request_restart() -> bool {
+    if let Some(sent) = with_context(|context| context.proxy.send_event(UserEvent::Restart).is_ok())
+    {
+        if sent {
+            return true;
+        }
+    }
+    unsafe {
+        let hwnd = FindWindowW(
+            w!("PlexPosterScreensaverTray"),
+            w!("Plex Poster Screensaver"),
+        )
+        .unwrap_or_default();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        PostMessageW(hwnd, WM_RESTART, WPARAM(0), LPARAM(0)).is_ok()
+    }
 }
 
 fn taskbar_created_message() -> u32 {
@@ -616,6 +647,7 @@ fn show_menu(hwnd: HWND) {
         append(menu, resume, MENU_RESUME, "恢复自动触发");
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING, MENU_SETTINGS, "设置…");
+        append(menu, MF_STRING, MENU_RESTART, "重启程序");
         let config = if config_available {
             MF_STRING
         } else {
@@ -654,6 +686,7 @@ fn handle_menu(id: usize) {
         MENU_PLAY => send_event(UserEvent::StartNow),
         MENU_PAUSE => send_event(UserEvent::PauseFor(Duration::from_secs(3600))),
         MENU_RESUME => send_event(UserEvent::ResumeAuto),
+        MENU_RESTART => send_event(UserEvent::Restart),
         MENU_QUIT => send_event(UserEvent::Quit),
         MENU_SETTINGS => {
             let data = with_context(|context| {
