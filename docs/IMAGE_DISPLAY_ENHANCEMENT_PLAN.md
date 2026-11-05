@@ -170,9 +170,9 @@ CLI 新增 `--layout single|wall`、`--transition fade|slide-left|slide-right|sl
 
 - 系统：Windows 11 专业版 10.0.26200（build 26200），真实桌面会话。
 - 工具链：rustc / cargo 1.94.0，Release 构建，D3D11。
-- 自动化：`cargo fmt --check`、`cargo test --release --offline`（**84 passed**，基线 48 项，新增 36 项）、`cargo build --release --offline`、`cargo clippy --release --offline --all-targets` 全部通过。
+- 自动化：`cargo fmt --check`、`cargo test --release --offline`（**87 passed**，基线 48 项，新增 39 项）、`cargo build --release --offline`、`cargo clippy --release --offline --all-targets` 全部通过。
 - 说明：本机 Debug 配置仍受已知的 ring/MSVC 构建问题影响，所有验证使用 Release 配置。
-- 本地提交：`d21d36e`（实现）、`2c034f7`（README 与示例配置）；本记录随文档提交。未推送远程仓库。
+- 本地提交：`d21d36e`（实现）、`2c034f7`（README 与示例配置）、`8cd4fef`（海报墙掉线回退修复）；本记录随文档提交。未推送远程仓库。
 
 ### 8.2 阶段实施与验收
 
@@ -180,7 +180,7 @@ CLI 新增 `--layout single|wall`、`--transition fade|slide-left|slide-right|sl
 | --- | --- | --- | --- |
 | A 配置模型 | 完成（枚举解析、默认值、旧配置兼容、`fade_seconds` 别名、CLI 覆盖、`--no-motion` 等价、非法值/范围） | 通过 `--help`、`--layout mosaic`、`--fade 5` 验证帮助与启动前报错 | `transition_seconds` 允许 0 以兼容旧 `--fade 0`，其余范围为 0.1–3.0 |
 | B 方向切换 | 完成（缓动、四方向起点/终点、完全离屏、单调收敛、fade/slide 图层参数、随机方向稳定与避重、首帧/静止/零时长） | 1280×720 `--preview` 实测单张 slide-left 与海报墙 slide-left，转换过程中旧画面保留、无黑带/残影 | 单张 fade 及另外三种方向的逐帧录屏未逐一执行（共享路径与数学已覆盖） |
-| C 海报墙 | 完成（0–6 张网格、1280/1920/3840 边界与非重叠、宽高比、短列表居中、1 张退回单张、0 张报错、墙面像素不出格） | 1920×1080 `--snapshot` 生成单张与 6 张海报墙；1280×720 `--preview` 实测 6 张墙面 | 1–5 张、坏缓存、部分网络失败与 4K 实机画面未逐一实测；4K 墙面画布约 33 MB/帧，未做耗时基准 |
+| C 海报墙 | 完成（0–6 张网格、1280/1920/3840 边界与非重叠、宽高比、短列表居中、1 张退回单张、0 张报错、墙面像素不出格、离线回退、坏缓存跳过、补位去重） | 1920×1080 `--snapshot` 生成单张与 6 张海报墙；1280×720 `--preview` 实测 6 张墙面 | 1–5 张、部分网络失败与 4K 实机画面未逐一实测（坏缓存/离线回退已自动覆盖）；4K 墙面画布约 33 MB/帧，未做耗时基准 |
 | D 静止轮播 | 完成（静止跳过转场、`continuous_motion_mode` 组合、静止帧只画一次、最小化/尺寸变化标记重画） | 1280×720 `--preview --motion static` 捕获 24 帧（约 7 秒），每个 3 秒停留段像素完全一致，三组内容自动切换 | 静止单张的多周期录屏、显示器缩放、托盘退出未单独实测 |
 
 ### 8.3 关键实现
@@ -188,7 +188,7 @@ CLI 新增 `--layout single|wall`、`--transition fade|slide-left|slide-right|sl
 - 配置：新增 `DisplayLayout`、`Transition`、`MotionMode` 强类型枚举；JSON 字段 `display_layout`、`transition`、`transition_seconds`、`motion_mode` 与既有 `ken_burns` 组合。CLI 新增 `--layout`、`--transition`、`--motion`；`--no-motion` 等同 `--motion static`；`--fade` 保留为 `transition_seconds` 别名。旧 `fade_seconds` 配置继续读取，`transition_seconds` 优先。
 - 校验：未知枚举值、NaN/Inf、负数和越界时长在创建窗口前报错；错误信息包含 JSON 键或 CLI 参数名；`--no-motion` 与 `--motion static` 与参数顺序无关。
 - 转场：`Phase::Transition` 统一保存旧帧、旧 UV、开始时间与实际效果；GPU uniform 增加背景偏移与背景/海报两层独立 alpha；单张布局移动海报层并淡化背景，海报墙移动整张画布；随机方向每张只选一次且避免连续重复；首帧、静止模式、`transition_seconds=0` 直接切换，转场帧率沿用 `motion_fps`。
-- 海报墙：新增 `src/layout.rs` 负责 3×2/短列表网格、边距与间距下限、比例 fit；worker 逐张复用缓存或下载并合成整屏画布，主线程只上传一张纹理；少于 6 张按可用数量重排，1 张退回单张，全部失败沿用等待/错误状态。
+- 海报墙：新增 `src/layout.rs` 负责 3×2/短列表网格、边距与间距下限、比例 fit；worker 逐张复用缓存或下载并合成整屏画布，主线程只上传一张纹理；少于 6 张按可用数量重排，1 张退回单张，全部失败沿用等待/错误状态。取列表中途掉线时保留已选中的在线条目（能命中缓存的继续组帧），并从离线缓存补齐剩余格子，而不是整组失败。
 - 静止：`motion_mode=static` 跳过转场与缩放；停留帧只绘制一次，不再按 `motion_fps` 反复唤醒或重复 Present；调度只保留换图、宽限期和常驻输入检查截止时间；最小化恢复、尺寸变化与系统恢复强制重画一帧。
 - GPU 恢复：纹理创建失败现在携带 `GpuError`，设备丢失时直接进入既有退避恢复，避免静止模式长时间不 Present 导致上传失败无限重试。
 
@@ -210,4 +210,14 @@ CLI 新增 `--layout single|wall`、`--transition fade|slide-left|slide-right|sl
 - 海报墙固定最多 6 张、3 列×2 行，不支持自定义行列；短列表按 2×1、3×1、2×2、3×2 自动重排。
 - 墙面画布每次组帧在 worker 生成，不写入媒体缓存；4K 下每帧约 33 MB，连续切换的内存峰值高于单张布局。
 - 随机方向只在换图时生成一次；同一进程内使用时间种子，不保证跨进程可复现。
+
+### 8.6 复核修复：海报墙在线转离线（2026-11-05）
+
+- 问题：`online_wall_items()` 在补充列表失败后会调用 `go_offline()`，但已选中的在线条目仍会被返回；旧 `wall_next()` 仅依据 `self.online` 选择取图模式，随后 `wall_slide()` 对这些条目只读缓存。若它们尚未缓存，`loaded` 为空，即使离线队列里仍有可用缓存，也会直接报错，与“部分网络失败时以成功缓存/下载的海报继续组帧”的要求不一致。
+- 修复：
+  - 保留已选中的在线条目；按其取图时的连接状态选择在线（可下载）或缓存模式，掉线后不再为未缓存封面等待网络超时；
+  - 在线候选不足或部分取图失败时，用 `take_offline_items()` 从离线队列补齐，排除已加载条目并去重；补齐后仍可组成 2–6 张墙面，只剩 1 张时退回单张；
+  - 单张坏缓存/下载失败只跳过该张并汇总失败张数；取消时不再消费离线队列。
+- 自动验证：新增 `wall_falls_back_to_offline_cache_when_plex_is_gone`、`wall_skips_corrupt_cache_and_keeps_remaining_posters`、`offline_backfill_skips_items_already_loaded` 三项回归测试；完整 Release 测试 **87 passed**，`cargo fmt --check`、`cargo build --release --offline`、`cargo clippy --release --offline --all-targets` 通过。
+- 剩余限制：真实网络中“部分封面下载失败后掉线”的时序仍由离线/坏缓存路径间接覆盖，未做真实 Plex 断网注入；托盘在线状态仍由 `self.online` 统一决定。
 
