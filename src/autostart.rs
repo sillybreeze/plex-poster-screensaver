@@ -76,7 +76,12 @@ pub fn disable() -> Result<(), String> {
     if !file.is_file() {
         return Ok(());
     }
-    fs::remove_file(&file).map_err(|err| format!("删除开机自启脚本失败: {err}"))
+    fs::remove_file(&file).map_err(|err| {
+        format!(
+            "删除开机自启脚本失败 {}: {err}。请检查启动文件夹权限，或手动删除该文件",
+            file.display()
+        )
+    })
 }
 
 #[cfg(test)]

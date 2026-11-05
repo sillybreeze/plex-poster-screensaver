@@ -1812,16 +1812,26 @@ fn save_settings(hwnd: HWND) {
     } else {
         Ok(())
     };
-    if let Err(err) = autostart_result {
+    let autostart_error = autostart_result.err();
+    if let Some(err) = &autostart_error {
         log_error!("开机自启更新失败: {err}");
-        message_error(hwnd, &format!("配置已保存，但开机自启更新失败：\n{err}"));
-        return;
     }
 
     let restarted = crate::platform::request_restart();
     MODAL_SAVED.set(true);
     MODAL_RESTARTED.set(restarted);
     log_info!("设置已保存，重启请求={restarted}");
+    if let Some(err) = autostart_error {
+        let restart_status = if restarted {
+            "当前运行实例正在应用新设置。"
+        } else {
+            "请手动重启程序以应用新设置。"
+        };
+        message_error(
+            hwnd,
+            &format!("配置已保存，但开机自启状态未能更新。\n{err}\n{restart_status}"),
+        );
+    }
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
