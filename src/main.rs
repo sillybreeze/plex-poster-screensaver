@@ -138,6 +138,7 @@ mod console {
 mod idle;
 mod layout;
 mod logging;
+mod media;
 mod platform;
 mod plex;
 mod render;
@@ -539,7 +540,7 @@ fn run_self_test(
     count: usize,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(
+    let mut source = media::Source::new(
         client,
         cache,
         sections,
@@ -595,7 +596,7 @@ fn run_snapshot(
     path: &str,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(
+    let mut source = media::Source::new(
         client,
         cache,
         sections,
