@@ -37,6 +37,7 @@ mod logging;
 mod platform;
 mod plex;
 mod render;
+mod settings;
 mod status;
 mod trigger;
 

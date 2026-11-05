@@ -4,10 +4,12 @@
 
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
@@ -376,6 +378,228 @@ pub fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 设置窗口读写的常用显示项。
+///
+/// 只覆盖日常调整的 6 个字段；其余高级配置保存在原 JSON 里，保存时原样保留。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplaySettings {
+    pub display_layout: DisplayLayout,
+    pub transition: Transition,
+    pub transition_seconds: f64,
+    pub display_seconds: f64,
+    pub motion_mode: MotionMode,
+    pub ken_burns: bool,
+}
+
+impl Default for DisplaySettings {
+    fn default() -> Self {
+        Self::from_config(&Config::default())
+    }
+}
+
+impl DisplaySettings {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            display_layout: cfg.display_layout,
+            transition: cfg.transition,
+            transition_seconds: cfg.transition_seconds,
+            display_seconds: cfg.display_seconds,
+            motion_mode: cfg.motion_mode,
+            ken_burns: cfg.ken_burns,
+        }
+    }
+
+    /// 设置窗口保存前的校验；错误信息直接显示给用户。
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.display_seconds.is_finite() || !(0.1..=3600.0).contains(&self.display_seconds) {
+            return Err("每张停留时间必须在 0.1–3600 秒之间".to_string());
+        }
+        if !self.transition_seconds.is_finite()
+            || (self.transition_seconds != 0.0
+                && !(MIN_TRANSITION_SECONDS..=MAX_TRANSITION_SECONDS)
+                    .contains(&self.transition_seconds))
+        {
+            return Err("切换时长必须是 0（立即切换）或 0.1–3.0 秒".to_string());
+        }
+        Duration::try_from_secs_f64(self.display_seconds)
+            .map_err(|err| format!("每张停留时间无法转换为时间间隔: {err}"))?;
+        Duration::try_from_secs_f64(self.transition_seconds)
+            .map_err(|err| format!("切换时长无法转换为时间间隔: {err}"))?;
+        Ok(())
+    }
+
+    /// 从配置文件 JSON 读取常用项；缺失字段用默认值，旧 `fade_seconds` 仍兼容。
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        let mut settings = Self::default();
+        if let Some(raw) = value.get("display_layout") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 display_layout 必须是字符串".to_string())?;
+            settings.display_layout = DisplayLayout::parse(raw).ok_or_else(|| {
+                format!("config.json 里的 display_layout 无效（single|wall）: {raw}")
+            })?;
+        }
+        if let Some(raw) = value.get("transition") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 transition 必须是字符串".to_string())?;
+            settings.transition = Transition::parse(raw).ok_or_else(|| {
+                format!(
+                    "config.json 里的 transition 无效（fade|slide-left|slide-right|slide-up|slide-down|random）: {raw}"
+                )
+            })?;
+        }
+        let seconds = value
+            .get("transition_seconds")
+            .or_else(|| value.get("fade_seconds"));
+        if let Some(raw) = seconds {
+            settings.transition_seconds = raw
+                .as_f64()
+                .ok_or_else(|| "config.json 里的 transition_seconds 必须是数值".to_string())?;
+        }
+        if let Some(raw) = value.get("display_seconds") {
+            settings.display_seconds = raw
+                .as_f64()
+                .ok_or_else(|| "config.json 里的 display_seconds 必须是数值".to_string())?;
+        }
+        if let Some(raw) = value.get("motion_mode") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 motion_mode 必须是字符串".to_string())?;
+            settings.motion_mode = MotionMode::parse(raw).ok_or_else(|| {
+                format!("config.json 里的 motion_mode 无效（animated|static）: {raw}")
+            })?;
+        }
+        if let Some(raw) = value.get("ken_burns") {
+            settings.ken_burns = raw
+                .as_bool()
+                .ok_or_else(|| "config.json 里的 ken_burns 必须是布尔值".to_string())?;
+        }
+        Ok(settings)
+    }
+
+    /// 只覆盖常用键，保留 `plex_url`、缓存、热键等高级字段；旧别名会被删除。
+    pub fn apply_to_json(&self, value: &mut Value) -> Result<(), String> {
+        let map = value
+            .as_object_mut()
+            .ok_or_else(|| "配置文件根节点必须是 JSON 对象".to_string())?;
+        map.insert(
+            "display_layout".to_string(),
+            Value::String(self.display_layout.as_str().to_string()),
+        );
+        map.insert(
+            "transition".to_string(),
+            Value::String(self.transition.as_str().to_string()),
+        );
+        map.insert(
+            "transition_seconds".to_string(),
+            Value::from(self.transition_seconds),
+        );
+        map.insert(
+            "display_seconds".to_string(),
+            Value::from(self.display_seconds),
+        );
+        map.insert(
+            "motion_mode".to_string(),
+            Value::String(self.motion_mode.as_str().to_string()),
+        );
+        map.insert("ken_burns".to_string(), Value::Bool(self.ken_burns));
+        map.remove("fade_seconds");
+        Ok(())
+    }
+}
+
+/// 设置窗口保存的目标：已有配置文件优先，否则在可写位置新建。
+pub fn display_settings_path(existing: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = existing {
+        return Some(path.to_path_buf());
+    }
+    [exe_dir().join("config.json"), app_dir().join("config.json")]
+        .into_iter()
+        .find(|candidate| candidate.parent().is_some_and(probe_writable))
+}
+
+fn probe_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".settings-write-probe-{}", std::process::id()));
+    let ok = fs::write(&probe, b"1").is_ok();
+    let _ = fs::remove_file(probe);
+    ok
+}
+
+/// 读取常用显示设置；文件不存在时返回默认值。
+pub fn load_display_settings(path: Option<&Path>) -> Result<DisplaySettings, String> {
+    let Some(path) = path else {
+        return Ok(DisplaySettings::default());
+    };
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|err| format!("配置文件解析失败 {}: {err}", path.display()))?;
+            DisplaySettings::from_json(&value)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DisplaySettings::default()),
+        Err(err) => Err(format!("无法读取配置文件 {}: {err}", path.display())),
+    }
+}
+
+/// 把常用显示设置写回配置文件，保留未识别的 JSON 字段。
+pub fn save_display_settings(
+    path: Option<&Path>,
+    settings: &DisplaySettings,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Err("没有可写的配置文件位置；可用 --config 指定一个可写路径".to_string());
+    };
+    settings.validate()?;
+
+    let mut value = if path.exists() {
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("无法读取配置文件 {}: {err}", path.display()))?;
+        serde_json::from_str(&text)
+            .map_err(|err| format!("现有配置文件解析失败，未覆盖 {}: {err}", path.display()))?
+    } else {
+        Value::Object(Map::new())
+    };
+    if !value.is_object() {
+        return Err(format!(
+            "配置文件根节点不是 JSON 对象，未保存: {}",
+            path.display()
+        ));
+    }
+    settings.apply_to_json(&mut value)?;
+
+    let text =
+        serde_json::to_string_pretty(&value).map_err(|err| format!("序列化配置失败: {err}"))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("创建配置目录失败 {}: {err}", parent.display()))?;
+        }
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    if let Err(err) = fs::write(&tmp, format!("{text}\n")) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("写入配置临时文件失败: {err}"));
+    }
+    if fs::rename(&tmp, path).is_err() {
+        // Windows 上目标已存在时极少数文件系统会拒绝覆盖；先删目标再重试一次。
+        let _ = fs::remove_file(path);
+        if let Err(err) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("保存配置失败 {}: {err}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1443,5 +1667,196 @@ mod tests {
         // 旧行为是只关 Ken Burns，现在由静止模式统一覆盖；
         // 想只关缩放仍可在配置里写 ken_burns=false。
         assert!(cfg.ken_burns, "配置里的 ken_burns 不因 --no-motion 被改写");
+    }
+
+    fn settings_scratch_dir(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("settings-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn display_settings_defaults_match_config_defaults() {
+        let defaults = DisplaySettings::default();
+        let cfg = Config::default();
+        assert_eq!(defaults.display_layout, cfg.display_layout);
+        assert_eq!(defaults.transition, cfg.transition);
+        assert_eq!(defaults.transition_seconds, cfg.transition_seconds);
+        assert_eq!(defaults.display_seconds, cfg.display_seconds);
+        assert_eq!(defaults.motion_mode, cfg.motion_mode);
+        assert_eq!(defaults.ken_burns, cfg.ken_burns);
+        assert!(defaults.validate().is_ok());
+    }
+
+    #[test]
+    fn display_settings_validation_rejects_bad_ranges() {
+        let short = DisplaySettings {
+            display_seconds: 0.05,
+            ..Default::default()
+        };
+        assert!(short.validate().unwrap_err().contains("停留"));
+
+        let nan = DisplaySettings {
+            display_seconds: f64::NAN,
+            ..Default::default()
+        };
+        assert!(nan.validate().is_err());
+
+        let slow = DisplaySettings {
+            transition_seconds: 3.5,
+            ..Default::default()
+        };
+        assert!(slow.validate().unwrap_err().contains("切换"));
+
+        let infinite = DisplaySettings {
+            transition_seconds: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(infinite.validate().is_err());
+
+        // 0 保留旧 --fade 0 的“立即切换”语义；0.1/3.0 是边界。
+        for value in [0.0, 0.1, 3.0] {
+            let settings = DisplaySettings {
+                transition_seconds: value,
+                ..Default::default()
+            };
+            assert!(settings.validate().is_ok(), "边界值 {value} 应合法");
+        }
+    }
+
+    #[test]
+    fn display_settings_json_reads_common_and_legacy_fields() {
+        let value: Value = serde_json::from_str(
+            r#"{"display_layout":"wall","transition":"slide-up","fade_seconds":1.4,"display_seconds":18,"motion_mode":"static","ken_burns":false}"#,
+        )
+        .unwrap();
+        let settings = DisplaySettings::from_json(&value).unwrap();
+        assert_eq!(settings.display_layout, DisplayLayout::Wall);
+        assert_eq!(settings.transition, Transition::SlideUp);
+        assert!((settings.transition_seconds - 1.4).abs() < 1e-9);
+        assert!((settings.display_seconds - 18.0).abs() < 1e-9);
+        assert_eq!(settings.motion_mode, MotionMode::Static);
+        assert!(!settings.ken_burns);
+
+        // 新键优先于旧 fade_seconds。
+        let value: Value =
+            serde_json::from_str(r#"{"fade_seconds":1.4,"transition_seconds":0.5}"#).unwrap();
+        assert!(
+            (DisplaySettings::from_json(&value)
+                .unwrap()
+                .transition_seconds
+                - 0.5)
+                .abs()
+                < 1e-9
+        );
+
+        let value: Value = serde_json::from_str(r#"{"display_layout":"mosaic"}"#).unwrap();
+        assert!(DisplaySettings::from_json(&value).is_err());
+    }
+
+    #[test]
+    fn saving_display_settings_preserves_advanced_fields() {
+        let dir = settings_scratch_dir("roundtrip");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "plex_url": "http://plex:32400",
+                "plex_token": "secret",
+                "libraries": ["电影"],
+                "cache_dir": "covers",
+                "cache_days": 45,
+                "display_layout": "single",
+                "transition": "fade",
+                "fade_seconds": 1.2,
+                "display_seconds": 20,
+                "motion_mode": "animated",
+                "ken_burns": false,
+                "future_option": {"keep": true}
+            }"#,
+        )
+        .unwrap();
+
+        let mut settings = load_display_settings(Some(&path)).unwrap();
+        assert!((settings.transition_seconds - 1.2).abs() < 1e-9);
+        settings.display_layout = DisplayLayout::Wall;
+        settings.transition = Transition::SlideLeft;
+        settings.transition_seconds = 1.5;
+        settings.display_seconds = 8.0;
+        settings.motion_mode = MotionMode::Animated;
+        settings.ken_burns = true;
+        save_display_settings(Some(&path), &settings).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["plex_url"], "http://plex:32400");
+        assert_eq!(value["plex_token"], "secret");
+        assert_eq!(value["cache_dir"], "covers");
+        assert_eq!(value["cache_days"], 45);
+        assert_eq!(value["libraries"][0], "电影");
+        assert_eq!(value["future_option"]["keep"], true);
+        assert_eq!(value["display_layout"], "wall");
+        assert_eq!(value["transition"], "slide-left");
+        assert_eq!(value["display_seconds"], 8.0);
+        assert_eq!(value["ken_burns"], true);
+        assert!(
+            value.get("fade_seconds").is_none(),
+            "保存新键后应移除旧别名，避免两个时长字段并存"
+        );
+        assert_eq!(load_display_settings(Some(&path)).unwrap(), settings);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_display_settings_creates_missing_file_and_directories() {
+        let dir = settings_scratch_dir("create");
+        let path = dir.join("nested").join("config.json");
+        assert!(!path.exists());
+
+        let settings = DisplaySettings {
+            display_layout: DisplayLayout::Wall,
+            transition: Transition::Random,
+            transition_seconds: 0.8,
+            display_seconds: 12.0,
+            motion_mode: MotionMode::Static,
+            ken_burns: false,
+        };
+        save_display_settings(Some(&path), &settings).unwrap();
+        assert!(path.is_file());
+        assert_eq!(load_display_settings(Some(&path)).unwrap(), settings);
+
+        // 不存在的文件按默认值读取。
+        let missing = dir.join("missing.json");
+        assert_eq!(
+            load_display_settings(Some(&missing)).unwrap(),
+            DisplaySettings::default()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_settings_refuses_to_clobber_invalid_json() {
+        let dir = settings_scratch_dir("invalid");
+        let path = dir.join("config.json");
+        fs::write(&path, "{ not valid json").unwrap();
+        let err = save_display_settings(Some(&path), &DisplaySettings::default())
+            .expect_err("损坏配置不能被覆盖");
+        assert!(err.contains("解析失败"), "错误信息应说明解析失败: {err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_settings_path_prefers_existing_path() {
+        let dir = settings_scratch_dir("path");
+        let path = dir.join("custom.json");
+        assert_eq!(display_settings_path(Some(&path)), Some(path.clone()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

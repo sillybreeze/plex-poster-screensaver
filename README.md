@@ -130,6 +130,22 @@ Copy-Item config.example.json config.json
 - 海报墙在缓存不足 6 张时用可用数量重新排网格；只剩 1 张时退回单张布局；下载失败的部分会被跳过，全部失败则保持等待/错误状态。
 - 旧配置里的 `fade_seconds` 仍作为 `transition_seconds` 的别名读取；`--fade` 参数保留，同时控制方向滑入时长。
 
+### 显示设置窗口
+
+托盘菜单里的 **显示设置…** 会打开一个简洁的设置窗口，日常调整不用记 JSON 字段：
+
+- 布局：单张海报 / 6 张 3×2 海报墙
+- 切换效果：淡化、四方向滑入、随机方向
+- 切换时长、每张停留时间
+- 动效模式：动画 / 静止
+- 缓慢推近（Ken Burns）开关
+
+右侧预览会按当前组合循环播放（加速演示；缓存不足时用占位色块）。**恢复默认**只重置这些常用项；**保存**只写入 `config.json` 的常用字段，`plex_token`、缓存、热键等高级项原样保留，旧的 `fade_seconds` 会迁移成 `transition_seconds`。
+
+设置**下次启动屏保时生效**；命令行参数仍然在启动时覆盖配置文件中的对应项。配置文件不存在时，会在 exe 目录或 `%LOCALAPPDATA%\PlexPosterScreensaver\` 下新建；两处都不可写时保存按钮会禁用。
+
+实现与验收记录见 [docs/SETTINGS_WINDOW.md](docs/SETTINGS_WINDOW.md)。
+
 **离线播放**：缓存目录的 `index.json` 记录 ratingKey、标题、thumb 和所属媒体库；断网时用缓存轮播，恢复后自动切回在线。旧版 `1479.jpg`、`标题_1479.jpg` 会自动扫描进索引；Plex 不可用且完全没有缓存时，常驻模式会保持后台等待。
 
 **缓存文件名**：默认 `标题_ratingKey.jpg`（如 `阿凡达 水之道_1479.jpg`）；`--cache-naming key` 改为 `1479.jpg`。命中旧命名会直接改名，不重新下载。

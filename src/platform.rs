@@ -57,6 +57,8 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
 use crate::logging::{log_info, log_warn};
+use crate::plex::Cache;
+use crate::settings;
 use crate::status;
 
 const TRAY_ID: u32 = 1;
@@ -69,12 +71,15 @@ const MENU_RESUME: usize = 12;
 const MENU_CONFIG: usize = 20;
 const MENU_CACHE: usize = 21;
 const MENU_LOGS: usize = 22;
+const MENU_SETTINGS: usize = 23;
 const MENU_QUIT: usize = 30;
 
 struct Context {
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
     config_path: Option<PathBuf>,
+    settings_path: Option<PathBuf>,
+    preview_cache: Cache,
     cache_dir: PathBuf,
     log_dir: PathBuf,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
@@ -115,6 +120,8 @@ pub fn start(
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
     config_path: Option<PathBuf>,
+    settings_path: Option<PathBuf>,
+    preview_cache: Cache,
     cache_dir: PathBuf,
     log_dir: PathBuf,
 ) -> Result<Platform, String> {
@@ -130,7 +137,15 @@ pub fn start(
                 log_warn!("托盘线程 COM 初始化失败: 0x{:08X}", com.0);
             }
 
-            match create_window(proxy, status, config_path, cache_dir, log_dir) {
+            match create_window(
+                proxy,
+                status,
+                config_path,
+                settings_path,
+                preview_cache,
+                cache_dir,
+                log_dir,
+            ) {
                 Ok((hwnd, context)) => {
                     CONTEXT.with(|cell| *cell.borrow_mut() = Some(context));
                     let _ = tx.send(Ok(hwnd.0 as usize));
@@ -190,6 +205,8 @@ fn create_window(
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
     config_path: Option<PathBuf>,
+    settings_path: Option<PathBuf>,
+    preview_cache: Cache,
     cache_dir: PathBuf,
     log_dir: PathBuf,
 ) -> Result<(HWND, Context), String> {
@@ -240,6 +257,8 @@ fn create_window(
             proxy,
             status,
             config_path,
+            settings_path,
+            preview_cache,
             cache_dir,
             log_dir,
             icon,
@@ -385,6 +404,8 @@ unsafe extern "system" fn window_proc(
 unsafe fn cleanup(hwnd: HWND) {
     let _ = KillTimer(hwnd, TIMER_ID);
     let _ = WTSUnRegisterSessionNotification(hwnd);
+    // 设置窗口和托盘在同一个线程；先关掉它，避免托盘线程退出时留下可见窗口。
+    settings::close();
 
     let mut context = None;
     CONTEXT.with(|cell| {
@@ -586,6 +607,7 @@ fn show_menu(hwnd: HWND) {
         };
         append(menu, resume, MENU_RESUME, "恢复自动触发");
         append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING, MENU_SETTINGS, "显示设置…");
         let config = if config_available {
             MF_STRING
         } else {
@@ -625,6 +647,20 @@ fn handle_menu(id: usize) {
         MENU_PAUSE => send_event(UserEvent::PauseFor(Duration::from_secs(3600))),
         MENU_RESUME => send_event(UserEvent::ResumeAuto),
         MENU_QUIT => send_event(UserEvent::Quit),
+        MENU_SETTINGS => {
+            let data = with_context(|context| {
+                (
+                    context.settings_path.clone(),
+                    context.preview_cache.clone(),
+                    context.icon,
+                )
+            });
+            if let Some((path, cache, icon)) = data {
+                // 托盘窗口本身是隐藏的，不能让设置窗口成为它的 owned window，
+                // 否则可能跟着隐藏；设置窗口独立显示，退出时由 cleanup 关闭。
+                settings::open(path, cache, icon, HWND::default());
+            }
+        }
         MENU_CONFIG | MENU_CACHE | MENU_LOGS => {
             let path = with_context(|context| match id {
                 MENU_CONFIG => context.config_path.clone(),

@@ -1210,10 +1210,13 @@ impl App {
         }
 
         let tray_proxy = event_loop.create_proxy();
+        let settings_path = crate::config::display_settings_path(self.config_path.as_deref());
         match crate::platform::start(
             tray_proxy,
             self.status.clone(),
             self.config_path.clone(),
+            settings_path,
+            self.cache.clone(),
             self.cfg.cache_dir.clone(),
             crate::logging::log_dir(),
         ) {

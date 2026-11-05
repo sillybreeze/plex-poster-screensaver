@@ -588,6 +588,46 @@ pub fn draw_poster(
     }
 }
 
+/// 把海报按 UV 采样叠加到已有画面上，`offset` 为相对最终居中位置的屏幕像素偏移。
+///
+/// 不重置背景，超出画布的部分自动裁掉；供设置窗口的 CPU 转场预览使用。
+pub fn draw_poster_overlay(comp: &Composition, uv: [f32; 4], offset: (f32, f32), out: &mut [u32]) {
+    let pw = comp.poster.width() as i32;
+    let ph = comp.poster.height() as i32;
+    if pw <= 0
+        || ph <= 0
+        || comp.width == 0
+        || comp.height == 0
+        || out.len() < comp.width as usize * comp.height as usize
+    {
+        return;
+    }
+    let ox = comp.position.0 + offset.0.round() as i32;
+    let oy = comp.position.1 + offset.1.round() as i32;
+    let x0 = ox.max(0);
+    let x1 = (ox + pw).min(comp.width as i32);
+    let y0 = oy.max(0);
+    let y1 = (oy + ph).min(comp.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let dst_w = comp.width as usize;
+    let raw = comp.poster.as_raw();
+    let inv_w = 1.0 / pw as f32;
+    let inv_h = 1.0 / ph as f32;
+    for dy in y0..y1 {
+        let qy = ((dy - oy) as f32 + 0.5) * inv_h;
+        let sy = (uv[1] + qy * uv[3]) * ph as f32;
+        let row = dy as usize * dst_w;
+        for dx in x0..x1 {
+            let qx = ((dx - ox) as f32 + 0.5) * inv_w;
+            let sx = (uv[0] + qx * uv[2]) * pw as f32;
+            out[row + dx as usize] = sample_bilinear(raw, pw, ph, sx, sy);
+        }
+    }
+}
+
 /// 把海报矩形区域的背景写回去（只动这一块）。
 fn restore_background(comp: &Composition, out: &mut [u32]) {
     let pw = comp.poster.width() as i32;
@@ -687,6 +727,34 @@ mod tests {
     }
 
     const SCREEN: (u32, u32) = (1920, 1080);
+
+    #[test]
+    fn poster_overlay_clips_without_touching_outside_pixels() {
+        let img = solid(20, 30, [200, 40, 40]);
+        let comp = compose_single(img, 100, 100);
+        let packed = (200u32 << 16) | (40 << 8) | 40;
+
+        let mut out = vec![0u32; 100 * 100];
+        draw_poster_overlay(&comp, [0.0, 0.0, 1.0, 1.0], (0.0, 0.0), &mut out);
+        assert_eq!(out[50 * 100 + 50], packed);
+        assert_eq!(out[0], 0, "海报矩形外不应被覆盖");
+
+        // 完全移到画布外：一个像素都不写。
+        let mut outside = vec![0u32; 100 * 100];
+        draw_poster_overlay(&comp, [0.0, 0.0, 1.0, 1.0], (100.0, 0.0), &mut outside);
+        assert!(outside.iter().all(|value| *value == 0));
+
+        // 左移半个海报宽度：左半张被裁掉，右边缘外保持 0。
+        let offset = -(comp.poster.width() as f32 / 2.0);
+        let mut partial = vec![0u32; 100 * 100];
+        draw_poster_overlay(&comp, [0.0, 0.0, 1.0, 1.0], (offset, 0.0), &mut partial);
+        let ox = comp.position.0 + offset.round() as i32;
+        let right = ox + comp.poster.width() as i32;
+        assert_eq!(partial[50 * 100 + (right - 1) as usize], packed);
+        if right < 100 {
+            assert_eq!(partial[50 * 100 + right as usize], 0);
+        }
+    }
 
     #[test]
     fn ease_is_monotonic_and_hits_endpoints() {
