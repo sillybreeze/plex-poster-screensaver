@@ -86,6 +86,7 @@ mod platform;
 mod plex;
 mod render;
 mod settings;
+mod settings_preview;
 mod status;
 mod trigger;
 
@@ -144,7 +145,7 @@ fn main() {
         return;
     }
 
-    let config_path = config::locate_config(args.config.as_deref());
+    let mut config_path = config::locate_config(args.config.as_deref());
 
     // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
     // 只有真正要开窗口的模式才检查是否已有实例在跑。
@@ -190,6 +191,25 @@ fn main() {
             fatal_error(&format!("配置错误: {err}"), 2, popup_errors);
         }
     };
+    let settings_overrides = config::SettingsOverrides::from_args(&args);
+    if cfg.token.is_empty() && !utility {
+        log_warn!("未配置 Plex Token，先打开首次设置");
+        let preview_cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
+        let settings_path = config::display_settings_path(config_path.as_deref());
+        if let Err(err) = settings::run_modal(
+            settings_path,
+            preview_cache,
+            settings_overrides.clone(),
+            settings::Page::Plex,
+        ) {
+            log_warn!("首次设置窗口打开失败: {err}");
+        }
+        config_path = config::locate_config(args.config.as_deref());
+        cfg = match config::load(&args) {
+            Ok(cfg) => cfg,
+            Err(err) => fatal_error(&format!("配置错误: {err}"), 2, popup_errors),
+        };
+    }
     if cfg.token.is_empty() {
         fatal_error(
             "缺少 Plex Token。请设置环境变量 PLEX_TOKEN，或在 config.json 中填写 plex_token。",
@@ -326,6 +346,7 @@ fn main() {
         wanted,
         status_handle,
         config_path,
+        settings_overrides,
     );
     let result = app.run(trigger_event);
     timer::end();

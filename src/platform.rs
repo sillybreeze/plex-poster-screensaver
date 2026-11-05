@@ -56,6 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
+use crate::config::SettingsOverrides;
 use crate::logging::{log_info, log_warn};
 use crate::plex::Cache;
 use crate::settings;
@@ -80,6 +81,7 @@ struct Context {
     config_path: Option<PathBuf>,
     settings_path: Option<PathBuf>,
     preview_cache: Cache,
+    settings_overrides: SettingsOverrides,
     cache_dir: PathBuf,
     log_dir: PathBuf,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
@@ -116,12 +118,14 @@ impl Drop for Platform {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
     config_path: Option<PathBuf>,
     settings_path: Option<PathBuf>,
     preview_cache: Cache,
+    settings_overrides: SettingsOverrides,
     cache_dir: PathBuf,
     log_dir: PathBuf,
 ) -> Result<Platform, String> {
@@ -143,6 +147,7 @@ pub fn start(
                 config_path,
                 settings_path,
                 preview_cache,
+                settings_overrides,
                 cache_dir,
                 log_dir,
             ) {
@@ -201,12 +206,14 @@ fn load_app_icon() -> HICON {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_window(
     proxy: EventLoopProxy<UserEvent>,
     status: status::Shared,
     config_path: Option<PathBuf>,
     settings_path: Option<PathBuf>,
     preview_cache: Cache,
+    settings_overrides: SettingsOverrides,
     cache_dir: PathBuf,
     log_dir: PathBuf,
 ) -> Result<(HWND, Context), String> {
@@ -259,6 +266,7 @@ fn create_window(
             config_path,
             settings_path,
             preview_cache,
+            settings_overrides,
             cache_dir,
             log_dir,
             icon,
@@ -607,7 +615,7 @@ fn show_menu(hwnd: HWND) {
         };
         append(menu, resume, MENU_RESUME, "恢复自动触发");
         append(menu, MF_SEPARATOR, 0, "");
-        append(menu, MF_STRING, MENU_SETTINGS, "显示设置…");
+        append(menu, MF_STRING, MENU_SETTINGS, "设置…");
         let config = if config_available {
             MF_STRING
         } else {
@@ -653,12 +661,13 @@ fn handle_menu(id: usize) {
                     context.settings_path.clone(),
                     context.preview_cache.clone(),
                     context.icon,
+                    context.settings_overrides.clone(),
                 )
             });
-            if let Some((path, cache, icon)) = data {
+            if let Some((path, cache, icon, overrides)) = data {
                 // 托盘窗口本身是隐藏的，不能让设置窗口成为它的 owned window，
                 // 否则可能跟着隐藏；设置窗口独立显示，退出时由 cleanup 关闭。
-                settings::open(path, cache, icon, HWND::default());
+                settings::open(path, cache, icon, HWND::default(), overrides);
             }
         }
         MENU_CONFIG | MENU_CACHE | MENU_LOGS => {
@@ -677,7 +686,7 @@ fn handle_menu(id: usize) {
     }
 }
 
-fn open_path(path: &Path) {
+pub(crate) fn open_path(path: &Path) {
     if !path.exists() {
         log_warn!("要打开的路径不存在: {}", path.display());
         return;

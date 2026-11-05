@@ -511,6 +511,388 @@ impl DisplaySettings {
     }
 }
 
+/// 设置窗口编辑的完整持久化配置。
+///
+/// 与运行期 [`Config`] 分开：这里保留文件里的原始语义（例如 `cache_dir: "auto"`、
+/// 空 Token、空热键），保存时再写回 JSON，未知高级字段原样保留。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditableSettings {
+    pub plex_url: String,
+    pub plex_token: String,
+    pub libraries: Vec<String>,
+    pub verify_tls: bool,
+    pub timeout: u64,
+    pub display: DisplaySettings,
+    pub motion_fps: u32,
+    pub watch: bool,
+    pub idle_minutes: f64,
+    pub mouse_only: bool,
+    /// 空字符串表示停用热键。
+    pub hotkey: String,
+    pub cache_dir: String,
+    /// true 时保存成 `"auto"`，忽略 `cache_dir`。
+    pub cache_auto: bool,
+    pub cache_naming: Naming,
+    pub cache_days: i64,
+    pub cache_max_mb: u64,
+    pub transcode: bool,
+}
+
+impl Default for EditableSettings {
+    fn default() -> Self {
+        let cfg = Config::default();
+        let display = DisplaySettings::from_config(&cfg);
+        Self {
+            plex_url: cfg.url,
+            plex_token: cfg.token,
+            libraries: Vec::new(),
+            verify_tls: cfg.verify_tls,
+            timeout: cfg.timeout,
+            display,
+            motion_fps: cfg.motion_fps,
+            watch: cfg.watch,
+            idle_minutes: cfg.idle_seconds / 60.0,
+            mouse_only: cfg.mouse_only,
+            hotkey: cfg.hotkey.map(|hotkey| hotkey.label()).unwrap_or_default(),
+            cache_dir: cfg.cache_dir.to_string_lossy().into_owned(),
+            // 没有显式 cache_dir 时保持“自动挑选可写目录”的语义，避免
+            // GUI 保存后把默认路径固化成可能不可写的绝对路径。
+            cache_auto: true,
+            cache_naming: cfg.cache_naming,
+            cache_days: cfg.cache_days,
+            cache_max_mb: cfg.cache_max_mb,
+            transcode: cfg.transcode,
+        }
+    }
+}
+
+impl EditableSettings {
+    /// 从 config.json 读取全部持久字段；缺失项用默认值，路径按配置文件目录解析。
+    pub fn from_json(value: &Value, base: &Path) -> Result<Self, String> {
+        let display = DisplaySettings::from_json(value)?;
+        let mut settings = Self {
+            display,
+            ..Self::default()
+        };
+
+        if let Some(raw) = value.get("plex_url") {
+            settings.plex_url = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 plex_url 必须是字符串".to_string())?
+                .to_string();
+        }
+        if let Some(raw) = value.get("plex_token") {
+            settings.plex_token = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 plex_token 必须是字符串".to_string())?
+                .to_string();
+        }
+        if let Some(raw) = value.get("libraries") {
+            let items = raw
+                .as_array()
+                .ok_or_else(|| "config.json 里的 libraries 必须是数组".to_string())?;
+            let mut libraries = Vec::with_capacity(items.len());
+            for item in items {
+                let title = item
+                    .as_str()
+                    .ok_or_else(|| "config.json 里的 libraries 必须都是字符串".to_string())?;
+                libraries.push(title.to_string());
+            }
+            settings.libraries = libraries;
+        }
+        if let Some(raw) = value.get("verify_tls") {
+            settings.verify_tls = raw
+                .as_bool()
+                .ok_or_else(|| "config.json 里的 verify_tls 必须是布尔值".to_string())?;
+        }
+        if let Some(raw) = value.get("timeout") {
+            settings.timeout = raw
+                .as_u64()
+                .ok_or_else(|| "config.json 里的 timeout 必须是整数".to_string())?;
+        }
+        if let Some(raw) = value.get("motion_fps") {
+            settings.motion_fps = raw
+                .as_u64()
+                .ok_or_else(|| "config.json 里的 motion_fps 必须是整数".to_string())?
+                .try_into()
+                .map_err(|_| "config.json 里的 motion_fps 超出范围".to_string())?;
+        }
+        if let Some(raw) = value.get("watch") {
+            settings.watch = raw
+                .as_bool()
+                .ok_or_else(|| "config.json 里的 watch 必须是布尔值".to_string())?;
+        }
+        if let Some(raw) = value.get("idle_minutes") {
+            settings.idle_minutes = raw
+                .as_f64()
+                .ok_or_else(|| "config.json 里的 idle_minutes 必须是数值".to_string())?;
+        }
+        if let Some(raw) = value.get("mouse_only") {
+            settings.mouse_only = raw
+                .as_bool()
+                .ok_or_else(|| "config.json 里的 mouse_only 必须是布尔值".to_string())?;
+        }
+        if let Some(raw) = value.get("hotkey") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 hotkey 必须是字符串".to_string())?;
+            settings.hotkey = match raw.trim() {
+                "" | "none" | "off" => String::new(),
+                other => other.to_string(),
+            };
+        }
+        if let Some(raw) = value.get("cache_dir") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 cache_dir 必须是字符串".to_string())?;
+            let raw = raw.trim();
+            if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+                settings.cache_auto = true;
+                settings.cache_dir = Config::default().cache_dir.to_string_lossy().into_owned();
+            } else {
+                settings.cache_auto = false;
+                settings.cache_dir = resolve_path(base, raw).to_string_lossy().into_owned();
+            }
+        }
+        if let Some(raw) = value.get("cache_naming") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 cache_naming 必须是字符串".to_string())?;
+            settings.cache_naming = Naming::parse(raw)
+                .ok_or_else(|| format!("config.json 里的 cache_naming 无效（title|key）: {raw}"))?;
+        }
+        if let Some(raw) = value.get("cache_days") {
+            settings.cache_days = raw
+                .as_i64()
+                .ok_or_else(|| "config.json 里的 cache_days 必须是整数".to_string())?;
+        }
+        if let Some(raw) = value.get("cache_max_mb") {
+            settings.cache_max_mb = raw
+                .as_u64()
+                .ok_or_else(|| "config.json 里的 cache_max_mb 必须是整数".to_string())?;
+        }
+        if let Some(raw) = value.get("transcode") {
+            settings.transcode = raw
+                .as_bool()
+                .ok_or_else(|| "config.json 里的 transcode 必须是布尔值".to_string())?;
+        }
+        Ok(settings)
+    }
+
+    /// 只覆盖持久化字段，保留未知/高级 JSON 键；旧 `fade_seconds` 会被移除。
+    pub fn apply_to_json(&self, value: &mut Value) -> Result<(), String> {
+        self.display.apply_to_json(value)?;
+        let map = value
+            .as_object_mut()
+            .ok_or_else(|| "配置文件根节点必须是 JSON 对象".to_string())?;
+        map.insert("plex_url".to_string(), Value::String(self.plex_url.clone()));
+        map.insert(
+            "plex_token".to_string(),
+            Value::String(self.plex_token.clone()),
+        );
+        map.insert(
+            "libraries".to_string(),
+            Value::Array(
+                self.libraries
+                    .iter()
+                    .map(|title| Value::String(title.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert("verify_tls".to_string(), Value::Bool(self.verify_tls));
+        map.insert("timeout".to_string(), Value::from(self.timeout));
+        map.insert("motion_fps".to_string(), Value::from(self.motion_fps));
+        map.insert("watch".to_string(), Value::Bool(self.watch));
+        map.insert("idle_minutes".to_string(), Value::from(self.idle_minutes));
+        map.insert("mouse_only".to_string(), Value::Bool(self.mouse_only));
+        map.insert(
+            "hotkey".to_string(),
+            Value::String(if self.hotkey.trim().is_empty() {
+                "none".to_string()
+            } else {
+                self.hotkey.trim().to_string()
+            }),
+        );
+        map.insert(
+            "cache_dir".to_string(),
+            Value::String(if self.cache_auto {
+                "auto".to_string()
+            } else {
+                self.cache_dir.trim().to_string()
+            }),
+        );
+        map.insert(
+            "cache_naming".to_string(),
+            Value::String(self.cache_naming.as_str().to_string()),
+        );
+        map.insert("cache_days".to_string(), Value::from(self.cache_days));
+        map.insert("cache_max_mb".to_string(), Value::from(self.cache_max_mb));
+        map.insert("transcode".to_string(), Value::Bool(self.transcode));
+        Ok(())
+    }
+
+    /// 校验全部持久字段。`require_token=false` 用于 Token 由环境变量提供的场景。
+    pub fn validate(&self, require_token: bool) -> Result<(), String> {
+        self.display.validate()?;
+        let url = self.plex_url.trim();
+        if url.is_empty() {
+            return Err("Plex 服务器地址不能为空".to_string());
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err("Plex 服务器地址必须以 http:// 或 https:// 开头".to_string());
+        }
+        if require_token && self.plex_token.trim().is_empty() {
+            return Err("Plex Token 不能为空".to_string());
+        }
+        if !(1..=600).contains(&self.timeout) {
+            return Err("连接超时必须在 1–600 秒之间".to_string());
+        }
+        let min_idle = 5.0 / 60.0;
+        if !self.idle_minutes.is_finite() || !(min_idle..=1440.0).contains(&self.idle_minutes) {
+            return Err("空闲触发时间必须在 5 秒–24 小时之间".to_string());
+        }
+        if !(1..=120).contains(&self.motion_fps) {
+            return Err("动效帧率必须在 1–120 之间".to_string());
+        }
+        if !(0..=36_500).contains(&self.cache_days) {
+            return Err("缓存保留天数必须在 0–36500 天之间".to_string());
+        }
+        if !self.cache_auto && self.cache_dir.trim().is_empty() {
+            return Err("缓存目录不能为空；也可以勾选“自动选择”".to_string());
+        }
+        let hotkey = self.hotkey.trim();
+        if !hotkey.is_empty()
+            && !matches!(hotkey, "none" | "off")
+            && Hotkey::parse(hotkey).is_none()
+        {
+            return Err(format!("热键格式无效: {hotkey}（例：Ctrl+Alt+P）"));
+        }
+        Ok(())
+    }
+}
+
+/// 当前运行被哪些启动参数/环境变量覆盖；设置窗口只做提示，不改变保存目标。
+#[derive(Debug, Clone, Default)]
+pub struct SettingsOverrides {
+    pub plex_url: bool,
+    pub plex_token: bool,
+    pub libraries: bool,
+    pub display_seconds: bool,
+    pub transition: bool,
+    pub transition_seconds: bool,
+    pub display_layout: bool,
+    pub motion_mode: bool,
+    pub motion_fps: bool,
+    pub watch: bool,
+    pub idle: bool,
+    pub mouse_only: bool,
+    pub hotkey: bool,
+    pub verify_tls: bool,
+    pub transcode: bool,
+    pub cache_dir: bool,
+    pub cache_naming: bool,
+    pub cache_days: bool,
+    pub cache_max_mb: bool,
+}
+
+impl SettingsOverrides {
+    pub fn from_args(args: &Args) -> Self {
+        let env_url = env::var_os("PLEX_URL").is_some();
+        let env_token = env::var_os("PLEX_TOKEN").is_some();
+        Self {
+            plex_url: args.url.is_some() || env_url,
+            plex_token: args.token.is_some() || env_token,
+            libraries: !args.library.is_empty(),
+            display_seconds: args.display.is_some(),
+            transition: args.transition.is_some(),
+            transition_seconds: args.fade.is_some(),
+            display_layout: args.layout.is_some(),
+            motion_mode: args.motion.is_some() || args.no_motion,
+            motion_fps: args.motion_fps.is_some(),
+            watch: args.watch || args.now,
+            idle: args.idle.is_some(),
+            mouse_only: args.mouse_only,
+            hotkey: args.hotkey.is_some() || args.no_hotkey,
+            verify_tls: args.insecure,
+            transcode: args.no_transcode,
+            cache_dir: args.cache_dir.is_some(),
+            cache_naming: args.cache_naming.is_some(),
+            cache_days: args.cache_days.is_some(),
+            cache_max_mb: args.cache_max_mb.is_some(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.summary().is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        let mut items = Vec::new();
+        if self.plex_url {
+            items.push("Plex 地址");
+        }
+        if self.plex_token {
+            items.push("Plex Token");
+        }
+        if self.libraries {
+            items.push("媒体库");
+        }
+        if self.display_layout || self.transition || self.transition_seconds {
+            items.push("显示效果");
+        }
+        if self.display_seconds {
+            items.push("停留时间");
+        }
+        if self.motion_mode || self.motion_fps {
+            items.push("动效");
+        }
+        if self.watch || self.idle {
+            items.push("触发方式");
+        }
+        if self.mouse_only {
+            items.push("活动检测");
+        }
+        if self.hotkey {
+            items.push("热键");
+        }
+        if self.verify_tls || self.transcode {
+            items.push("Plex 高级选项");
+        }
+        if self.cache_dir || self.cache_naming || self.cache_days || self.cache_max_mb {
+            items.push("缓存");
+        }
+        items.join("、")
+    }
+}
+
+/// 读取设置窗口的完整配置；文件不存在时返回默认值。
+pub fn load_editable_settings(path: Option<&Path>) -> Result<EditableSettings, String> {
+    let Some(path) = path else {
+        return Ok(EditableSettings::default());
+    };
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|err| format!("配置文件解析失败 {}: {err}", path.display()))?;
+            EditableSettings::from_json(&value, &config_base_dir(path))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(EditableSettings::default()),
+        Err(err) => Err(format!("无法读取配置文件 {}: {err}", path.display())),
+    }
+}
+
+/// 保存完整配置；保留未知字段，写入前做范围校验（允许空 Token，由调用方决定）。
+pub fn save_editable_settings(
+    path: Option<&Path>,
+    settings: &EditableSettings,
+) -> Result<(), String> {
+    settings.validate(false)?;
+    let Some(path) = path else {
+        return Err("没有可写的配置文件位置；可用 --config 指定一个可写路径".to_string());
+    };
+    save_preserving(path, |value| settings.apply_to_json(value))
+}
+
 /// 设置窗口保存的目标：已有配置文件优先，否则在可写位置新建。
 pub fn display_settings_path(existing: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = existing {
@@ -532,6 +914,8 @@ fn probe_writable(dir: &Path) -> bool {
 }
 
 /// 读取常用显示设置；文件不存在时返回默认值。
+/// 保留给旧调用方/测试；设置中心使用 `load_editable_settings`。
+#[allow(dead_code)]
 pub fn load_display_settings(path: Option<&Path>) -> Result<DisplaySettings, String> {
     let Some(path) = path else {
         return Ok(DisplaySettings::default());
@@ -547,16 +931,11 @@ pub fn load_display_settings(path: Option<&Path>) -> Result<DisplaySettings, Str
     }
 }
 
-/// 把常用显示设置写回配置文件，保留未识别的 JSON 字段。
-pub fn save_display_settings(
-    path: Option<&Path>,
-    settings: &DisplaySettings,
+/// 读取现有 JSON，应用字段变更后原子写回；未知字段原样保留。
+fn save_preserving(
+    path: &Path,
+    apply: impl FnOnce(&mut Value) -> Result<(), String>,
 ) -> Result<(), String> {
-    let Some(path) = path else {
-        return Err("没有可写的配置文件位置；可用 --config 指定一个可写路径".to_string());
-    };
-    settings.validate()?;
-
     let mut value = if path.exists() {
         let text = fs::read_to_string(path)
             .map_err(|err| format!("无法读取配置文件 {}: {err}", path.display()))?;
@@ -571,7 +950,7 @@ pub fn save_display_settings(
             path.display()
         ));
     }
-    settings.apply_to_json(&mut value)?;
+    apply(&mut value)?;
 
     let text =
         serde_json::to_string_pretty(&value).map_err(|err| format!("序列化配置失败: {err}"))?;
@@ -600,6 +979,20 @@ pub fn save_display_settings(
         }
     }
     Ok(())
+}
+
+/// 把常用显示设置写回配置文件，保留未识别的 JSON 字段。
+/// 保留给旧调用方/测试；设置中心使用 `save_editable_settings`。
+#[allow(dead_code)]
+pub fn save_display_settings(
+    path: Option<&Path>,
+    settings: &DisplaySettings,
+) -> Result<(), String> {
+    settings.validate()?;
+    let Some(path) = path else {
+        return Err("没有可写的配置文件位置；可用 --config 指定一个可写路径".to_string());
+    };
+    save_preserving(path, |value| settings.apply_to_json(value))
 }
 
 #[derive(Debug, Default)]
@@ -1858,5 +2251,160 @@ mod tests {
         let path = dir.join("custom.json");
         assert_eq!(display_settings_path(Some(&path)), Some(path.clone()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editable_settings_round_trip_preserves_advanced_fields() {
+        let raw = r#"{
+            "plex_url": "http://192.168.1.2:32400",
+            "plex_token": "token",
+            "libraries": ["电影", "剧集"],
+            "display_layout": "wall",
+            "transition": "slide-left",
+            "fade_seconds": 1.1,
+            "transition_seconds": 0.8,
+            "display_seconds": 8,
+            "motion_mode": "static",
+            "ken_burns": false,
+            "motion_fps": 24,
+            "watch": true,
+            "idle_minutes": 7,
+            "mouse_only": true,
+            "hotkey": "Ctrl+Shift+F9",
+            "cache_dir": "covers",
+            "cache_naming": "key",
+            "cache_days": 45,
+            "cache_max_mb": 1024,
+            "verify_tls": false,
+            "timeout": 20,
+            "transcode": false,
+            "custom_advanced": {"keep": true}
+        }"#;
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        let base = Path::new("C:/base");
+        let settings = EditableSettings::from_json(&value, base).unwrap();
+
+        assert_eq!(settings.plex_url, "http://192.168.1.2:32400");
+        assert_eq!(
+            settings.libraries,
+            vec!["电影".to_string(), "剧集".to_string()]
+        );
+        assert_eq!(settings.display.display_layout, DisplayLayout::Wall);
+        assert_eq!(settings.display.transition, Transition::SlideLeft);
+        assert!((settings.display.transition_seconds - 0.8).abs() < 1e-9);
+        assert_eq!(settings.motion_fps, 24);
+        assert!(settings.mouse_only);
+        assert_eq!(settings.idle_minutes, 7.0);
+        assert_eq!(settings.cache_naming, Naming::Key);
+        assert!(!settings.cache_auto);
+        assert!(settings.cache_dir.ends_with("covers"));
+
+        settings.apply_to_json(&mut value).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(map.get("fade_seconds").is_none(), "旧字段应被迁移并删除");
+        assert!(map.get("custom_advanced").is_some(), "高级字段必须保留");
+        assert_eq!(
+            map.get("cache_dir").unwrap().as_str().unwrap(),
+            settings.cache_dir
+        );
+        assert_eq!(map.get("idle_minutes").unwrap().as_f64(), Some(7.0));
+        assert_eq!(map.get("hotkey").unwrap().as_str(), Some("Ctrl+Shift+F9"));
+    }
+
+    #[test]
+    fn editable_settings_save_and_load_round_trip() {
+        let dir = settings_scratch_dir("editable");
+        let path = dir.join("config.json");
+        let settings = EditableSettings {
+            plex_token: "secret".to_string(),
+            timeout: 22,
+            cache_days: 12,
+            cache_auto: true,
+            display: DisplaySettings {
+                display_seconds: 6.0,
+                ..DisplaySettings::default()
+            },
+            ..EditableSettings::default()
+        };
+        fs::write(&path, r#"{"plex_token":"secret","old_key":42}"#).unwrap();
+
+        save_editable_settings(Some(&path), &settings).unwrap();
+        let loaded = load_editable_settings(Some(&path)).unwrap();
+        assert_eq!(loaded.timeout, 22);
+        assert_eq!(loaded.cache_days, 12);
+        assert!((loaded.display.display_seconds - 6.0).abs() < 1e-9);
+        assert!(loaded.cache_auto);
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value.get("old_key").unwrap().as_u64(), Some(42));
+        assert_eq!(value.get("cache_dir").unwrap().as_str(), Some("auto"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editable_settings_validation_covers_all_ranges() {
+        let base = EditableSettings::default();
+        assert!(base.validate(true).is_err(), "默认没有 Token");
+        assert!(base.validate(false).is_ok(), "Token 可由环境变量提供");
+
+        let mut valid = base.clone();
+        valid.plex_url = "http://127.0.0.1:32400".to_string();
+        valid.plex_token = "token".to_string();
+        assert!(valid.validate(true).is_ok());
+        assert!(valid.validate(false).is_ok());
+
+        let mut empty_token = valid.clone();
+        empty_token.plex_token.clear();
+        assert!(empty_token.validate(false).is_ok());
+        assert!(empty_token.validate(true).is_err());
+
+        for (mutate, label) in [
+            (
+                Box::new(|s: &mut EditableSettings| s.timeout = 0)
+                    as Box<dyn Fn(&mut EditableSettings)>,
+                "timeout",
+            ),
+            (
+                Box::new(|s: &mut EditableSettings| s.idle_minutes = 0.01),
+                "idle",
+            ),
+            (
+                Box::new(|s: &mut EditableSettings| s.motion_fps = 121),
+                "fps",
+            ),
+            (
+                Box::new(|s: &mut EditableSettings| s.cache_days = 36_501),
+                "days",
+            ),
+            (
+                Box::new(|s: &mut EditableSettings| s.hotkey = "NotAKey".to_string()),
+                "hotkey",
+            ),
+            (
+                Box::new(|s: &mut EditableSettings| s.plex_url = "ftp://x".to_string()),
+                "url",
+            ),
+        ] {
+            let mut broken = valid.clone();
+            mutate(&mut broken);
+            assert!(broken.validate(false).is_err(), "{label} 应被拒绝");
+        }
+        let _ = base;
+    }
+
+    #[test]
+    fn settings_overrides_summarize_launch_overrides() {
+        let args = Args {
+            url: Some("http://x".to_string()),
+            layout: Some(DisplayLayout::Wall),
+            no_transcode: true,
+            ..Args::default()
+        };
+        let overrides = SettingsOverrides::from_args(&args);
+        assert!(overrides.plex_url);
+        assert!(overrides.display_layout);
+        assert!(overrides.transcode);
+        assert!(overrides.summary().contains("Plex 地址"));
+        assert!(overrides.summary().contains("Plex 高级选项"));
     }
 }

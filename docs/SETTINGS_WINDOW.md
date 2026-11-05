@@ -1,79 +1,73 @@
-# 显示设置窗口
+# 设置中心
 
 ## 目标
 
-给日常调整提供一个简洁入口，不必记 `config.json` 字段。窗口只暴露最常用的六项，配置文件和命令行仍然是高级用法与启动覆盖的入口。
+把日常需要的持久配置从 `config.json` 搬进 GUI，同时保留配置文件作为自动化、便携部署和高级字段的入口。设置窗口不再是只改六项显示参数的窄对话框，而是按用途分页的设置中心。
 
-## 界面
+## 页面
 
-托盘菜单 **显示设置…** 打开原生 Win32 窗口（不引入额外 GUI 依赖）：
-
-| 控件 | 含义 | 写回字段 |
+| 页面 | 内容 | 写回字段 |
 | --- | --- | --- |
-| 布局 | 单张海报 / 6 张 3×2 海报墙 | `display_layout` |
-| 切换效果 | 淡化、四方向滑入、随机方向 | `transition` |
-| 切换时长 | 0（旧 `--fade 0` 语义）或 0.1–3.0 秒 | `transition_seconds` |
-| 每张停留 | 0.1–3600 秒 | `display_seconds` |
-| 动效模式 | 动画 / 静止 | `motion_mode` |
-| 缓慢推近 | Ken Burns 开关 | `ken_burns` |
+| 显示 | 布局、切换效果、切换时长、停留时间、动效模式、Ken Burns、预览 | `display_layout`、`transition`、`transition_seconds`、`display_seconds`、`motion_mode`、`ken_burns` |
+| Plex 服务器 | 地址、Token、验证 HTTPS、超时、测试连接、媒体库多选 | `plex_url`、`plex_token`、`verify_tls`、`timeout`、`libraries` |
+| 启动与热键 | 常驻等待、空闲分钟数、只算鼠标、全局热键 | `watch`、`idle_minutes`、`mouse_only`、`hotkey` |
+| 缓存 | 目录/自动选择、命名、保留天数、容量上限、transcode | `cache_dir`、`cache_naming`、`cache_days`、`cache_max_mb`、`transcode` |
+| 高级 | 动效帧率、配置文件路径、打开配置文件/日志目录 | `motion_fps` |
+| 日志 | `app.log` 最近 300 行，只读、可滚动、每秒刷新 | 无 |
 
-布局为海报墙或动效为静止时，Ken Burns 复选框禁用但保留当前值。窗口按系统 DPI 缩放；`恢复默认` 只重置这六项，`保存`/`取消` 在底部。底部另有 **查看日志**，把右侧区域切换成只读日志视图；此时按钮变成 **返回预览**。
+窗口按系统 DPI 缩放；左侧分页，底部固定“取消/保存”，显示页保留“恢复显示默认”。
 
-## 日志查看
+## Plex 配置与首次启动
 
-- 读取 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log` 最近 300 行，显示在右侧只读多行编辑框中；只读、可滚动。
-- 打开期间每秒检查一次文件长度，有新内容才重新加载并滚到末尾；切回预览后预览定时器恢复。
-- 不读取 5MB 轮换后的 `app.1.log`，只显示当前文件；完整历史可继续用托盘菜单“打开日志目录”。
-- 日志不可读时，视图里显示具体错误和文件路径。
+- **Token 掩码**：默认以密码框显示，可勾选“显示 Token”；测试失败不会回显 Token。
+- **测试连接**：在后台线程构造临时 `Config` 并调用 `Client::sections()`，通过 `PostMessage` 回到设置窗口；成功后在列表里显示实际媒体库，按保存的标题恢复勾选。
+- **媒体库**：多选列表；全选时保存 `libraries: []`（等价于全部），部分选择时保存标题。修改媒体库名称后需要重新测试/选择。
+- **首次启动**：`config::load` 后如果 Token 为空且不是工具命令，先以模态方式打开 Plex 配置页；用户保存后重新加载配置，Token 仍为空才报错退出。没有配置文件时，保存目标由 `display_settings_path` 在 exe 目录或 `%LOCALAPPDATA%\PlexPosterScreensaver\` 中选择。
+- **覆盖提示**：窗口顶部显示当前被命令行/环境变量覆盖的字段；保存只改文件，不改变本次运行的优先级链（默认值 → 文件 → `PLEX_URL`/`PLEX_TOKEN` → CLI）。
 
-## 控制台
+## 配置模型
 
-- 正常启动（双击/开机自启/计划任务）时，用 `GetConsoleProcessList` 判断控制台是否独占；独占则 `FreeConsole` 释放，避免留下黑色终端窗口。
-- 从 `cmd`/PowerShell 启动时控制台与 shell 共用，不做处理，保留命令行输出；`--help`、`--list`、`--self-test`、`--snapshot`、`--diagnose-foreground` 仍按原样输出。
-- 控制台不可见或没有控制台时，启动阶段的致命错误（配置解析、缺 Token、缓存目录等）在写日志之外再弹 MessageBox。
-- 正常模式的提示信息改用日志宏输出，避免释放控制台后写 stdout 触发 panic。
-- 只释放控制台，不改变 PE 子系统，因此从终端运行工具命令仍能拿到 stdout。
+- `EditableSettings` 保存完整持久配置，和运行期 `Config` 分开；`cache_dir` 保留 `auto` 语义，相对路径按配置文件目录解析。
+- `load_editable_settings` / `save_editable_settings` 读写 JSON；保存只覆盖已知字段，未知/高级字段原样保留，旧 `fade_seconds` 迁移为 `transition_seconds`。
+- `save_preserving` 统一“读现有 JSON → 应用变更 → 临时文件 → rename”的原子写入路径。
+- `SettingsOverrides::from_args` 汇总 CLI/env 覆盖项，用于窗口顶部提示。
+- 保存前统一校验 URL、Token（有环境变量时允许空）、超时、空闲时间、帧率、缓存天数/目录和热键格式。
 
-## 预览
+## 保存与生效
 
-右侧 16:9 预览在 CPU 上按当前组合循环播放：
+- 保存只写 `config.json`；显示、Plex、缓存、触发等变更**下次启动生效**。窗口提示这一点，不假装热更新。
+- 配置文件不存在时自动新建；没有可写位置或现有 JSON 损坏时禁用保存，不覆盖损坏文件。
+- 缓存目录改变只影响下次启动，旧目录不会自动搬移；缓存页会明确提示。
 
-- 从缓存中最多取 12 张封面（长边缩到 360），不足两张时用占位色块。
-- 单张模式用两张场景交替；海报墙模式按当前可用数量组成 2/3/4/6 张的墙，A/B 两组错开取图。
-- 停留时间取 `display_seconds.clamp(1, 4)`（加速演示）；动画模式下按 `transition_seconds` 播放淡化或滑入；静止模式不做逐帧变化。
-- 单张滑入用背景混合 + 海报矩形覆盖，和主程序的滑入模型一致；海报墙滑入直接搬动画布。
+## 控制台与日志
 
-## 配置语义
-
-- 启动时读取顺序与主程序一致：exe 目录 → `%LOCALAPPDATA%\PlexPosterScreensaver\`。
-- 保存只覆盖六个常用字段；`apply_to_json` 保留 `plex_token`、缓存、热键等所有未知/高级字段。
-- 旧 `fade_seconds` 仍可读；保存时迁移为 `transition_seconds` 并删除旧键。
-- 设置**下次启动屏保时生效**，预览是近似演示；启动命令行参数仍优先于配置文件。
-- 没有可写位置或现有 JSON 无法解析时禁用保存并提示；不会覆盖损坏的配置。
+- 正常启动（双击/开机自启/计划任务）如果控制台是进程独占的，`FreeConsole` 释放；从 cmd/PowerShell 启动时保留共享控制台，CLI 输出仍可用。
+- 日志固定写入 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`，5MB 轮换；日志页只读显示当前文件最近 300 行，按文件长度变化刷新。
+- 控制台不可见时，启动致命错误额外弹 MessageBox。
 
 ## 实现位置
 
-- `src/config.rs`：`DisplaySettings`、读取/校验/原子保存、路径探测。
-- `src/settings.rs`：窗口/控件、原生消息循环、CPU 预览合成。
-- `src/platform.rs`：托盘菜单项、设置路径与缓存句柄传递、退出时关闭窗口。
-- `src/app.rs`：启动时计算设置路径并把缓存克隆给托盘线程。
-- `src/render.rs`：抽出的 `draw_poster_overlay`，供预览的单张滑入复用。
+- `src/config.rs`：`EditableSettings`、`SettingsOverrides`、读写/校验/迁移。
+- `src/settings.rs`：分页窗口、原生控件、后台连接测试、首次配置模态循环、保存。
+- `src/settings_preview.rs`：CPU 预览合成，移到独立模块。
+- `src/platform.rs`：托盘菜单、设置路径/缓存/覆盖信息传递。
+- `src/app.rs` / `src/main.rs`：覆盖信息传递、首次启动流程。
 
 ## 验证
 
-- `cargo test --release --offline`：101 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
-- 通过隐藏托盘窗口投递 `WM_COMMAND` 打开窗口，验证：
-  - 海报墙 + 左侧滑入 + 0.8 秒 + 8 秒 + 静止 + 关闭 Ken Burns 保存后字段正确；
-  - `custom_advanced` 等高级字段保留，`fade_seconds` 被移除；
-  - `恢复默认` 写回 `single/fade/0.6/10/animated/true`；
-  - 保存和取消都能关闭窗口；
-  - 预览能显示 6 张海报墙，并在停留结束后播放左侧滑入；
-  - 点击“查看日志”能显示 `app.log` 最近内容，再点“返回预览”恢复预览。
-- 用独立控制台启动时日志记录 `控制台状态: Hidden`，确认 `FreeConsole` 路径生效；`--help` 仍能正常输出到终端。
+- `cargo test --release --offline`：105 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
+- GUI 验证：
+  - 六个页面逐页截图，Plex 测试连接成功并列出 4 个媒体库；
+  - 保存 `wall / slide-left / 0.8s / 8s / static / Ken Burns off`、`idle=7`、`mouse_only=true`、`cache_days=45`、`cache_max_mb=1024`、`motion_fps=24` 全部写回；
+  - 高级字段 `custom_advanced` 保留；
+  - 首次启动（Token 为空）自动打开 Plex 页，填入 Token、测试连接、保存后应用继续启动；
+  - 日志页能显示 `app.log` 内容。
+- 之前验证的独立控制台 `控制台状态: Hidden` 和 `--help` 输出仍成立。
 
 ## 限制
 
-- 保存后不热应用；需要在下次启动时生效。
-- 预览使用缓存封面，缓存为空时是占位色块，不代表真实图片内容。
-- 预览的停留时间被限制在 1–4 秒，避免等待过久；真实屏保仍按 `display_seconds`。
-- 窗口按启动时系统 DPI 布局；跨显示器拖动不会重新排版控件。
+- 保存后不热应用，仍需重启屏保进程。
+- 媒体库选择保存标题而不是 Plex section key；重命名后需要重新选择。
+- 缓存目录变更不搬移旧缓存；暂无缓存清理/统计按钮。
+- 暂无 Windows 开机自启开关、Token DPAPI 加密、多配置文件切换。
+- 设置窗口的预览是加速近似，缓存不足时用占位色块。

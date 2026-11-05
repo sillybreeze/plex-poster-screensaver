@@ -18,7 +18,7 @@ use winit::platform::windows::WindowExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::config::{Config, DisplayLayout, MotionMode};
+use crate::config::{Config, DisplayLayout, MotionMode, SettingsOverrides};
 use crate::gpu::{Gpu, GpuError, PresentStatus, Textures};
 use crate::idle::{self, Idle};
 use crate::layout::WALL_POSTERS;
@@ -1047,6 +1047,7 @@ pub struct App {
     cache: Cache,
     sections: Vec<Section>,
     wanted: Vec<String>,
+    settings_overrides: SettingsOverrides,
     rx: Option<Receiver<Slide>>,
     /// 常驻隐藏时先从通道里取出来的一张，避免空闲到点却还没内容可显示。
     pending_slide: Option<Slide>,
@@ -1104,6 +1105,7 @@ impl App {
         wanted: Vec<String>,
         status: Shared,
         config_path: Option<PathBuf>,
+        settings_overrides: SettingsOverrides,
     ) -> Self {
         let now = Instant::now();
         let watch = if cfg.watch && !preview {
@@ -1129,6 +1131,7 @@ impl App {
             cache,
             sections,
             wanted,
+            settings_overrides,
             rx: None,
             pending_slide: None,
             worker_cancel: None,
@@ -1217,6 +1220,7 @@ impl App {
             self.config_path.clone(),
             settings_path,
             self.cache.clone(),
+            self.settings_overrides.clone(),
             self.cfg.cache_dir.clone(),
             crate::logging::log_dir(),
         ) {
