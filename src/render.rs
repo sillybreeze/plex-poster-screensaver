@@ -8,6 +8,9 @@ use std::path::Path;
 use image::imageops::FilterType;
 use image::{Rgb, RgbImage};
 
+use crate::config::{MotionMode, Transition};
+use crate::layout;
+
 pub const POSTER_SCALE: f32 = 1.0;
 pub const KEN_BURNS_ZOOM: f32 = 0.035;
 pub const DIRECTIONS: [(f32, f32); 6] = [
@@ -19,6 +22,9 @@ pub const DIRECTIONS: [(f32, f32); 6] = [
     (-0.7, -0.7),
 ];
 
+/// 海报墙空白处的统一低对比背景色（0xRRGGBB）。
+pub const WALL_BACKGROUND: [u8; 3] = [18, 18, 22];
+
 pub struct Composition {
     pub background: Vec<u32>,
     pub poster: RgbImage,
@@ -27,21 +33,52 @@ pub struct Composition {
     pub height: u32,
 }
 
-pub fn build(path: &Path, width: u32, height: u32) -> Result<Composition, String> {
-    // 不能依赖扩展名：Plex 可能把 PNG 内容缓存在 .jpg 文件名下。
-    // `image::open` 只看扩展名，所以这里把文件读进来，按内容识别格式。
-    let data = fs::read(path).map_err(|e| format!("读取封面失败 {}: {e}", path.display()))?;
-    build_from_bytes(&data, width, height).map_err(|e| format!("{}: {e}", path.display()))
+/// 预取线程交付的一帧：单张布局是氛围背景 + 一张居中海报，
+/// 海报墙布局是一整张已经合成好的全屏画布。
+pub enum Frame {
+    Single(Composition),
+    Wall(WallComposition),
 }
 
-/// 直接从内存里的图片字节构建；缓存目录不可写时也用这条路径。
-///
-/// `image::load_from_memory` 按文件内容判断格式，不关心扩展名。
-pub fn build_from_bytes(data: &[u8], width: u32, height: u32) -> Result<Composition, String> {
-    let img = image::load_from_memory(data)
-        .map_err(|e| format!("解码封面失败: {e}"))?
-        .to_rgb8();
-    Ok(build_from_image(img, width, height))
+pub struct WallComposition {
+    /// 全屏画布，0x00RRGGBB。
+    pub canvas: Vec<u32>,
+    pub width: u32,
+    pub height: u32,
+    /// 实际画出的海报数量（1–6）。
+    pub cards: usize,
+}
+
+impl Frame {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Single(comp) => comp.width,
+            Self::Wall(wall) => wall.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Single(comp) => comp.height,
+            Self::Wall(wall) => wall.height,
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width(), self.height())
+    }
+}
+
+/// 按内容解码；缓存里常见 PNG 内容配 `.jpg` 文件名，不能看扩展名。
+pub fn decode(data: &[u8]) -> Result<RgbImage, String> {
+    image::load_from_memory(data)
+        .map(|img| img.to_rgb8())
+        .map_err(|e| format!("解码封面失败: {e}"))
+}
+
+pub fn decode_file(path: &Path) -> Result<RgbImage, String> {
+    let data = fs::read(path).map_err(|e| format!("读取封面失败 {}: {e}", path.display()))?;
+    decode(&data).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn build_from_image(img: RgbImage, width: u32, height: u32) -> Composition {
@@ -56,6 +93,59 @@ fn build_from_image(img: RgbImage, width: u32, height: u32) -> Composition {
         position,
         width,
         height,
+    }
+}
+
+/// 单张布局：原始海报 → 完整居中海报 + 氛围背景。
+pub fn compose_single(img: RgbImage, width: u32, height: u32) -> Composition {
+    build_from_image(img, width, height)
+}
+
+/// 把一组原始海报合成为一帧。
+///
+/// 只有 1 张时退回单张布局（氛围背景 + 居中海报），不画空卡占位；
+/// 0 张返回错误，让上层沿用“暂无内容”的等待/错误状态。
+pub fn compose_wall_frame(
+    mut images: Vec<RgbImage>,
+    width: u32,
+    height: u32,
+) -> Result<Frame, String> {
+    match images.len() {
+        0 => Err("没有可用的海报".to_string()),
+        1 => Ok(Frame::Single(build_from_image(
+            images.remove(0),
+            width,
+            height,
+        ))),
+        _ => Ok(Frame::Wall(compose_wall(&images, width, height))),
+    }
+}
+
+/// 在屏幕尺寸的画布上按 3×2（或短列表网格）摆好每张海报。
+pub fn compose_wall(images: &[RgbImage], width: u32, height: u32) -> WallComposition {
+    let background = pack(WALL_BACKGROUND.map(|c| c as f32));
+    let mut canvas = vec![background; (width as usize).saturating_mul(height as usize)];
+    let cells = layout::cells_for(images.len(), width, height);
+
+    for (img, cell) in images.iter().zip(cells) {
+        let (w, h) = layout::fit_in_cell(img.width(), img.height(), &cell);
+        let scaled = image::imageops::resize(img, w, h, FilterType::Lanczos3);
+        let x = cell.x + (cell.width.saturating_sub(w)) / 2;
+        let y = cell.y + (cell.height.saturating_sub(h)) / 2;
+        for (dx, dy, px) in scaled.enumerate_pixels() {
+            let idx = (y + dy) as usize * width as usize + (x + dx) as usize;
+            if let Some(slot) = canvas.get_mut(idx) {
+                let [r, g, b] = px.0;
+                *slot = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+            }
+        }
+    }
+
+    WallComposition {
+        canvas,
+        width,
+        height,
+        cards: images.len(),
     }
 }
 
@@ -254,6 +344,184 @@ pub fn ken_burns_uv(pw: f32, ph: f32, progress: f32, direction: (f32, f32)) -> [
     [left / pw, top / ph, cw / pw, ch / ph]
 }
 
+/// 方向滑入的四条边：值表示画面从哪一侧进入中央。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SlideDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// 一次转场实际使用的效果；随机方向在开始换图时就已经选定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionKind {
+    Fade,
+    Slide(SlideDirection),
+}
+
+/// 平滑缓动（smoothstep），在 0–1 上单调递增且两端导数为 0。
+pub fn ease(progress: f32) -> f32 {
+    let t = progress.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 由 elapsed/duration 计算转场进度；时长非法时视为立即完成。
+pub fn transition_progress(elapsed_secs: f64, duration_secs: f64) -> f32 {
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        return 1.0;
+    }
+    (elapsed_secs / duration_secs).clamp(0.0, 1.0) as f32
+}
+
+/// 混合种子，避免直接用低位的规律性。
+fn mix_seed(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// 从四个方向里挑一个；如果上一张也是随机方向，尽量不和它连续重复。
+///
+/// 纯函数：同一个 seed 得到同一个结果，方向在一次转场期间不会变化。
+pub fn pick_direction(seed: u64, previous: Option<SlideDirection>) -> SlideDirection {
+    const ALL: [SlideDirection; 4] = [
+        SlideDirection::Left,
+        SlideDirection::Right,
+        SlideDirection::Up,
+        SlideDirection::Down,
+    ];
+    let mut choices = [SlideDirection::Left; 4];
+    let mut len = 0usize;
+    for direction in ALL {
+        if Some(direction) != previous {
+            choices[len] = direction;
+            len += 1;
+        }
+    }
+    let slot = (mix_seed(seed) % len as u64) as usize;
+    choices[slot]
+}
+
+/// 配置里的 `transition` 值转换为本次实际效果；`random` 用 seed 选一次方向。
+pub fn resolve_transition(
+    transition: Transition,
+    seed: u64,
+    previous: Option<SlideDirection>,
+) -> TransitionKind {
+    match transition {
+        Transition::Fade => TransitionKind::Fade,
+        Transition::SlideLeft => TransitionKind::Slide(SlideDirection::Left),
+        Transition::SlideRight => TransitionKind::Slide(SlideDirection::Right),
+        Transition::SlideUp => TransitionKind::Slide(SlideDirection::Up),
+        Transition::SlideDown => TransitionKind::Slide(SlideDirection::Down),
+        Transition::Random => TransitionKind::Slide(pick_direction(seed, previous)),
+    }
+}
+
+/// 本次换图是否需要转场。首帧、静止模式、时长为 0 都直接切到新画面。
+pub fn choose_transition(
+    transition: Transition,
+    motion: MotionMode,
+    seconds: f64,
+    has_previous: bool,
+    previous: Option<SlideDirection>,
+    seed: u64,
+) -> Option<TransitionKind> {
+    if motion == MotionMode::Static || !seconds.is_finite() || seconds <= 0.0 || !has_previous {
+        return None;
+    }
+    Some(resolve_transition(transition, seed, previous))
+}
+
+/// 方向滑入时对图层施加的偏移（屏幕像素）。
+///
+/// `rect` 是图层最终居中时的矩形 `[x, y, w, h]`；返回相对最终位置的偏移。
+/// 起点保证图层完全在画面外：左/右从左右边缘外开始，上/下从上下边缘外开始；
+/// 进度 1 时精确回到 `(0, 0)`。
+pub fn slide_offset(
+    direction: SlideDirection,
+    progress: f32,
+    rect: [f32; 4],
+    screen: (u32, u32),
+) -> (f32, f32) {
+    let [x, y, w, h] = rect;
+    let (screen_w, screen_h) = (screen.0 as f32, screen.1 as f32);
+    let (start_x, start_y) = match direction {
+        SlideDirection::Left => (-w, y),
+        SlideDirection::Right => (screen_w, y),
+        SlideDirection::Up => (x, -h),
+        SlideDirection::Down => (x, screen_h),
+    };
+    let k = 1.0 - ease(progress);
+    ((start_x - x) * k, (start_y - y) * k)
+}
+
+/// 转场中旧/新两层的透明度与偏移。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerShift {
+    /// 新画面背景层（单张布局）或整张墙面画布（海报墙）的透明度。
+    pub bg_alpha: f32,
+    /// 单张布局里海报图层的透明度；海报墙没有独立海报层，恒为 0。
+    pub poster_alpha: f32,
+    pub offset: (f32, f32),
+}
+
+/// 根据转场类型和进度计算图层参数。
+///
+/// 单张布局：背景按进度淡化，海报层保持不透明并滑入；
+/// 海报墙布局：整张画布按进度移动，露出的部分保留旧场景。
+pub fn transition_layers(
+    kind: TransitionKind,
+    progress: f32,
+    rect: [f32; 4],
+    screen: (u32, u32),
+    wall: bool,
+) -> LayerShift {
+    let t = ease(progress);
+    match kind {
+        TransitionKind::Fade => LayerShift {
+            bg_alpha: t,
+            poster_alpha: t,
+            offset: (0.0, 0.0),
+        },
+        TransitionKind::Slide(direction) => {
+            let offset = slide_offset(direction, progress, rect, screen);
+            if wall {
+                LayerShift {
+                    bg_alpha: 1.0,
+                    poster_alpha: 0.0,
+                    offset,
+                }
+            } else {
+                LayerShift {
+                    bg_alpha: t,
+                    poster_alpha: 1.0,
+                    offset,
+                }
+            }
+        }
+    }
+}
+
+/// 按布局类型把一帧画到 CPU 缓冲区，供快照与自检使用。
+pub fn draw_frame(
+    frame: &Frame,
+    progress: f32,
+    direction: (f32, f32),
+    out: &mut [u32],
+    full: bool,
+) {
+    match frame {
+        Frame::Single(comp) => draw_poster(comp, progress, direction, out, full),
+        Frame::Wall(wall) => {
+            let n = out.len().min(wall.canvas.len());
+            out[..n].copy_from_slice(&wall.canvas[..n]);
+        }
+    }
+}
+
 /// 把海报按 Ken Burns 进度画到 `out` 上。
 ///
 /// `full = false` 时只重绘海报覆盖的那一块——动效期间背景是静止的，
@@ -406,11 +674,354 @@ mod tests {
         image::save_buffer(&png, img.as_raw(), 4, 6, image::ColorType::Rgb8).unwrap();
         fs::rename(&png, &jpg_name).unwrap();
 
-        let comp = build(&jpg_name, 64, 64).expect("扩展名和内容不一致时也要能解码");
+        let comp = compose_single(
+            decode_file(&jpg_name).expect("扩展名和内容不一致时也要能解码"),
+            64,
+            64,
+        );
         assert_eq!((comp.width, comp.height), (64, 64));
         assert_eq!(comp.background.len(), 64 * 64);
         assert!(comp.poster.width() > 0 && comp.poster.height() > 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    const SCREEN: (u32, u32) = (1920, 1080);
+
+    #[test]
+    fn ease_is_monotonic_and_hits_endpoints() {
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        let mut previous = -1.0;
+        for step in 0..=100 {
+            let value = ease(step as f32 / 100.0);
+            assert!(value >= previous, "缓动必须单调: {value} < {previous}");
+            previous = value;
+        }
+        // 中点的 smoothstep 恰好是 0.5。
+        assert!((ease(0.5) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transition_progress_clamps_and_handles_bad_duration() {
+        assert_eq!(transition_progress(0.0, 1.0), 0.0);
+        assert_eq!(transition_progress(0.5, 1.0), 0.5);
+        assert_eq!(transition_progress(2.0, 1.0), 1.0);
+        assert_eq!(transition_progress(0.0, 0.0), 1.0);
+        assert_eq!(transition_progress(0.0, f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn slide_starts_fully_off_screen_and_ends_centered() {
+        let rect = [700.0, 200.0, 520.0, 680.0];
+        let cases = [
+            (SlideDirection::Left, -520.0),
+            (SlideDirection::Right, 1920.0),
+            (SlideDirection::Up, -680.0),
+            (SlideDirection::Down, 1080.0),
+        ];
+        for (direction, outside) in cases {
+            let (dx, dy) = slide_offset(direction, 0.0, rect, SCREEN);
+            // 起点：图层完全离开画面（左/右看 x，上/下看 y）。
+            match direction {
+                SlideDirection::Left => {
+                    assert!(rect[0] + dx + rect[2] <= 0.0, "左滑起点应完全离屏")
+                }
+                SlideDirection::Right => assert!(rect[0] + dx >= 1920.0, "右滑起点应完全离屏"),
+                SlideDirection::Up => assert!(rect[1] + dy + rect[3] <= 0.0, "下滑起点应完全离屏"),
+                SlideDirection::Down => assert!(rect[1] + dy >= 1080.0, "上滑起点应完全离屏"),
+            }
+            // 另一轴保持居中。
+            if matches!(direction, SlideDirection::Left | SlideDirection::Right) {
+                assert_eq!(dy, 0.0);
+            } else {
+                assert_eq!(dx, 0.0);
+            }
+            let (end_dx, end_dy) = slide_offset(direction, 1.0, rect, SCREEN);
+            assert_eq!((end_dx, end_dy), (0.0, 0.0), "结束时必须精确归位");
+            // 起点偏移方向与预期一致（左/上滑入为负，右/下滑入为正）。
+            match direction {
+                SlideDirection::Left | SlideDirection::Up => {
+                    assert!(dx < 0.0 || dy < 0.0, "上/左滑入起点偏移应为负: {outside}");
+                }
+                SlideDirection::Right | SlideDirection::Down => {
+                    assert!(dx > 0.0 || dy > 0.0, "下/右滑入起点偏移应为正: {outside}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slide_offset_is_monotonic_toward_center() {
+        let rect = [700.0, 200.0, 520.0, 680.0];
+        for direction in [
+            SlideDirection::Left,
+            SlideDirection::Right,
+            SlideDirection::Up,
+            SlideDirection::Down,
+        ] {
+            let mut previous = slide_offset(direction, 0.0, rect, SCREEN);
+            for step in 1..=50 {
+                let current = slide_offset(direction, step as f32 / 50.0, rect, SCREEN);
+                let moved_toward_center = match direction {
+                    SlideDirection::Left | SlideDirection::Up => {
+                        current.0 >= previous.0 && current.1 >= previous.1
+                    }
+                    SlideDirection::Right | SlideDirection::Down => {
+                        current.0 <= previous.0 && current.1 <= previous.1
+                    }
+                };
+                assert!(
+                    moved_toward_center,
+                    "{direction:?} 的偏移必须单调收敛: {previous:?} -> {current:?}"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn wall_slide_moves_the_whole_canvas() {
+        let rect = [0.0, 0.0, 1920.0, 1080.0];
+        let start = transition_layers(
+            TransitionKind::Slide(SlideDirection::Left),
+            0.0,
+            rect,
+            SCREEN,
+            true,
+        );
+        assert_eq!(start.bg_alpha, 1.0, "墙面画布保持不透明");
+        assert_eq!(start.poster_alpha, 0.0, "墙面没有独立海报层");
+        assert_eq!(start.offset.0, -1920.0, "整张画布完全移到左边缘外");
+
+        let end = transition_layers(
+            TransitionKind::Slide(SlideDirection::Left),
+            1.0,
+            rect,
+            SCREEN,
+            true,
+        );
+        assert_eq!(end.offset, (0.0, 0.0));
+    }
+
+    #[test]
+    fn single_slide_keeps_poster_opaque_and_fades_background() {
+        let rect = [700.0, 200.0, 520.0, 680.0];
+        let mid = transition_layers(
+            TransitionKind::Slide(SlideDirection::Right),
+            0.5,
+            rect,
+            SCREEN,
+            false,
+        );
+        assert!((mid.bg_alpha - 0.5).abs() < 1e-6);
+        assert_eq!(mid.poster_alpha, 1.0, "海报滑入时不应变成半透明残影");
+        assert!(mid.offset.0 > 0.0);
+
+        let fade = transition_layers(TransitionKind::Fade, 0.5, rect, SCREEN, false);
+        assert_eq!(fade.offset, (0.0, 0.0));
+        assert!((fade.bg_alpha - 0.5).abs() < 1e-6);
+        assert!((fade.poster_alpha - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn choose_transition_skips_first_frame_static_and_zero_duration() {
+        let seed = 42;
+        assert_eq!(
+            choose_transition(
+                Transition::SlideLeft,
+                MotionMode::Animated,
+                1.0,
+                false,
+                None,
+                seed
+            ),
+            None,
+            "首帧没有旧画面，不应做空转场"
+        );
+        assert_eq!(
+            choose_transition(
+                Transition::SlideLeft,
+                MotionMode::Static,
+                1.0,
+                true,
+                None,
+                seed
+            ),
+            None,
+            "静止模式必须跳过转场"
+        );
+        assert_eq!(
+            choose_transition(
+                Transition::Fade,
+                MotionMode::Animated,
+                0.0,
+                true,
+                None,
+                seed
+            ),
+            None,
+            "--fade 0 直接切换"
+        );
+        assert_eq!(
+            choose_transition(
+                Transition::SlideUp,
+                MotionMode::Animated,
+                1.0,
+                true,
+                None,
+                seed
+            ),
+            Some(TransitionKind::Slide(SlideDirection::Up))
+        );
+    }
+
+    #[test]
+    fn random_direction_is_stable_and_avoids_immediate_repeat() {
+        let first = pick_direction(1, None);
+        assert_eq!(first, pick_direction(1, None), "同一 seed 必须稳定");
+
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..200 {
+            seen.insert(pick_direction(seed, None));
+            let previous = pick_direction(seed, None);
+            assert_ne!(
+                pick_direction(seed, Some(previous)),
+                previous,
+                "随机方向不应与上一张连续重复"
+            );
+        }
+        assert_eq!(seen.len(), 4, "四个方向都应有可能被选中");
+
+        let _ = first;
+    }
+
+    #[test]
+    fn resolve_transition_maps_all_values() {
+        assert_eq!(
+            resolve_transition(Transition::Fade, 7, None),
+            TransitionKind::Fade
+        );
+        assert_eq!(
+            resolve_transition(Transition::SlideLeft, 7, None),
+            TransitionKind::Slide(SlideDirection::Left)
+        );
+        assert_eq!(
+            resolve_transition(Transition::SlideRight, 7, None),
+            TransitionKind::Slide(SlideDirection::Right)
+        );
+        assert_eq!(
+            resolve_transition(Transition::SlideUp, 7, None),
+            TransitionKind::Slide(SlideDirection::Up)
+        );
+        assert_eq!(
+            resolve_transition(Transition::SlideDown, 7, None),
+            TransitionKind::Slide(SlideDirection::Down)
+        );
+        assert!(matches!(
+            resolve_transition(Transition::Random, 7, None),
+            TransitionKind::Slide(_)
+        ));
+    }
+
+    fn solid(width: u32, height: u32, rgb: [u8; 3]) -> RgbImage {
+        RgbImage::from_pixel(width, height, Rgb(rgb))
+    }
+
+    #[test]
+    fn one_or_zero_images_fall_back_correctly() {
+        let single = compose_wall_frame(vec![solid(40, 60, [200, 40, 40])], 320, 180).unwrap();
+        assert!(
+            matches!(single, Frame::Single(_)),
+            "只有 1 张时应退回单张布局"
+        );
+        assert_eq!(single.size(), (320, 180));
+        match single {
+            Frame::Single(comp) => {
+                assert!(comp.poster.width() > 0 && comp.poster.height() > 0);
+                assert_eq!(comp.background.len(), 320 * 180);
+            }
+            Frame::Wall(_) => unreachable!(),
+        }
+
+        assert!(compose_wall_frame(Vec::new(), 320, 180).is_err());
+    }
+
+    #[test]
+    fn wall_canvas_has_screen_size_and_neutral_background() {
+        let images = vec![
+            solid(40, 60, [200, 40, 40]),
+            solid(40, 60, [40, 200, 40]),
+            solid(40, 60, [40, 40, 200]),
+        ];
+        let frame = compose_wall_frame(images, 640, 360).unwrap();
+        match frame {
+            Frame::Wall(wall) => {
+                assert_eq!((wall.width, wall.height), (640, 360));
+                assert_eq!(wall.canvas.len(), 640 * 360);
+                assert_eq!(wall.cards, 3);
+                let background = pack(WALL_BACKGROUND.map(|c| c as f32));
+                // 四角一定在卡片之外，应保持统一背景色。
+                for (x, y) in [(0usize, 0usize), (639, 0), (0, 359), (639, 359)] {
+                    assert_eq!(
+                        wall.canvas[y * 640 + x],
+                        background,
+                        "角点 ({x},{y}) 应是背景色"
+                    );
+                }
+            }
+            Frame::Single(_) => panic!("3 张应走海报墙"),
+        }
+    }
+
+    #[test]
+    fn wall_posters_are_drawn_inside_cells_without_overlap() {
+        let images: Vec<RgbImage> = [
+            [255u8, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 0],
+            [0, 255, 255],
+            [255, 0, 255],
+        ]
+        .into_iter()
+        .map(|rgb| solid(60, 90, rgb))
+        .collect();
+        let (width, height) = (640, 360);
+        let frame = compose_wall_frame(images, width, height).unwrap();
+        let Frame::Wall(wall) = frame else {
+            panic!("6 张应走海报墙");
+        };
+        let cells = layout::cells_for(6, width, height);
+        assert_eq!(cells.len(), 6);
+
+        for (index, cell) in cells.iter().enumerate() {
+            // 在每个格子里找该海报的纯色像素，必须全部落在格子内。
+            let expected = [
+                [255u32, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
+                [255, 255, 0],
+                [0, 255, 255],
+                [255, 0, 255],
+            ][index];
+            let packed = (expected[0] << 16) | (expected[1] << 8) | expected[2];
+            let mut found = 0;
+            for y in 0..height {
+                for x in 0..width {
+                    if wall.canvas[y as usize * width as usize + x as usize] == packed {
+                        assert!(
+                            x >= cell.x
+                                && x < cell.x + cell.width
+                                && y >= cell.y
+                                && y < cell.y + cell.height,
+                            "第 {index} 张海报的像素越出格子: ({x},{y}) 不在 {cell:?}"
+                        );
+                        found += 1;
+                    }
+                }
+            }
+            assert!(found > 0, "第 {index} 张海报没有画出来");
+        }
     }
 }

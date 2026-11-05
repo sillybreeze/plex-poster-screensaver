@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use image::RgbImage;
 use windows::Win32::Foundation::HANDLE;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -17,18 +18,35 @@ use winit::platform::windows::WindowExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, DisplayLayout, MotionMode};
 use crate::gpu::{Gpu, GpuError, PresentStatus, Textures};
 use crate::idle::{self, Idle};
+use crate::layout::WALL_POSTERS;
 use crate::logging::{log_error, log_info, log_warn, Throttle};
 use crate::platform::Platform;
 use crate::plex::{Cache, Client, MediaItem, Section};
-use crate::render::{self, Composition, DIRECTIONS};
+use crate::render::{self, Frame, SlideDirection, TransitionKind, DIRECTIONS};
 use crate::status::{self, Shared};
 
 pub struct Slide {
-    pub item: MediaItem,
-    pub comp: Composition,
+    /// 单张布局 1 张；海报墙最多 6 张（少于 6 张时按可用数量组帧）。
+    pub items: Vec<MediaItem>,
+    pub frame: Frame,
+}
+
+impl Slide {
+    pub fn size(&self) -> (u32, u32) {
+        self.frame.size()
+    }
+
+    /// 托盘/日志里显示的标题；海报墙只列第一张并标明总数。
+    pub fn title(&self) -> String {
+        match self.items.as_slice() {
+            [] => String::new(),
+            [only] => only.title.clone(),
+            [first, ..] => format!("{} 等 {} 张", first.title, self.items.len()),
+        }
+    }
 }
 
 const TASK_CANCELLED: &str = "预取任务已取消";
@@ -124,11 +142,14 @@ pub struct Source {
     next_reconnect: Instant,
     /// 用户配置的媒体库筛选；重连时仍然要按它选，不能把没选的库也播出来。
     wanted: Vec<String>,
+    /// 单张或海报墙；决定每次取一张图还是一组图。
+    layout: DisplayLayout,
     status: Shared,
     guard: TaskGuard,
 }
 
 impl Source {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
         cache: Cache,
@@ -136,6 +157,7 @@ impl Source {
         size: (u32, u32),
         wanted: Vec<String>,
         status: Shared,
+        layout: DisplayLayout,
     ) -> Self {
         Self::with_guard(
             client,
@@ -144,10 +166,12 @@ impl Source {
             size,
             wanted,
             status,
+            layout,
             TaskGuard::detached(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_guard(
         client: Client,
         cache: Cache,
@@ -155,6 +179,7 @@ impl Source {
         size: (u32, u32),
         wanted: Vec<String>,
         status: Shared,
+        layout: DisplayLayout,
         guard: TaskGuard,
     ) -> Self {
         let buffers = sections
@@ -181,6 +206,7 @@ impl Source {
                 now + RECONNECT_INTERVAL
             },
             wanted,
+            layout,
             status,
             guard,
         };
@@ -303,9 +329,11 @@ impl Source {
         }
     }
 
-    fn finish(&mut self, item: MediaItem, comp: Composition) -> Slide {
-        self.remember(&item.rating_key);
-        Slide { item, comp }
+    fn finish(&mut self, items: Vec<MediaItem>, frame: Frame) -> Slide {
+        for item in &items {
+            self.remember(&item.rating_key);
+        }
+        Slide { items, frame }
     }
 
     /// 在线取一张。只有连续多次取图失败才切离线，单个坏条目不至于让整个屏保定格。
@@ -368,10 +396,10 @@ impl Source {
                 continue;
             }
 
-            match self.slide_for(&item) {
-                Ok(comp) => {
+            match self.single_frame_for(&item) {
+                Ok(frame) => {
                     self.ensure_current()?;
-                    return Ok(Some(self.finish(item, comp)));
+                    return Ok(Some(self.finish(vec![item], frame)));
                 }
                 Err(err) => {
                     if !self.guard.is_current() {
@@ -393,14 +421,14 @@ impl Source {
     }
 
     /// 在线路径：缓存命中直接解码；命中坏缓存则删掉重下；没有缓存则下载。
-    fn slide_for(&mut self, item: &MediaItem) -> Result<Composition, String> {
+    fn image_for(&mut self, item: &MediaItem) -> Result<RgbImage, String> {
         self.ensure_current()?;
         if let Some(path) = self.cache.get(item) {
-            match render::build(&path, self.size.0, self.size.1) {
-                Ok(comp) => {
+            match render::decode_file(&path) {
+                Ok(img) => {
                     self.ensure_current()?;
                     let _ = self.commit_cache(|cache| cache.remember(item));
-                    return Ok(comp);
+                    return Ok(img);
                 }
                 Err(err) => {
                     if !self.guard.is_current() {
@@ -419,7 +447,7 @@ impl Source {
             return Err(format!("封面内容为空: {}", item.title));
         }
         // 先确认能解码再落盘，避免把坏内容存成 .jpg 后一直命中坏缓存。
-        let comp = render::build_from_bytes(&data, self.size.0, self.size.1)?;
+        let img = render::decode(&data)?;
         // 解码后、提交缓存前再检查一次，避免旧任务把结果写进正式索引。
         self.ensure_current()?;
         if self
@@ -428,21 +456,21 @@ impl Source {
         {
             return Err(TASK_CANCELLED.to_string());
         }
-        Ok(comp)
+        Ok(img)
     }
 
     /// 离线路径：只读缓存，绝不访问网络。
-    fn cached_slide(&mut self, item: &MediaItem) -> Result<Composition, String> {
+    fn cached_image(&mut self, item: &MediaItem) -> Result<RgbImage, String> {
         self.ensure_current()?;
         let path = self
             .cache
             .get(item)
             .ok_or_else(|| format!("缓存文件不存在: {}", item.title))?;
-        match render::build(&path, self.size.0, self.size.1) {
-            Ok(comp) => {
+        match render::decode_file(&path) {
+            Ok(img) => {
                 self.ensure_current()?;
                 let _ = self.commit_cache(|cache| cache.remember(item));
-                Ok(comp)
+                Ok(img)
             }
             Err(err) => {
                 if !self.guard.is_current() {
@@ -452,6 +480,24 @@ impl Source {
                 Err(err)
             }
         }
+    }
+
+    fn single_frame_for(&mut self, item: &MediaItem) -> Result<Frame, String> {
+        let img = self.image_for(item)?;
+        Ok(Frame::Single(render::compose_single(
+            img,
+            self.size.0,
+            self.size.1,
+        )))
+    }
+
+    fn cached_single_frame(&mut self, item: &MediaItem) -> Result<Frame, String> {
+        let img = self.cached_image(item)?;
+        Ok(Frame::Single(render::compose_single(
+            img,
+            self.size.0,
+            self.size.1,
+        )))
     }
 
     fn offline_next(&mut self) -> Result<Slide, String> {
@@ -465,10 +511,10 @@ impl Source {
             let Some(item) = self.offline.pop_front() else {
                 break;
             };
-            match self.cached_slide(&item) {
-                Ok(comp) => {
+            match self.cached_single_frame(&item) {
+                Ok(frame) => {
                     self.ensure_current()?;
-                    return Ok(self.finish(item, comp));
+                    return Ok(self.finish(vec![item], frame));
                 }
                 Err(err) => {
                     if !self.guard.is_current() {
@@ -485,12 +531,187 @@ impl Source {
         Err(message)
     }
 
+    /// 从在线缓冲区里凑一组不重复的条目；网络失败或库存不足时返回已凑到的部分。
+    fn online_wall_items(&mut self) -> Vec<MediaItem> {
+        if self.sections.is_empty() {
+            return Vec::new();
+        }
+        let mut picked: Vec<MediaItem> = Vec::with_capacity(WALL_POSTERS);
+        let mut empty_rounds = 0usize;
+        let mut attempts = 0usize;
+        while picked.len() < WALL_POSTERS && attempts < 300 {
+            attempts += 1;
+            if !self.guard.is_current() {
+                break;
+            }
+            let section = self.sections[self.rr % self.sections.len()].clone();
+            self.rr = self.rr.wrapping_add(1);
+            let key = section.key.clone();
+
+            let empty = self.buffers.get(&key).map(|b| b.is_empty()).unwrap_or(true);
+            if empty {
+                match self.refill(&section) {
+                    Ok(0) => {
+                        empty_rounds += 1;
+                        if empty_rounds >= self.sections.len() {
+                            log_warn!("Plex 媒体库里没有条目，改用本地缓存");
+                            self.go_offline();
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(_) => empty_rounds = 0,
+                    Err(err) => {
+                        if !self.guard.is_current() {
+                            break;
+                        }
+                        log_warn!("补充取图列表失败: {err}");
+                        self.commit_status(|current| {
+                            current.last_error = format!("补充取图列表失败: {err}");
+                        });
+                        self.go_offline();
+                        break;
+                    }
+                }
+            }
+
+            let Some(item) = self.buffers.get_mut(&key).and_then(|b| b.pop_front()) else {
+                continue;
+            };
+            // 同一面墙里不出现重复海报。
+            if picked
+                .iter()
+                .any(|picked| picked.rating_key == item.rating_key)
+            {
+                continue;
+            }
+            // 优先避开最近放过的条目；小库或试得够多时允许重复，保证墙面有内容。
+            if self.recent.contains(&item.rating_key) && attempts < 120 {
+                continue;
+            }
+            picked.push(item);
+        }
+        picked
+    }
+
+    /// 离线时从缓存队列里凑一组不重复的条目。
+    fn offline_wall_items(&mut self) -> Vec<MediaItem> {
+        if self.offline.is_empty() {
+            self.reload_offline();
+        }
+        let mut picked: Vec<MediaItem> = Vec::with_capacity(WALL_POSTERS);
+        let available = self.offline.len();
+        for _ in 0..available {
+            if picked.len() >= WALL_POSTERS {
+                break;
+            }
+            let Some(item) = self.offline.pop_front() else {
+                break;
+            };
+            if picked
+                .iter()
+                .any(|picked| picked.rating_key == item.rating_key)
+            {
+                continue;
+            }
+            picked.push(item);
+        }
+        picked
+    }
+
+    /// 逐张取图并组帧；单张失败只跳过，全部失败才返回错误。
+    fn wall_slide(&mut self, items: Vec<MediaItem>, online: bool) -> Result<Slide, String> {
+        let mut loaded: Vec<(MediaItem, RgbImage)> = Vec::with_capacity(items.len());
+        let mut errors = 0usize;
+        for item in items {
+            self.ensure_current()?;
+            let result = if online {
+                self.image_for(&item)
+            } else {
+                self.cached_image(&item)
+            };
+            match result {
+                Ok(img) => loaded.push((item, img)),
+                Err(err) => {
+                    if !self.guard.is_current() {
+                        return Err(TASK_CANCELLED.to_string());
+                    }
+                    log_warn!("海报墙取图失败 {}: {err}", item.title);
+                    errors += 1;
+                }
+            }
+        }
+
+        if loaded.is_empty() {
+            let message = if online {
+                "Plex 暂时没有可用的海报，本地也没有可用缓存".to_string()
+            } else {
+                "无法连接 Plex，本地缓存也没有可用封面".to_string()
+            };
+            self.commit_status(|current| {
+                current.last_error = message.clone();
+            });
+            return Err(message);
+        }
+        if errors > 0 {
+            log_warn!(
+                "海报墙有 {errors} 张取图失败，用剩余 {} 张继续组帧",
+                loaded.len()
+            );
+        }
+
+        let items: Vec<MediaItem> = loaded.iter().map(|(item, _)| item.clone()).collect();
+        let images: Vec<RgbImage> = loaded.into_iter().map(|(_, img)| img).collect();
+        let frame = render::compose_wall_frame(images, self.size.0, self.size.1)?;
+        if let Frame::Wall(wall) = &frame {
+            log_info!("海报墙组帧完成：{} 张海报", wall.cards);
+        }
+        self.ensure_current()?;
+        Ok(self.finish(items, frame))
+    }
+
+    fn wall_next(&mut self) -> Result<Slide, String> {
+        let mut online = self.online;
+        let mut items = if online {
+            self.online_wall_items()
+        } else {
+            Vec::new()
+        };
+        // 取列表过程中可能已经切到离线，后续取图只读缓存，不再等网络超时。
+        online = self.online && !items.is_empty();
+        if items.is_empty() {
+            online = false;
+            items = self.offline_wall_items();
+        }
+        if items.is_empty() {
+            let message = if self.online {
+                "Plex 暂时没有可用的海报".to_string()
+            } else {
+                "无法连接 Plex，本地缓存也没有可用封面".to_string()
+            };
+            self.commit_status(|current| {
+                current.last_error = message.clone();
+            });
+            return Err(message);
+        }
+
+        let slide = self.wall_slide(items, online)?;
+        self.commit_status(|current| {
+            current.online = online;
+            current.last_error.clear();
+        });
+        Ok(slide)
+    }
+
     pub fn next(&mut self) -> Result<Slide, String> {
         self.ensure_current()?;
         let now = Instant::now();
         self.cache.maintain_if_due();
         if !self.online && now >= self.next_reconnect {
             self.try_reconnect(now);
+        }
+        if self.layout == DisplayLayout::Wall {
+            return self.wall_next();
         }
         if self.online {
             match self.online_next() {
@@ -533,12 +754,14 @@ fn shuffle(items: &mut [MediaItem]) {
     }
 }
 
+/// 统一画面阶段：旧画面 → 转场（淡化或方向滑入）→ 停留/缩放。
 enum Phase {
     Idle,
-    Fade {
+    Transition {
         old: Textures,
         old_uv: [f32; 4],
         start: Instant,
+        kind: TransitionKind,
     },
     Motion {
         start: Instant,
@@ -667,6 +890,18 @@ fn resources_allowed(system_paused: bool, minimized: bool) -> bool {
 /// 尺寸资源应用的前置条件：不在系统暂停、窗口可见、且未最小化。
 fn can_apply_size(system_paused: bool, active: bool, minimized: bool) -> bool {
     active && resources_allowed(system_paused, minimized)
+}
+
+/// 只有动画模式 + 单张布局 + Ken Burns 才需要按 `motion_fps` 持续重绘。
+///
+/// 静止模式优先级最高：即使配置里 `ken_burns=true`，也只画一次然后按间隔换内容。
+fn continuous_motion_mode(motion: MotionMode, ken_burns: bool, layout: DisplayLayout) -> bool {
+    motion == MotionMode::Animated && ken_burns && layout == DisplayLayout::Single
+}
+
+/// 停留帧是否需要重绘：逐帧动效每帧都画，静止帧只在还没画过时画一次。
+fn hold_redraw_needed(continuous: bool, frame_shown: bool) -> bool {
+    continuous || !frame_shown
 }
 
 /// 暂停时先决定等待方式，避免最小化窗口继续使用过期的 GPU 重试/帧截止时间。
@@ -801,6 +1036,12 @@ pub struct App {
     slide_index: usize,
     progress: f32,
     uv: [f32; 4],
+    /// 当前停留帧是否已经画过；静止模式据此跳过重复重绘。
+    frame_shown: bool,
+    /// 上一次方向滑入用的方向，用于随机方向避免连续重复。
+    last_direction: Option<SlideDirection>,
+    /// 随机方向的种子；每换一张推进一次，方向在整段动画内保持不变。
+    seed: u64,
 
     next_frame_at: Instant,
     grace_until: Instant,
@@ -869,6 +1110,12 @@ impl App {
             slide_index: 0,
             progress: 0.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            frame_shown: false,
+            last_direction: None,
+            seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9e37_79b9_7f4a_7c15),
             next_frame_at: now,
             grace_until: now + Duration::from_millis(1500),
             pointer_start: (0.0, 0.0),
@@ -881,6 +1128,17 @@ impl App {
     }
 
     pub fn run(mut self, trigger: Option<HANDLE>) -> Result<(), String> {
+        log_info!(
+            "显示设置：布局={}（{}） 转场={}（{}，{:.1} 秒） 动效={}（{}） KenBurns={}",
+            self.cfg.display_layout.as_str(),
+            self.cfg.display_layout.label(),
+            self.cfg.transition.as_str(),
+            self.cfg.transition.label(),
+            self.cfg.transition_seconds,
+            self.cfg.motion_mode.as_str(),
+            self.cfg.motion_mode.label(),
+            if self.cfg.ken_burns { "开" } else { "关" }
+        );
         if let Some(w) = &self.watch {
             log_info!(
                 "常驻等待：空闲 {:.0} 秒后自动全屏，动鼠标/按键就收起",
@@ -1057,6 +1315,8 @@ impl App {
         self.phase = Phase::Idle;
         self.progress = 0.0;
         self.uv = [0.0, 0.0, 1.0, 1.0];
+        self.frame_shown = false;
+        self.last_direction = None;
         self.next_frame_at = now;
         self.grace_until = now + if manual { MANUAL_GRACE } else { IDLE_GRACE };
 
@@ -1084,6 +1344,8 @@ impl App {
         self.current = None;
         self.phase = Phase::Idle;
         self.progress = 0.0;
+        self.frame_shown = false;
+        self.last_direction = None;
         self.next_frame_at = now;
         // 常驻模式收起后窗口尺寸不再有意义；下次显示会按当前显示器重新计算，
         // 所以这里直接丢弃待应用尺寸，避免隐藏期间按旧尺寸做资源工作。
@@ -1123,7 +1385,7 @@ impl App {
             return;
         };
         if let Ok(slide) = rx.try_recv() {
-            if (slide.comp.width, slide.comp.height) == self.size {
+            if slide.size() == self.size {
                 self.pending_slide = Some(slide);
             }
         }
@@ -1165,10 +1427,19 @@ impl App {
         let sections = self.sections.clone();
         let wanted = self.wanted.clone();
         let status = self.status.clone();
+        let layout = self.cfg.display_layout;
 
         thread::spawn(move || {
-            let mut source =
-                Source::with_guard(client, cache, sections, size, wanted, status, guard.clone());
+            let mut source = Source::with_guard(
+                client,
+                cache,
+                sections,
+                size,
+                wanted,
+                status,
+                layout,
+                guard.clone(),
+            );
             loop {
                 if !guard.is_current() {
                     break;
@@ -1239,8 +1510,10 @@ impl App {
         }
         let target = (target.0.max(1), target.1.max(1));
         if target == self.size {
-            // 同尺寸也可能只是暂停后恢复，需要把预取线程补回来。
+            // 同尺寸也可能只是暂停后恢复，需要把预取线程补回来，并重画一帧：
+            // 静止模式不逐帧重绘，最小化/恢复后必须显式标记需要重画。
             self.ensure_worker();
+            self.frame_shown = false;
             self.next_frame_at = now;
             return;
         }
@@ -1261,6 +1534,7 @@ impl App {
         self.phase = Phase::Idle;
         self.progress = 0.0;
         self.uv = [0.0, 0.0, 1.0, 1.0];
+        self.frame_shown = false;
 
         let mut resize_error = None;
         if let Some(gpu) = &mut self.gpu {
@@ -1275,6 +1549,7 @@ impl App {
             self.gpu = None;
             self.current = None;
             self.phase = Phase::Idle;
+            self.frame_shown = false;
             self.note_gpu_failure(now, &err);
         }
 
@@ -1320,48 +1595,78 @@ impl App {
             }
         };
 
-        if (slide.comp.width, slide.comp.height) != self.size {
+        if slide.size() != self.size {
             log_warn!(
                 "丢弃尺寸不匹配的预取画面: {}x{}（当前 {}x{}）",
-                slide.comp.width,
-                slide.comp.height,
+                slide.size().0,
+                slide.size().1,
                 self.size.0,
                 self.size.1
             );
             return false;
         }
 
-        log_info!("显示: {}", slide.item.title);
+        let title = slide.title();
+        log_info!("显示: {title}");
         status::update(&self.status, |current| {
-            current.current = slide.item.title.clone();
+            current.current = title;
         });
         self.slide_index += 1;
+        self.frame_shown = false;
 
-        let Some(gpu) = &self.gpu else {
-            return false;
+        let uploaded = match &self.gpu {
+            Some(gpu) => gpu.upload(&slide.frame),
+            None => return false,
         };
-        let new_tex = match gpu.upload(
-            &slide.comp.background,
-            &slide.comp.poster,
-            slide.comp.position,
-        ) {
+        let new_tex = match uploaded {
             Ok(tex) => tex,
             Err(err) => {
-                log_error!("上传纹理失败: {err}");
+                if err.device_lost() {
+                    // 静止模式可能长时间不 Present；上传时发现设备失效也要走统一恢复。
+                    self.gpu = None;
+                    self.current = None;
+                    self.phase = Phase::Idle;
+                    self.frame_shown = false;
+                    self.note_gpu_failure(now, &err);
+                    self.next_frame_at = now;
+                } else {
+                    log_error!("上传纹理失败: {err}");
+                }
                 return false;
             }
         };
 
-        match self.current.take() {
-            Some(old) => {
+        self.seed = self
+            .seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // 随机方向只在这里选一次；整段转场都用同一个 kind。
+        let kind = render::choose_transition(
+            self.cfg.transition,
+            self.cfg.motion_mode,
+            self.cfg.transition_seconds,
+            self.current.is_some(),
+            self.last_direction,
+            self.seed,
+        );
+
+        match (self.current.take(), kind) {
+            (Some(old), Some(kind)) => {
+                if let TransitionKind::Slide(direction) = kind {
+                    self.last_direction = Some(direction);
+                }
                 self.current = Some(new_tex);
-                self.phase = Phase::Fade {
+                self.progress = 0.0;
+                self.phase = Phase::Transition {
                     old,
                     old_uv: self.uv,
                     start: now,
+                    kind,
                 };
             }
-            None => {
+            (old, _) => {
+                // 首帧、静止模式或关闭转场：旧纹理直接释放，新帧立即就位。
+                drop(old);
                 self.current = Some(new_tex);
                 self.phase = Phase::Motion { start: now };
                 self.progress = 0.0;
@@ -1372,34 +1677,58 @@ impl App {
         true
     }
 
-    fn tick(&mut self, now: Instant) {
+    /// 推进一帧；返回是否真的画了内容（静止停留时不必重复 Present）。
+    fn tick(&mut self, now: Instant) -> bool {
         let phase = std::mem::replace(&mut self.phase, Phase::Idle);
         match phase {
             Phase::Idle => {
                 if self.take_next(now) {
-                    return;
+                    return false;
                 }
                 self.next_frame_at = now + Duration::from_millis(120);
+                false
             }
-            Phase::Fade { old, old_uv, start } => {
-                let duration = self.cfg.fade_seconds.max(0.01);
-                let t = ((now - start).as_secs_f64() / duration) as f32;
-                if t >= 1.0 {
+            Phase::Transition {
+                old,
+                old_uv,
+                start,
+                kind,
+            } => {
+                let duration = self.cfg.transition_seconds.max(0.001);
+                let elapsed = (now - start).as_secs_f64();
+                if elapsed >= duration {
                     self.begin_motion(now);
+                    false
                 } else {
-                    let uv = self.uv_at(0.0);
+                    let progress = render::transition_progress(elapsed, duration);
+                    let (rect, wall) = self.current_geometry();
+                    let shift = render::transition_layers(kind, progress, rect, self.size, wall);
                     if let (Some(gpu), Some(current)) = (&self.gpu, &self.current) {
-                        // 旧图不透明打底，新图按 alpha 叠加 = 标准交叉淡化
-                        gpu.draw(&old, old_uv, 1.0);
-                        gpu.draw(current, uv, t * t * (3.0 - 2.0 * t));
+                        // 旧画面不透明打底，新画面按进度叠加/滑入。
+                        gpu.draw(&old, old_uv, 1.0, 1.0, (0.0, 0.0));
+                        gpu.draw(
+                            current,
+                            [0.0, 0.0, 1.0, 1.0],
+                            shift.bg_alpha,
+                            shift.poster_alpha,
+                            shift.offset,
+                        );
                     }
-                    self.phase = Phase::Fade { old, old_uv, start };
-                    self.next_frame_at = now + Duration::from_millis(33);
+                    self.phase = Phase::Transition {
+                        old,
+                        old_uv,
+                        start,
+                        kind,
+                    };
+                    // 转场期间沿用现有动效帧率，不新增独立配置。
+                    let fps = self.cfg.motion_fps.max(1);
+                    self.next_frame_at = now + Duration::from_millis(1000 / fps as u64);
+                    true
                 }
             }
             Phase::Motion { start } => {
                 self.phase = Phase::Motion { start };
-                self.render_motion(now, start);
+                self.render_motion(now, start)
             }
         }
     }
@@ -1407,11 +1736,34 @@ impl App {
     fn begin_motion(&mut self, now: Instant) {
         self.phase = Phase::Motion { start: now };
         self.progress = 0.0;
+        self.frame_shown = false;
         self.next_frame_at = now;
+    }
+
+    /// 当前帧的海报矩形（未偏移）以及是否为整屏画布。
+    fn current_geometry(&self) -> ([f32; 4], bool) {
+        match &self.current {
+            Some(tex) => (tex.rect(), tex.is_wall()),
+            None => (
+                [0.0, 0.0, self.size.0 as f32, self.size.1 as f32],
+                self.cfg.display_layout == DisplayLayout::Wall,
+            ),
+        }
+    }
+
+    /// 是否需要在停留期间持续重绘：只有动画模式 + 单张布局 + Ken Burns。
+    fn continuous_motion(&self) -> bool {
+        continuous_motion_mode(
+            self.cfg.motion_mode,
+            self.cfg.ken_burns,
+            self.cfg.display_layout,
+        )
     }
 
     fn uv_at(&self, progress: f32) -> [f32; 4] {
         match &self.current {
+            // 海报墙只做整屏切换，不缩放（Ken Burns 仅用于单张布局）。
+            Some(tex) if tex.is_wall() => [0.0, 0.0, 1.0, 1.0],
             Some(tex) => {
                 let rect = tex.rect();
                 render::ken_burns_uv(rect[2], rect[3], progress, self.direction())
@@ -1420,13 +1772,14 @@ impl App {
         }
     }
 
-    fn render_motion(&mut self, now: Instant, start: Instant) {
+    fn render_motion(&mut self, now: Instant, start: Instant) -> bool {
         let display = Duration::try_from_secs_f64(self.cfg.display_seconds.max(0.1))
             .unwrap_or(Duration::from_secs(10));
         let elapsed = (now - start).as_secs_f64();
-        // 切张只看 elapsed；Ken Burns 进度只负责动效。关掉动效时 progress 恒 0，
-        // 但停留时间到了仍然要换下一张。
-        let progress = if self.cfg.ken_burns {
+        let continuous = self.continuous_motion();
+        // 切张只看 elapsed；Ken Burns 进度只负责动效。静止模式下 progress 恒 0，
+        // 但停留时间到了仍然要换下一张/下一组。
+        let progress = if continuous {
             (elapsed / display.as_secs_f64()).min(1.0) as f32
         } else {
             0.0
@@ -1434,20 +1787,26 @@ impl App {
         self.progress = progress;
         self.uv = self.uv_at(progress);
 
-        if let (Some(gpu), Some(current)) = (&self.gpu, &self.current) {
-            gpu.draw(current, self.uv, 1.0);
+        // 静止帧画过一次就不再重画：静止模式、ken_burns=false 与海报墙都走这里。
+        let mut drew = false;
+        if hold_redraw_needed(continuous, self.frame_shown) {
+            if let (Some(gpu), Some(current)) = (&self.gpu, &self.current) {
+                gpu.draw(current, self.uv, 1.0, 1.0, (0.0, 0.0));
+                self.frame_shown = true;
+                drew = true;
+            }
         }
 
         if elapsed >= display.as_secs_f64() {
             if self.take_next(now) {
-                return;
+                return drew;
             }
             self.next_frame_at = now + Duration::from_millis(120);
-        } else if self.cfg.ken_burns {
+        } else if continuous {
             let fps = self.cfg.motion_fps.max(1);
             self.next_frame_at = now + Duration::from_millis(1000 / fps as u64);
         } else {
-            // 没有动效就不需要每 120ms 重画同一帧，直接等到该换张的时刻。
+            // 没有逐帧动效就不按 motion_fps 唤醒，只等到该换张/该检查输入的时刻。
             // 常驻模式还要每 500ms 醒一次检查输入（尤其宽限期结束时），
             // 不能只靠窗口事件 —— 焦点万一不在自己身上就收不起来。
             let end = start.checked_add(display).unwrap_or(now);
@@ -1460,6 +1819,7 @@ impl App {
             }
             self.next_frame_at = next;
         }
+        drew
     }
 
     fn present(&mut self) {
@@ -1477,6 +1837,7 @@ impl App {
                 self.gpu = None;
                 self.current = None;
                 self.phase = Phase::Idle;
+                self.frame_shown = false;
                 self.note_gpu_failure(now, &err);
                 self.next_frame_at = now;
             }
@@ -1540,6 +1901,7 @@ impl App {
         self.transient_log.reset();
         self.current = None;
         self.phase = Phase::Idle;
+        self.frame_shown = false;
         self.next_frame_at = now;
         self.sync_status(now);
     }
@@ -1551,6 +1913,7 @@ impl App {
         self.transient_log.reset();
         self.current = None;
         self.phase = Phase::Idle;
+        self.frame_shown = false;
         if let Some(watch) = &mut self.watch {
             watch.idle.reset(now);
             watch.next_poll = now;
@@ -1703,6 +2066,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.watch.as_ref().is_some_and(|w| !w.showing) {
                     return;
                 }
+                // 窗口尺寸变化会让当前后缓冲失效；静止模式也要重画一帧。
+                self.frame_shown = false;
                 if size.width == 0 || size.height == 0 {
                     // 最小化：保留待应用尺寸，等恢复后的非零尺寸再统一处理。
                     self.minimized = true;
@@ -1856,13 +2221,20 @@ impl ApplicationHandler<UserEvent> for App {
 
         if self.window.is_some() && self.gpu.is_some() && now >= self.next_frame_at {
             let t0 = Instant::now();
-            self.tick(now);
+            let drew = self.tick(now);
             let t1 = Instant::now();
-            self.present();
+            // 静止停留期间不重画，也就不必重复 Present。
+            if drew {
+                self.present();
+            }
             let t2 = Instant::now();
-            self.frames += 1;
+            if drew {
+                self.frames += 1;
+            }
             self.tick_us += (t1 - t0).as_secs_f64() * 1000.0;
-            self.present_us += (t2 - t1).as_secs_f64() * 1000.0;
+            if drew {
+                self.present_us += (t2 - t1).as_secs_f64() * 1000.0;
+            }
             self.report(t2);
         }
 
@@ -2162,5 +2534,86 @@ mod tests {
             render_pause_control_flow(true, true, now),
             Some(ControlFlow::WaitUntil(now + Duration::from_secs(1)))
         );
+    }
+
+    #[test]
+    fn continuous_motion_requires_animated_kenburns_single() {
+        assert!(continuous_motion_mode(
+            MotionMode::Animated,
+            true,
+            DisplayLayout::Single
+        ));
+        assert!(
+            !continuous_motion_mode(MotionMode::Animated, true, DisplayLayout::Wall),
+            "海报墙停留期间不缩放，也不按 motion_fps 重绘"
+        );
+        assert!(!continuous_motion_mode(
+            MotionMode::Animated,
+            false,
+            DisplayLayout::Single
+        ));
+        for layout in [DisplayLayout::Single, DisplayLayout::Wall] {
+            for ken_burns in [true, false] {
+                assert!(
+                    !continuous_motion_mode(MotionMode::Static, ken_burns, layout),
+                    "静止模式优先级最高"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_hold_draws_once_and_never_redraws() {
+        // 静止帧已经画过：不重画（也就不会再按 motion_fps 唤醒）。
+        assert!(!hold_redraw_needed(false, true));
+        // 刚切到新帧还没画：画一次。
+        assert!(hold_redraw_needed(false, false));
+        // 逐帧动效每帧都要画。
+        assert!(hold_redraw_needed(true, true));
+        assert!(hold_redraw_needed(true, false));
+    }
+
+    fn media(key: &str, title: &str) -> MediaItem {
+        MediaItem {
+            rating_key: key.to_string(),
+            title: title.to_string(),
+            thumb: String::new(),
+            section_key: String::new(),
+            section_title: String::new(),
+        }
+    }
+
+    fn wall_frame(cards: usize) -> Frame {
+        Frame::Wall(crate::render::WallComposition {
+            canvas: vec![0; 4],
+            width: 2,
+            height: 2,
+            cards,
+        })
+    }
+
+    #[test]
+    fn slide_title_summarizes_wall_content() {
+        let single = Slide {
+            items: vec![media("1", "阿凡达")],
+            frame: wall_frame(1),
+        };
+        assert_eq!(single.title(), "阿凡达");
+
+        let wall = Slide {
+            items: vec![
+                media("1", "阿凡达"),
+                media("2", "盗梦空间"),
+                media("3", "星际穿越"),
+            ],
+            frame: wall_frame(3),
+        };
+        assert_eq!(wall.title(), "阿凡达 等 3 张");
+
+        let empty = Slide {
+            items: Vec::new(),
+            frame: wall_frame(0),
+        };
+        assert_eq!(empty.title(), "");
     }
 }

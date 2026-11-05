@@ -32,6 +32,7 @@ mod timer {
     pub fn end() {}
 }
 mod idle;
+mod layout;
 mod logging;
 mod platform;
 mod plex;
@@ -291,9 +292,22 @@ fn run_self_test(
     count: usize,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size, wanted, status);
+    let mut source = app::Source::new(
+        client,
+        cache,
+        sections,
+        size,
+        wanted,
+        status,
+        cfg.display_layout,
+    );
 
-    println!("自检开始：{count} 张，屏幕 {}x{}", size.0, size.1);
+    println!(
+        "自检开始：{count} 张，屏幕 {}x{}，布局 {}",
+        size.0,
+        size.1,
+        cfg.display_layout.label()
+    );
     let mut total = 0.0;
     for i in 0..count {
         let started = Instant::now();
@@ -306,7 +320,7 @@ fn run_self_test(
                     i + 1,
                     count,
                     elapsed * 1000.0,
-                    slide.item.title
+                    slide.title()
                 );
             }
             Err(err) => {
@@ -316,15 +330,16 @@ fn run_self_test(
         }
     }
     println!(
-        "平均 {:.0} ms/张；淡入淡出 {:.1} 秒，停留 {:.1} 秒",
+        "平均 {:.0} ms/张；转场 {:.1} 秒（{}），停留 {:.1} 秒",
         total / count as f64 * 1000.0,
-        cfg.fade_seconds,
+        cfg.transition_seconds,
+        cfg.transition.label(),
         cfg.display_seconds
     );
 }
 
 fn run_snapshot(
-    _cfg: &Config,
+    cfg: &Config,
     client: Client,
     cache: Cache,
     sections: Vec<Section>,
@@ -333,7 +348,15 @@ fn run_snapshot(
     path: &str,
 ) {
     let size = (1920u32, 1080u32);
-    let mut source = app::Source::new(client, cache, sections, size, wanted, status);
+    let mut source = app::Source::new(
+        client,
+        cache,
+        sections,
+        size,
+        wanted,
+        status,
+        cfg.display_layout,
+    );
     let slide = match source.next() {
         Ok(s) => s,
         Err(err) => {
@@ -343,9 +366,13 @@ fn run_snapshot(
     };
 
     let mut buffer = vec![0u32; (size.0 * size.1) as usize];
-    render::draw_poster(&slide.comp, 0.0, (1.0, 0.0), &mut buffer, true);
+    render::draw_frame(&slide.frame, 0.0, (1.0, 0.0), &mut buffer, true);
     match render::save_png(&buffer, size.0, size.1, Path::new(path)) {
-        Ok(()) => println!("已导出渲染结果: {path} （{}）", slide.item.title),
+        Ok(()) => println!(
+            "已导出渲染结果: {path} （{}，{}）",
+            slide.title(),
+            cfg.display_layout.label()
+        ),
         Err(err) => {
             log_error!("{err}");
             std::process::exit(1);

@@ -44,6 +44,125 @@ impl Naming {
     }
 }
 
+/// 显示布局：单张海报或 6 张 3×2 海报墙。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayLayout {
+    #[default]
+    Single,
+    Wall,
+}
+
+impl DisplayLayout {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "single" | "one" | "单张" => Some(Self::Single),
+            "wall" | "grid" | "海报墙" => Some(Self::Wall),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Wall => "wall",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "单张海报",
+            Self::Wall => "3×2 海报墙",
+        }
+    }
+}
+
+/// 每次更换画面时的切换效果。方向值描述画面从哪一侧进入中央。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transition {
+    #[default]
+    Fade,
+    SlideLeft,
+    SlideRight,
+    SlideUp,
+    SlideDown,
+    Random,
+}
+
+impl Transition {
+    pub fn parse(raw: &str) -> Option<Self> {
+        // 同时接受 slide_left / slideleft 这类写法，配置里少踩格式坑。
+        let token = raw.trim().to_ascii_lowercase().replace('_', "-");
+        match token.as_str() {
+            "fade" | "crossfade" => Some(Self::Fade),
+            "slide-left" | "slideleft" | "left" => Some(Self::SlideLeft),
+            "slide-right" | "slideright" | "right" => Some(Self::SlideRight),
+            "slide-up" | "slideup" | "up" => Some(Self::SlideUp),
+            "slide-down" | "slidedown" | "down" => Some(Self::SlideDown),
+            "random" => Some(Self::Random),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fade => "fade",
+            Self::SlideLeft => "slide-left",
+            Self::SlideRight => "slide-right",
+            Self::SlideUp => "slide-up",
+            Self::SlideDown => "slide-down",
+            Self::Random => "random",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fade => "淡化",
+            Self::SlideLeft => "从左侧滑入",
+            Self::SlideRight => "从右侧滑入",
+            Self::SlideUp => "从上方滑入",
+            Self::SlideDown => "从下方滑入",
+            Self::Random => "随机方向",
+        }
+    }
+}
+
+/// 动效模式。`Static` 优先级最高：关闭切换动画和缩放，但仍按间隔轮播。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionMode {
+    #[default]
+    Animated,
+    Static,
+}
+
+impl MotionMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "animated" | "animate" | "动画" => Some(Self::Animated),
+            "static" | "still" | "静止" => Some(Self::Static),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Animated => "animated",
+            Self::Static => "static",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Animated => "动画",
+            Self::Static => "静止",
+        }
+    }
+}
+
+/// 转场时长的默认值、允许范围与旧参数的 0 值兼容规则。
+pub const DEFAULT_TRANSITION_SECONDS: f64 = 0.6;
+pub const MIN_TRANSITION_SECONDS: f64 = 0.1;
+pub const MAX_TRANSITION_SECONDS: f64 = 3.0;
+
 /// 全局热键，比如 Ctrl+Alt+P。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
@@ -186,7 +305,11 @@ pub struct Config {
     pub token: String,
     pub libraries: Vec<String>,
     pub display_seconds: f64,
-    pub fade_seconds: f64,
+    /// 画面切换时长；0 表示不做转场（兼容旧 `--fade 0`）。
+    pub transition_seconds: f64,
+    pub display_layout: DisplayLayout,
+    pub transition: Transition,
+    pub motion_mode: MotionMode,
     pub cache_dir: PathBuf,
     pub cache_location: CacheLocation,
     /// 缓存文件用哪种命名
@@ -216,7 +339,10 @@ impl Default for Config {
             token: String::new(),
             libraries: Vec::new(),
             display_seconds: 10.0,
-            fade_seconds: 1.2,
+            transition_seconds: DEFAULT_TRANSITION_SECONDS,
+            display_layout: DisplayLayout::default(),
+            transition: Transition::default(),
+            motion_mode: MotionMode::default(),
             cache_dir: app_dir().join("covers"),
             cache_location: CacheLocation::Default,
             cache_naming: Naming::default(),
@@ -263,6 +389,9 @@ pub struct Args {
     pub preview: bool,
     pub display: Option<f64>,
     pub fade: Option<f64>,
+    pub layout: Option<DisplayLayout>,
+    pub transition: Option<Transition>,
+    pub motion: Option<MotionMode>,
     pub motion_fps: Option<u32>,
     pub no_motion: bool,
     pub no_transcode: bool,
@@ -297,8 +426,13 @@ plex-poster-screensaver (Rust)
   --list                列出媒体库后退出
   --diagnose-foreground <秒>  等待 N 秒后打印前台窗口诊断信息（全屏识别排查）
   --display <秒>        每张停留时间，默认 10（0.1–3600）
-  --fade <秒>           淡入淡出时长，默认 1.2（0–60），0 表示关闭
-  --no-motion           关闭 Ken Burns 缓慢推近（轮播继续）
+  --layout <布局>       single=单张海报（默认），wall=6 张 3×2 海报墙
+  --transition <效果>   fade=淡化（默认）、slide-left/slide-right/slide-up/slide-down
+                        从对应一侧滑入、random=随机方向
+  --fade <秒>           转场时长，默认 0.6（0 或 0.1–3，0 表示关闭）；旧参数名，
+                        同时控制方向滑入时长
+  --motion <模式>       animated=带动效（默认），static=静止轮播（无转场、无缩放）
+  --no-motion           等同 --motion static（保留兼容）
   --motion-fps <帧率>   动效帧率，默认 30（1–120）
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
@@ -322,8 +456,12 @@ plex-poster-screensaver (Rust)
 ";
 
 pub fn parse_args() -> Result<Args, String> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args::default();
-    let mut it = env::args().skip(1);
+    let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} 缺少参数值"));
         match arg.as_str() {
@@ -341,6 +479,28 @@ pub fn parse_args() -> Result<Args, String> {
             "--preview" => args.preview = true,
             "--display" => args.display = Some(parse_num(&value("--display")?)?),
             "--fade" => args.fade = Some(parse_num(&value("--fade")?)?),
+            "--layout" => {
+                let raw = value("--layout")?;
+                args.layout = Some(
+                    DisplayLayout::parse(&raw)
+                        .ok_or_else(|| format!("--layout 的参数无效: {raw}（single|wall）"))?,
+                );
+            }
+            "--transition" => {
+                let raw = value("--transition")?;
+                args.transition = Some(Transition::parse(&raw).ok_or_else(|| {
+                    format!(
+                        "--transition 的参数无效: {raw}（fade|slide-left|slide-right|slide-up|slide-down|random）"
+                    )
+                })?);
+            }
+            "--motion" => {
+                let raw = value("--motion")?;
+                args.motion = Some(
+                    MotionMode::parse(&raw)
+                        .ok_or_else(|| format!("--motion 的参数无效: {raw}（animated|static）"))?,
+                );
+            }
             "--motion-fps" => args.motion_fps = Some(parse_num(&value("--motion-fps")?)?),
             "--no-motion" => args.no_motion = true,
             "--no-transcode" => args.no_transcode = true,
@@ -387,7 +547,12 @@ struct FileConfig {
     plex_token: Option<String>,
     libraries: Option<Vec<String>>,
     display_seconds: Option<f64>,
+    /// 旧字段名；作为 `transition_seconds` 的兼容别名读取。
     fade_seconds: Option<f64>,
+    transition_seconds: Option<f64>,
+    display_layout: Option<String>,
+    transition: Option<String>,
+    motion_mode: Option<String>,
     cache_dir: Option<String>,
     cache_naming: Option<String>,
     cache_days: Option<i64>,
@@ -429,77 +594,11 @@ pub fn load(args: &Args) -> Result<Config, String> {
             Ok(text) => match serde_json::from_str::<FileConfig>(&text) {
                 Ok(file) => {
                     let base = config_base_dir(&path);
-                    if let Some(v) = file.plex_url {
-                        cfg.url = v;
-                    }
-                    if let Some(v) = file.plex_token {
-                        cfg.token = v;
-                    }
-                    if let Some(v) = file.libraries {
-                        cfg.libraries = v;
-                    }
-                    if let Some(v) = file.display_seconds {
-                        cfg.display_seconds = v;
-                    }
-                    if let Some(v) = file.fade_seconds {
-                        cfg.fade_seconds = v;
-                    }
-                    if let Some(v) = file.cache_dir {
-                        file_cache_dir = Some(v);
+                    if let Some(v) = &file.cache_dir {
+                        file_cache_dir = Some(v.clone());
                         file_cache_base = Some(base);
                     }
-                    if let Some(v) = &file.cache_naming {
-                        match Naming::parse(v) {
-                            Some(n) => cfg.cache_naming = n,
-                            None => {
-                                log_warn!("config.json 里的 cache_naming 无效（title|key）: {v}")
-                            }
-                        }
-                    }
-                    if let Some(v) = file.cache_days {
-                        cfg.cache_days = v;
-                    }
-                    if let Some(v) = file.cache_max_mb {
-                        cfg.cache_max_mb = v;
-                    }
-                    if let Some(v) = file.verify_tls {
-                        cfg.verify_tls = v;
-                    }
-                    if let Some(v) = file.transcode {
-                        cfg.transcode = v;
-                    }
-                    if let Some(v) = file.timeout {
-                        cfg.timeout = v;
-                    }
-                    if let Some(v) = file.ken_burns {
-                        cfg.ken_burns = v;
-                    }
-                    if let Some(v) = file.motion_fps {
-                        cfg.motion_fps = v;
-                    }
-                    if let Some(v) = file.watch {
-                        cfg.watch = v;
-                    }
-                    if let Some(v) = file.idle_minutes {
-                        cfg.idle_seconds = v * 60.0;
-                    }
-                    if let Some(v) = file.mouse_only {
-                        cfg.mouse_only = v;
-                    }
-                    if let Some(v) = &file.hotkey {
-                        let v = v.trim();
-                        if v.is_empty()
-                            || v.eq_ignore_ascii_case("none")
-                            || v.eq_ignore_ascii_case("off")
-                        {
-                            cfg.hotkey = None;
-                        } else {
-                            match Hotkey::parse(v) {
-                                Some(h) => cfg.hotkey = Some(h),
-                                None => log_warn!("config.json 里的 hotkey 无效，已忽略: {v}"),
-                            }
-                        }
-                    }
+                    apply_file(&mut cfg, &file)?;
                     log_info!("已加载配置: {}", path.display());
                 }
                 Err(err) => {
@@ -525,6 +624,118 @@ pub fn load(args: &Args) -> Result<Config, String> {
         cfg.token = v;
     }
 
+    apply_args(&mut cfg, args);
+
+    let default_cache = cfg.cache_dir.clone();
+    let file_base = file_cache_base.as_deref().unwrap_or_else(|| Path::new("."));
+    let (location, dir) = choose_cache_dir(
+        &default_cache,
+        file_cache_dir.as_deref(),
+        args.cache_dir.as_deref(),
+        file_base,
+    );
+    cfg.cache_location = location;
+    cfg.cache_dir = dir;
+
+    cfg.url = cfg.url.trim_end_matches('/').to_string();
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// 把 config.json 的字段合并进配置。
+///
+/// 旧字段 `fade_seconds` 继续作为 `transition_seconds` 的别名；同时出现时新键优先。
+/// 未知的布局/转场/动效值直接报错，错误信息带 JSON 键名。
+fn apply_file(cfg: &mut Config, file: &FileConfig) -> Result<(), String> {
+    if let Some(v) = &file.plex_url {
+        cfg.url = v.clone();
+    }
+    if let Some(v) = &file.plex_token {
+        cfg.token = v.clone();
+    }
+    if let Some(v) = &file.libraries {
+        cfg.libraries = v.clone();
+    }
+    if let Some(v) = file.display_seconds {
+        cfg.display_seconds = v;
+    }
+    if let Some(v) = file.fade_seconds {
+        cfg.transition_seconds = v;
+    }
+    if let Some(v) = file.transition_seconds {
+        cfg.transition_seconds = v;
+    }
+    if let Some(raw) = &file.display_layout {
+        cfg.display_layout = DisplayLayout::parse(raw)
+            .ok_or_else(|| format!("config.json 里的 display_layout 无效（single|wall）: {raw}"))?;
+    }
+    if let Some(raw) = &file.transition {
+        cfg.transition = Transition::parse(raw).ok_or_else(|| {
+            format!(
+                "config.json 里的 transition 无效（fade|slide-left|slide-right|slide-up|slide-down|random）: {raw}"
+            )
+        })?;
+    }
+    if let Some(raw) = &file.motion_mode {
+        cfg.motion_mode = MotionMode::parse(raw).ok_or_else(|| {
+            format!("config.json 里的 motion_mode 无效（animated|static）: {raw}")
+        })?;
+    }
+    if let Some(v) = &file.cache_naming {
+        match Naming::parse(v) {
+            Some(n) => cfg.cache_naming = n,
+            None => log_warn!("config.json 里的 cache_naming 无效（title|key）: {v}"),
+        }
+    }
+    if let Some(v) = file.cache_days {
+        cfg.cache_days = v;
+    }
+    if let Some(v) = file.cache_max_mb {
+        cfg.cache_max_mb = v;
+    }
+    if let Some(v) = file.verify_tls {
+        cfg.verify_tls = v;
+    }
+    if let Some(v) = file.transcode {
+        cfg.transcode = v;
+    }
+    if let Some(v) = file.timeout {
+        cfg.timeout = v;
+    }
+    if let Some(v) = file.ken_burns {
+        cfg.ken_burns = v;
+    }
+    if let Some(v) = file.motion_fps {
+        cfg.motion_fps = v;
+    }
+    if let Some(v) = file.watch {
+        cfg.watch = v;
+    }
+    if let Some(v) = file.idle_minutes {
+        cfg.idle_seconds = v * 60.0;
+    }
+    if let Some(v) = file.mouse_only {
+        cfg.mouse_only = v;
+    }
+    if let Some(v) = &file.hotkey {
+        let v = v.trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+            cfg.hotkey = None;
+        } else {
+            match Hotkey::parse(v) {
+                Some(h) => cfg.hotkey = Some(h),
+                None => log_warn!("config.json 里的 hotkey 无效，已忽略: {v}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 命令行覆盖；优先级固定为 CLI > 环境/文件 > 默认值，且与参数出现顺序无关。
+///
+/// `--no-motion` 是 `--motion static` 的快捷方式：两者都要求静止；
+/// 若同时给了 `--motion animated`，按“静止优先”处理而不是看谁写在后面。
+fn apply_args(cfg: &mut Config, args: &Args) {
     if let Some(v) = &args.url {
         cfg.url = v.clone();
     }
@@ -534,14 +745,24 @@ pub fn load(args: &Args) -> Result<Config, String> {
     if let Some(v) = args.display {
         cfg.display_seconds = v;
     }
+    // --fade 是旧参数名，现在只作为转场时长的别名。
     if let Some(v) = args.fade {
-        cfg.fade_seconds = v;
+        cfg.transition_seconds = v;
+    }
+    if let Some(v) = args.layout {
+        cfg.display_layout = v;
+    }
+    if let Some(v) = args.transition {
+        cfg.transition = v;
+    }
+    if let Some(v) = args.motion {
+        cfg.motion_mode = v;
+    }
+    if args.no_motion {
+        cfg.motion_mode = MotionMode::Static;
     }
     if let Some(v) = args.motion_fps {
         cfg.motion_fps = v;
-    }
-    if args.no_motion {
-        cfg.ken_burns = false;
     }
     if args.watch {
         cfg.watch = true;
@@ -576,21 +797,6 @@ pub fn load(args: &Args) -> Result<Config, String> {
     if let Some(v) = args.cache_max_mb {
         cfg.cache_max_mb = v;
     }
-
-    let default_cache = cfg.cache_dir.clone();
-    let file_base = file_cache_base.as_deref().unwrap_or_else(|| Path::new("."));
-    let (location, dir) = choose_cache_dir(
-        &default_cache,
-        file_cache_dir.as_deref(),
-        args.cache_dir.as_deref(),
-        file_base,
-    );
-    cfg.cache_location = location;
-    cfg.cache_dir = dir;
-
-    cfg.url = cfg.url.trim_end_matches('/').to_string();
-    validate(&cfg)?;
-    Ok(cfg)
 }
 
 /// 配置合并完成后统一校验；错误信息带字段名，便于定位命令行或 config.json。
@@ -601,7 +807,7 @@ fn validate(cfg: &Config) -> Result<(), String> {
         0.1,
         3600.0,
     )?;
-    check_seconds("fade_seconds（--fade）", cfg.fade_seconds, 0.0, 60.0)?;
+    check_transition_seconds(cfg.transition_seconds)?;
     check_seconds(
         "idle_seconds（--idle / idle_minutes）",
         cfg.idle_seconds,
@@ -642,6 +848,27 @@ fn check_seconds(name: &str, value: f64, min: f64, max: f64) -> Result<(), Strin
     }
     Duration::try_from_secs_f64(value)
         .map_err(|err| format!("{name} 无法转换为时间间隔: {err}"))?;
+    Ok(())
+}
+
+/// 校验转场时长：有限，且为旧的 0（立即切换）或新的 0.1–3.0 秒范围。
+///
+/// 0 是 `--fade 0` 的历史语义，保留下来避免已有启动脚本失效；
+/// 其余 0.1 以下的值仍按越界处理，避免出现一闪而过、比一帧还短的转场。
+fn check_transition_seconds(value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!(
+            "transition_seconds（--fade） 必须是有限数值，当前为 {value}"
+        ));
+    }
+    let legacy_off = value == 0.0;
+    if !legacy_off && !(MIN_TRANSITION_SECONDS..=MAX_TRANSITION_SECONDS).contains(&value) {
+        return Err(format!(
+            "transition_seconds（--fade） 超出允许范围 {MIN_TRANSITION_SECONDS}..={MAX_TRANSITION_SECONDS} 秒（0 表示关闭），当前为 {value}"
+        ));
+    }
+    Duration::try_from_secs_f64(value)
+        .map_err(|err| format!("transition_seconds（--fade） 无法转换为时间间隔: {err}"))?;
     Ok(())
 }
 
@@ -825,23 +1052,37 @@ mod tests {
         );
 
         rejected(
-            "fade_seconds",
+            "transition_seconds",
             Config {
-                fade_seconds: f64::INFINITY,
+                transition_seconds: f64::INFINITY,
                 ..Default::default()
             },
         );
         rejected(
-            "fade_seconds",
+            "transition_seconds",
             Config {
-                fade_seconds: -0.1,
+                transition_seconds: f64::NAN,
                 ..Default::default()
             },
         );
         rejected(
-            "fade_seconds",
+            "transition_seconds",
             Config {
-                fade_seconds: 60.1,
+                transition_seconds: -0.1,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "transition_seconds",
+            Config {
+                transition_seconds: 0.05,
+                ..Default::default()
+            },
+        );
+        rejected(
+            "transition_seconds",
+            Config {
+                transition_seconds: 3.1,
                 ..Default::default()
             },
         );
@@ -921,33 +1162,286 @@ mod tests {
 
     #[test]
     fn accepts_valid_boundaries_and_zero_fade() {
-        let mut cfg = Config::default();
-        cfg.display_seconds = 0.1;
-        cfg.fade_seconds = 0.0;
-        cfg.idle_seconds = 5.0;
-        cfg.timeout = 1;
-        cfg.cache_days = 0;
-        cfg.motion_fps = 1;
+        let min = Config {
+            display_seconds: 0.1,
+            transition_seconds: 0.0,
+            idle_seconds: 5.0,
+            timeout: 1,
+            cache_days: 0,
+            motion_fps: 1,
+            ..Default::default()
+        };
         assert!(
-            validate(&cfg).is_ok(),
+            validate(&min).is_ok(),
             "最小边界应合法: {:?}",
-            validate(&cfg)
+            validate(&min)
         );
 
-        cfg.display_seconds = 3600.0;
-        cfg.fade_seconds = 60.0;
-        cfg.idle_seconds = 86_400.0;
-        cfg.timeout = 600;
-        cfg.cache_days = 36_500;
-        cfg.motion_fps = 120;
+        let max = Config {
+            display_seconds: 3600.0,
+            transition_seconds: 3.0,
+            idle_seconds: 86_400.0,
+            timeout: 600,
+            cache_days: 36_500,
+            motion_fps: 120,
+            ..Default::default()
+        };
         assert!(
-            validate(&cfg).is_ok(),
+            validate(&max).is_ok(),
             "最大边界应合法: {:?}",
-            validate(&cfg)
+            validate(&max)
         );
 
-        // 负零按 0 处理，淡入淡出允许关闭。
-        cfg.fade_seconds = -0.0;
+        // 负零按 0 处理：旧的 --fade 0 仍然表示立即切换。
+        let negative_zero = Config {
+            transition_seconds: -0.0,
+            ..Default::default()
+        };
+        assert!(validate(&negative_zero).is_ok());
+
+        // 0.1 秒是新的最小时长。
+        let minimum = Config {
+            transition_seconds: 0.1,
+            ..Default::default()
+        };
+        assert!(validate(&minimum).is_ok());
+    }
+
+    #[test]
+    fn parses_display_layout_values() {
+        assert_eq!(DisplayLayout::parse("single"), Some(DisplayLayout::Single));
+        assert_eq!(DisplayLayout::parse(" WALL "), Some(DisplayLayout::Wall));
+        assert_eq!(DisplayLayout::parse("海报墙"), Some(DisplayLayout::Wall));
+        assert_eq!(DisplayLayout::parse("mosaic"), None);
+        assert_eq!(DisplayLayout::Single.as_str(), "single");
+        assert_eq!(DisplayLayout::Wall.as_str(), "wall");
+    }
+
+    #[test]
+    fn parses_transition_values() {
+        let cases = [
+            ("fade", Transition::Fade),
+            ("slide-left", Transition::SlideLeft),
+            ("slide_left", Transition::SlideLeft),
+            ("SLIDE-RIGHT", Transition::SlideRight),
+            ("slide-up", Transition::SlideUp),
+            ("slide-down", Transition::SlideDown),
+            ("random", Transition::Random),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(Transition::parse(raw), Some(expected), "解析 {raw}");
+        }
+        assert_eq!(Transition::parse("wipe"), None);
+
+        // 序列化字符串要能再解析回来。
+        for value in [
+            Transition::Fade,
+            Transition::SlideLeft,
+            Transition::SlideRight,
+            Transition::SlideUp,
+            Transition::SlideDown,
+            Transition::Random,
+        ] {
+            assert_eq!(Transition::parse(value.as_str()), Some(value));
+        }
+    }
+
+    #[test]
+    fn parses_motion_mode_values() {
+        assert_eq!(MotionMode::parse("animated"), Some(MotionMode::Animated));
+        assert_eq!(MotionMode::parse("STATIC"), Some(MotionMode::Static));
+        assert_eq!(MotionMode::parse("静止"), Some(MotionMode::Static));
+        assert_eq!(MotionMode::parse("slow"), None);
+        assert_eq!(MotionMode::Animated.as_str(), "animated");
+        assert_eq!(MotionMode::Static.as_str(), "static");
+    }
+
+    #[test]
+    fn defaults_match_documented_display_settings() {
+        let cfg = Config::default();
+        assert_eq!(cfg.display_layout, DisplayLayout::Single);
+        assert_eq!(cfg.transition, Transition::Fade);
+        assert!((cfg.transition_seconds - 0.6).abs() < 1e-9);
+        assert_eq!(cfg.motion_mode, MotionMode::Animated);
+        assert!(cfg.ken_burns);
+    }
+
+    #[test]
+    fn legacy_file_config_keeps_old_display_behavior() {
+        // 升级前的配置：没有新字段，fade_seconds=1.2，关掉 Ken Burns。
+        let file: FileConfig =
+            serde_json::from_str(r#"{"display_seconds":10,"fade_seconds":1.2,"ken_burns":false}"#)
+                .unwrap();
+        let mut cfg = Config::default();
+        apply_file(&mut cfg, &file).unwrap();
+
+        assert_eq!(cfg.display_layout, DisplayLayout::Single);
+        assert_eq!(cfg.transition, Transition::Fade);
+        assert_eq!(cfg.motion_mode, MotionMode::Animated);
+        assert!(!cfg.ken_burns, "旧配置的 ken_burns=false 仍然只关缩放");
+        assert!((cfg.transition_seconds - 1.2).abs() < 1e-9);
         assert!(validate(&cfg).is_ok());
+
+        // 完全没有新字段的旧配置同样维持默认显示。
+        let empty: FileConfig = serde_json::from_str(r#"{"plex_url":"http://x"}"#).unwrap();
+        let mut cfg = Config::default();
+        apply_file(&mut cfg, &empty).unwrap();
+        assert_eq!(cfg.display_layout, DisplayLayout::Single);
+        assert_eq!(cfg.transition, Transition::Fade);
+        assert!((cfg.transition_seconds - DEFAULT_TRANSITION_SECONDS).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_seconds_overrides_legacy_fade_seconds() {
+        let file: FileConfig =
+            serde_json::from_str(r#"{"fade_seconds":1.5,"transition_seconds":0.4}"#).unwrap();
+        let mut cfg = Config::default();
+        apply_file(&mut cfg, &file).unwrap();
+        assert!((cfg.transition_seconds - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn file_display_settings_are_parsed() {
+        let file: FileConfig = serde_json::from_str(
+            r#"{"display_layout":"wall","transition":"slide-down","motion_mode":"static","ken_burns":true,"transition_seconds":2.5}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        apply_file(&mut cfg, &file).unwrap();
+        assert_eq!(cfg.display_layout, DisplayLayout::Wall);
+        assert_eq!(cfg.transition, Transition::SlideDown);
+        assert_eq!(cfg.motion_mode, MotionMode::Static);
+        assert!(cfg.ken_burns);
+        assert!((cfg.transition_seconds - 2.5).abs() < 1e-9);
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn invalid_enum_in_file_reports_key_name() {
+        for (json, key) in [
+            (r#"{"display_layout":"mosaic"}"#, "display_layout"),
+            (r#"{"transition":"wipe"}"#, "transition"),
+            (r#"{"motion_mode":"slow"}"#, "motion_mode"),
+        ] {
+            let file: FileConfig = serde_json::from_str(json).unwrap();
+            let mut cfg = Config::default();
+            let err = apply_file(&mut cfg, &file).expect_err("未知枚举值必须报错");
+            assert!(
+                err.contains(key),
+                "错误信息应包含 JSON 键 {key}，实际为 {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_display_settings_override_file() {
+        let file: FileConfig = serde_json::from_str(
+            r#"{"display_layout":"single","transition":"fade","motion_mode":"animated","transition_seconds":0.6}"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        apply_file(&mut cfg, &file).unwrap();
+
+        let args = Args {
+            layout: Some(DisplayLayout::Wall),
+            transition: Some(Transition::SlideLeft),
+            motion: Some(MotionMode::Animated),
+            fade: Some(1.5),
+            ..Default::default()
+        };
+        apply_args(&mut cfg, &args);
+
+        assert_eq!(cfg.display_layout, DisplayLayout::Wall);
+        assert_eq!(cfg.transition, Transition::SlideLeft);
+        assert_eq!(cfg.motion_mode, MotionMode::Animated);
+        assert!((cfg.transition_seconds - 1.5).abs() < 1e-9);
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn no_motion_equals_static_regardless_of_argument_order() {
+        // 先 --motion animated 后 --no-motion：静止优先。
+        let args = Args {
+            motion: Some(MotionMode::Animated),
+            no_motion: true,
+            ..Default::default()
+        };
+        let mut cfg = Config::default();
+        apply_args(&mut cfg, &args);
+        assert_eq!(cfg.motion_mode, MotionMode::Static);
+
+        // 只有 --motion static：与 --no-motion 等价。
+        let args = Args {
+            motion: Some(MotionMode::Static),
+            ..Default::default()
+        };
+        let mut cfg = Config::default();
+        apply_args(&mut cfg, &args);
+        assert_eq!(cfg.motion_mode, MotionMode::Static);
+
+        // 文件配置是 static，CLI 显式 animated 可以覆盖（然后 no-motion 再拉回静止）。
+        let mut cfg = Config {
+            motion_mode: MotionMode::Static,
+            ..Default::default()
+        };
+        let args = Args {
+            motion: Some(MotionMode::Animated),
+            ..Default::default()
+        };
+        apply_args(&mut cfg, &args);
+        assert_eq!(cfg.motion_mode, MotionMode::Animated);
+    }
+
+    #[test]
+    fn parse_args_accepts_display_flags() {
+        let args = parse_args_from(
+            [
+                "--layout",
+                "wall",
+                "--transition",
+                "slide-up",
+                "--motion",
+                "static",
+                "--fade",
+                "1.5",
+                "--display",
+                "8",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(args.layout, Some(DisplayLayout::Wall));
+        assert_eq!(args.transition, Some(Transition::SlideUp));
+        assert_eq!(args.motion, Some(MotionMode::Static));
+        assert_eq!(args.fade, Some(1.5));
+        assert_eq!(args.display, Some(8.0));
+    }
+
+    #[test]
+    fn parse_args_reports_invalid_enum_with_flag_name() {
+        for (flag, value, name) in [
+            ("--layout", "mosaic", "--layout"),
+            ("--transition", "wipe", "--transition"),
+            ("--motion", "slow", "--motion"),
+        ] {
+            let err = parse_args_from([flag.to_string(), value.to_string()])
+                .expect_err("未知枚举值必须报错");
+            assert!(
+                err.contains(name),
+                "错误信息应包含参数名 {name}，实际为 {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_motion_is_static_alias_on_cli() {
+        let args = parse_args_from(["--no-motion".to_string()]).unwrap();
+        let mut cfg = Config::default();
+        apply_args(&mut cfg, &args);
+        assert_eq!(cfg.motion_mode, MotionMode::Static);
+
+        // 旧行为是只关 Ken Burns，现在由静止模式统一覆盖；
+        // 想只关缩放仍可在配置里写 ken_burns=false。
+        assert!(cfg.ken_burns, "配置里的 ken_burns 不因 --no-motion 被改写");
     }
 }

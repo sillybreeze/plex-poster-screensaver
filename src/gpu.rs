@@ -3,7 +3,6 @@
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 
-use image::RgbImage;
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, FALSE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -33,11 +32,13 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_EFFECT_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
+use crate::render::Frame;
+
 const SHADER: &str = r#"
 cbuffer Params : register(b0)
 {
     float2 screenSize;
-    float2 pad0;
+    float2 bgOffset;
     float4 posterRect;
     float4 posterUV;
     float4 colorAlpha;
@@ -59,15 +60,26 @@ VSOut VS(uint id : SV_VertexID)
 
 float4 PS(VSOut i) : SV_Target
 {
-    float2 uv = i.pos.xy / screenSize;
-    float3 c = bgTex.SampleLevel(samp, uv, 0).rgb;
-    float2 q = (i.pos.xy - posterRect.xy) / posterRect.zw;
-    if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0)
+    float2 uv = (i.pos.xy - bgOffset) / screenSize;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
     {
-        float2 puv = posterUV.xy + q * posterUV.zw;
-        c = posterTex.SampleLevel(samp, puv, 0).rgb;
+        // 海报墙整张画布滑入时，还没覆盖到的地方保留旧场景。
+        return float4(0.0, 0.0, 0.0, 0.0);
     }
-    return float4(c, colorAlpha.w);
+
+    float3 c = bgTex.SampleLevel(samp, uv, 0).rgb;
+    float alpha = colorAlpha.w;
+    if (posterRect.z > 0.0 && posterRect.w > 0.0)
+    {
+        float2 q = (i.pos.xy - posterRect.xy) / posterRect.zw;
+        if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0)
+        {
+            float2 puv = posterUV.xy + q * posterUV.zw;
+            c = posterTex.SampleLevel(samp, puv, 0).rgb;
+            alpha = colorAlpha.x;
+        }
+    }
+    return float4(c, alpha);
 }
 "#;
 
@@ -75,9 +87,10 @@ float4 PS(VSOut i) : SV_Target
 #[derive(Clone, Copy, Default)]
 struct Params {
     screen: [f32; 2],
-    pad: [f32; 2],
+    bg_offset: [f32; 2],
     rect: [f32; 4],
     uv: [f32; 4],
+    /// x = 海报层透明度，w = 背景/整屏画布透明度。
     color_alpha: [f32; 4],
 }
 
@@ -195,14 +208,21 @@ fn cache_or_build<T: Clone, E>(
 
 pub struct Textures {
     bg: ID3D11ShaderResourceView,
-    poster: ID3D11ShaderResourceView,
+    /// 海报墙布局没有独立海报层，绘制时绑定 1×1 占位纹理。
+    poster: Option<ID3D11ShaderResourceView>,
     rect: [f32; 4],
+    wall: bool,
 }
 
 impl Textures {
-    /// 海报在屏幕上的矩形：[x, y, 宽, 高]
+    /// 海报在屏幕上的矩形：[x, y, 宽, 高]；海报墙返回整屏矩形。
     pub fn rect(&self) -> [f32; 4] {
         self.rect
+    }
+
+    /// 是否为整屏合成画布（海报墙）。
+    pub fn is_wall(&self) -> bool {
+        self.wall
     }
 }
 
@@ -216,6 +236,8 @@ pub struct Gpu {
     sampler: ID3D11SamplerState,
     blend: ID3D11BlendState,
     raster: ID3D11RasterizerState,
+    /// 没有海报层的帧（海报墙）也要绑定一个有效 SRV。
+    dummy: ID3D11ShaderResourceView,
     width: u32,
     height: u32,
 }
@@ -368,6 +390,11 @@ impl Gpu {
                 state.ok_or_else(|| GpuError::text("创建光栅化状态", "光栅化状态为空"))?
             };
 
+            let dummy = {
+                let pixel = [0u32; 1];
+                create_texture(&device, 1, 1, pixel.as_ptr() as *const u8, 4)?
+            };
+
             Ok(Self {
                 swap,
                 device,
@@ -378,6 +405,7 @@ impl Gpu {
                 sampler,
                 blend,
                 raster,
+                dummy,
                 width,
                 height,
             })
@@ -421,50 +449,102 @@ impl Gpu {
         Ok(())
     }
 
-    /// 把背景（0x00RRGGBB）和海报（RGB）上传成纹理，一张图只做一次。
-    pub fn upload(
-        &self,
-        bg: &[u32],
-        poster: &RgbImage,
-        position: (i32, i32),
-    ) -> Result<Textures, String> {
+    /// 把预取线程合成好的一帧上传成纹理，一张图只做一次。
+    pub fn upload(&self, frame: &Frame) -> Result<Textures, GpuError> {
         let expected = self.width as usize * self.height as usize;
-        if bg.len() != expected {
-            return Err(format!(
-                "背景缓冲区尺寸不匹配: 纹理 {}x{} 需要 {} 像素，实际 {} 像素",
-                self.width,
-                self.height,
-                expected,
-                bg.len()
-            ));
+        match frame {
+            Frame::Single(comp) => {
+                if comp.background.len() != expected {
+                    return Err(GpuError::text(
+                        "上传纹理",
+                        format!(
+                            "背景缓冲区尺寸不匹配: 纹理 {}x{} 需要 {} 像素，实际 {} 像素",
+                            self.width,
+                            self.height,
+                            expected,
+                            comp.background.len()
+                        ),
+                    ));
+                }
+
+                let bg_srv = create_texture(
+                    &self.device,
+                    self.width,
+                    self.height,
+                    comp.background.as_ptr() as *const u8,
+                    self.width * 4,
+                )?;
+
+                let (pw, ph) = (comp.poster.width(), comp.poster.height());
+                let mut pixels = Vec::with_capacity((pw * ph) as usize);
+                for px in comp.poster.pixels() {
+                    let [r, g, b] = px.0;
+                    pixels.push((b as u32) | ((g as u32) << 8) | ((r as u32) << 16));
+                }
+                let poster_srv =
+                    create_texture(&self.device, pw, ph, pixels.as_ptr() as *const u8, pw * 4)?;
+
+                Ok(Textures {
+                    bg: bg_srv,
+                    poster: Some(poster_srv),
+                    rect: [
+                        comp.position.0 as f32,
+                        comp.position.1 as f32,
+                        pw as f32,
+                        ph as f32,
+                    ],
+                    wall: false,
+                })
+            }
+            Frame::Wall(wall) => {
+                if (wall.width, wall.height) != (self.width, self.height) {
+                    return Err(GpuError::text(
+                        "上传纹理",
+                        format!(
+                            "海报墙画布尺寸不匹配: 纹理 {}x{}，画布 {}x{}",
+                            self.width, self.height, wall.width, wall.height
+                        ),
+                    ));
+                }
+                if wall.canvas.len() != expected {
+                    return Err(GpuError::text(
+                        "上传纹理",
+                        format!(
+                            "海报墙缓冲区尺寸不匹配: 需要 {} 像素，实际 {} 像素",
+                            expected,
+                            wall.canvas.len()
+                        ),
+                    ));
+                }
+                let bg_srv = create_texture(
+                    &self.device,
+                    wall.width,
+                    wall.height,
+                    wall.canvas.as_ptr() as *const u8,
+                    wall.width * 4,
+                )?;
+                Ok(Textures {
+                    bg: bg_srv,
+                    poster: None,
+                    rect: [0.0, 0.0, wall.width as f32, wall.height as f32],
+                    wall: true,
+                })
+            }
         }
-
-        let bg_srv = create_texture(
-            &self.device,
-            self.width,
-            self.height,
-            bg.as_ptr() as *const u8,
-            self.width * 4,
-        )?;
-
-        let (pw, ph) = (poster.width(), poster.height());
-        let mut pixels = Vec::with_capacity((pw * ph) as usize);
-        for px in poster.pixels() {
-            let [r, g, b] = px.0;
-            pixels.push((b as u32) | ((g as u32) << 8) | ((r as u32) << 16));
-        }
-        let poster_srv =
-            create_texture(&self.device, pw, ph, pixels.as_ptr() as *const u8, pw * 4)?;
-
-        Ok(Textures {
-            bg: bg_srv,
-            poster: poster_srv,
-            rect: [position.0 as f32, position.1 as f32, pw as f32, ph as f32],
-        })
     }
 
-    /// 画一层画面。淡入淡出时调用两次（旧图 alpha=1，新图 alpha=t）。
-    pub fn draw(&self, tex: &Textures, uv: [f32; 4], alpha: f32) {
+    /// 画一层画面。转场时先画旧层，再画新层。
+    ///
+    /// `bg_alpha` 控制背景（海报墙时是整张画布）；`poster_alpha` 只影响单张布局的
+    /// 海报图层。`offset` 是相对最终居中位置的屏幕像素偏移。
+    pub fn draw(
+        &self,
+        tex: &Textures,
+        uv: [f32; 4],
+        bg_alpha: f32,
+        poster_alpha: f32,
+        offset: (f32, f32),
+    ) {
         unsafe {
             let Some(rtv) = self.render_target() else {
                 return;
@@ -481,10 +561,30 @@ impl Gpu {
 
             let params = Params {
                 screen: [self.width as f32, self.height as f32],
-                pad: [0.0, 0.0],
-                rect: tex.rect,
+                // 海报墙移动的是整张画布，背景 UV 也要跟着偏移；
+                // 单张布局背景始终铺满，只有海报图层移动。
+                bg_offset: if tex.wall {
+                    [offset.0, offset.1]
+                } else {
+                    [0.0, 0.0]
+                },
+                rect: if tex.wall {
+                    [0.0; 4]
+                } else {
+                    [
+                        tex.rect[0] + offset.0,
+                        tex.rect[1] + offset.1,
+                        tex.rect[2],
+                        tex.rect[3],
+                    ]
+                },
                 uv,
-                color_alpha: [1.0, 1.0, 1.0, alpha.clamp(0.0, 1.0)],
+                color_alpha: [
+                    poster_alpha.clamp(0.0, 1.0),
+                    1.0,
+                    1.0,
+                    bg_alpha.clamp(0.0, 1.0),
+                ],
             };
 
             self.context.UpdateSubresource(
@@ -501,8 +601,9 @@ impl Gpu {
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.context.VSSetShader(&self.vs, None);
             self.context.PSSetShader(&self.ps, None);
+            let poster = tex.poster.clone().unwrap_or_else(|| self.dummy.clone());
             self.context
-                .PSSetShaderResources(0, Some(&[Some(tex.bg.clone()), Some(tex.poster.clone())]));
+                .PSSetShaderResources(0, Some(&[Some(tex.bg.clone()), Some(poster)]));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context.OMSetBlendState(&self.blend, None, 0xffffffff);
@@ -610,7 +711,7 @@ fn create_texture(
     height: u32,
     data: *const u8,
     row_pitch: u32,
-) -> Result<ID3D11ShaderResourceView, String> {
+) -> Result<ID3D11ShaderResourceView, GpuError> {
     unsafe {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -635,13 +736,14 @@ fn create_texture(
         let mut texture = None;
         device
             .CreateTexture2D(&desc, Some(&init), Some(&mut texture))
-            .map_err(|e| format!("创建纹理失败: {e}"))?;
-        let texture: ID3D11Texture2D = texture.ok_or("纹理为空")?;
+            .map_err(|e| GpuError::from_win("创建纹理", e))?;
+        let texture: ID3D11Texture2D =
+            texture.ok_or_else(|| GpuError::text("创建纹理", "纹理为空"))?;
         let mut view = None;
         device
             .CreateShaderResourceView(&texture, None, Some(&mut view))
-            .map_err(|e| format!("创建纹理视图失败: {e}"))?;
-        view.ok_or_else(|| "纹理视图为空".to_string())
+            .map_err(|e| GpuError::from_win("创建纹理视图", e))?;
+        view.ok_or_else(|| GpuError::text("创建纹理视图", "纹理视图为空"))
     }
 }
 
