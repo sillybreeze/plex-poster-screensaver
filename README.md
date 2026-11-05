@@ -4,6 +4,8 @@ Windows 10/11 Plex 海报屏保。支持单张海报或海报墙、淡化/方向
 
 [![Release](https://img.shields.io/github/v/release/sillybreeze/plex-poster-screensaver?label=release)](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest)
 
+![截图](screenshot.png)
+
 ## 使用
 
 从 [Releases](https://github.com/sillybreeze/plex-poster-screensaver/releases/latest) 下载 Windows x64 版本。首次双击打开设置中心，填写 Plex 地址和 Token，测试连接并选择媒体库，保存后程序会启动。
