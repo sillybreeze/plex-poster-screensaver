@@ -11,6 +11,7 @@ mod app;
 mod autostart;
 mod cli;
 mod config;
+mod config_file;
 mod config_validate;
 mod gpu;
 

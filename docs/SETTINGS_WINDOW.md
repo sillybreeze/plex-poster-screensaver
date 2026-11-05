@@ -71,7 +71,8 @@
 
 ## 实现位置
 
-- `src/config.rs`：配置模型、文件读取和启动校验。
+- `src/config.rs`：配置模型、`EditableSettings` 和启动校验。
+- `src/config_file.rs`：config.json 定位、读取、原子写回和 CLI/env 覆盖链。
 - `src/cli.rs`：`Args`、命令行解析和覆盖字段汇总。
 - `src/config_validate.rs`：GUI 保存与启动加载共用的范围/URL/Token 规则。
 - `src/settings.rs`：窗口状态、消息循环和保存按钮的界面错误展示。
