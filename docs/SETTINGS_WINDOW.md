@@ -72,7 +72,9 @@
 ## 实现位置
 
 - `src/config.rs`：`EditableSettings`、`SettingsOverrides`、读写/校验/迁移。
-- `src/settings.rs`：分页窗口、原生控件、后台连接测试、首次配置模态循环、保存/重启请求、缓存统计清理。
+- `src/settings.rs`：窗口状态、消息循环和保存按钮的界面错误展示。
+- `src/settings/pages.rs`：六个页面的原生控件布局和尺寸。
+- `src/settings_apply.rs`：配置保存、自启同步、重启请求的顺序与失败语义；带可注入的保存失败/自启失败/重启测试。
 - `src/settings_preview.rs`：CPU 预览合成，移到独立模块。
 - `src/autostart.rs`：启动文件夹 VBS 的读写。
 - `src/platform.rs`：托盘菜单（含“重启程序”）、跨进程重启消息、设置路径/缓存/覆盖信息传递。
@@ -80,7 +82,7 @@
 
 ## 验证
 
-- `cargo test --release --offline`：108 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
+- `cargo test --release --offline`：114 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
 - GUI 验证：
   - 六个页面逐页截图，Plex 测试连接成功并列出 4 个媒体库；
   - 保存 `wall / slide-left / 0.8s / 8s / static / Ken Burns off`、`idle=7`、`mouse_only=true`、`cache_days=45`、`cache_max_mb=1024`、`motion_fps=24` 全部写回；

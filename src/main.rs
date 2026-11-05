@@ -142,6 +142,7 @@ mod platform;
 mod plex;
 mod render;
 mod settings;
+mod settings_apply;
 mod settings_preview;
 mod status;
 mod trigger;
