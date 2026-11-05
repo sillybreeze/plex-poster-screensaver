@@ -936,6 +936,14 @@ fn save_preserving(
     path: &Path,
     apply: impl FnOnce(&mut Value) -> Result<(), String>,
 ) -> Result<(), String> {
+    save_preserving_with(path, apply, |from, to| fs::rename(from, to))
+}
+
+fn save_preserving_with(
+    path: &Path,
+    apply: impl FnOnce(&mut Value) -> Result<(), String>,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), String> {
     let mut value = if path.exists() {
         let text = fs::read_to_string(path)
             .map_err(|err| format!("无法读取配置文件 {}: {err}", path.display()))?;
@@ -970,13 +978,9 @@ fn save_preserving(
         let _ = fs::remove_file(&tmp);
         return Err(format!("写入配置临时文件失败: {err}"));
     }
-    if fs::rename(&tmp, path).is_err() {
-        // Windows 上目标已存在时极少数文件系统会拒绝覆盖；先删目标再重试一次。
-        let _ = fs::remove_file(path);
-        if let Err(err) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("保存配置失败 {}: {err}", path.display()));
-        }
+    if let Err(err) = replace(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("保存配置失败 {}: {err}", path.display()));
     }
     Ok(())
 }
@@ -2249,6 +2253,36 @@ mod tests {
         assert!(err.contains("解析失败"), "错误信息应说明解析失败: {err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_config_replacement_keeps_original_file() {
+        let dir = settings_scratch_dir("replace-failure");
+        let path = dir.join("config.json");
+        let tmp = dir.join(format!(".config.json.{}.tmp", std::process::id()));
+        fs::write(&path, r#"{"custom":"original"}"#).unwrap();
+
+        let result = save_preserving_with(
+            &path,
+            |value| {
+                value["custom"] = Value::String("replacement".to_string());
+                Ok(())
+            },
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated replacement failure",
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"custom":"original"}"#
+        );
+        assert!(!tmp.exists(), "失败时应清理临时文件");
         let _ = fs::remove_dir_all(&dir);
     }
 

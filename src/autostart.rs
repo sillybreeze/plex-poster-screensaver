@@ -30,6 +30,7 @@ pub fn script(config_path: Option<&Path>) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|err| format!("获取当前 exe 路径失败: {err}"))?;
     let mut command = format!("\"{}\" --background", exe.display());
     if let Some(path) = config_path {
+        let path = absolute_config_path(path)?;
         command.push_str(&format!(" --config \"{}\"", path.display()));
     }
     // VBScript 字符串里的双引号写成两个双引号。
@@ -39,6 +40,15 @@ pub fn script(config_path: Option<&Path>) -> Result<String, String> {
          Set shell = CreateObject(\"WScript.Shell\")\r\n\
          shell.Run \"{escaped}\", 0, False\r\n"
     ))
+}
+
+fn absolute_config_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|err| format!("解析配置文件绝对路径失败: {err}"))
 }
 
 /// 写 UTF-16 LE + BOM，避免中文用户名/路径在 VBScript 里乱码。
@@ -86,5 +96,16 @@ mod tests {
     fn script_escapes_quotes() {
         let text = super::script(Some(Path::new(r"C:\tmp\a b\config.json"))).expect("script");
         assert!(text.contains(r#"--config ""C:\tmp\a b\config.json"""#));
+    }
+
+    #[test]
+    fn script_resolves_relative_config_path() {
+        let text = super::script(Some(Path::new("config.json"))).expect("script");
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("config.json")
+            .display()
+            .to_string();
+        assert!(text.contains(&expected));
     }
 }
