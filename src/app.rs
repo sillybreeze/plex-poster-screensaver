@@ -51,6 +51,13 @@ impl Slide {
 
 const TASK_CANCELLED: &str = "预取任务已取消";
 
+/// 海报墙取图方式：在线可下载补齐，离线只读缓存。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WallLoadMode {
+    Online,
+    Cached,
+}
+
 /// 取消与提交共用的闸门。
 ///
 /// 提交必须在锁内检查代次并执行；取消/换代也要拿同一把锁。这样“检查通过后、
@@ -594,20 +601,28 @@ impl Source {
         picked
     }
 
-    /// 离线时从缓存队列里凑一组不重复的条目。
-    fn offline_wall_items(&mut self) -> Vec<MediaItem> {
+    /// 取离线缓存候选，最多 `want` 张，跳过已加载的条目。
+    ///
+    /// 在线取图中途失败或数量不足时用它在不重复的前提下补齐墙面。
+    fn take_offline_items(&mut self, want: usize, exclude: &[String]) -> Vec<MediaItem> {
+        if want == 0 {
+            return Vec::new();
+        }
         if self.offline.is_empty() {
             self.reload_offline();
         }
-        let mut picked: Vec<MediaItem> = Vec::with_capacity(WALL_POSTERS);
+        let mut picked: Vec<MediaItem> = Vec::with_capacity(want);
         let available = self.offline.len();
         for _ in 0..available {
-            if picked.len() >= WALL_POSTERS {
+            if picked.len() >= want {
                 break;
             }
             let Some(item) = self.offline.pop_front() else {
                 break;
             };
+            if exclude.iter().any(|key| key == &item.rating_key) {
+                continue;
+            }
             if picked
                 .iter()
                 .any(|picked| picked.rating_key == item.rating_key)
@@ -619,31 +634,89 @@ impl Source {
         picked
     }
 
-    /// 逐张取图并组帧；单张失败只跳过，全部失败才返回错误。
-    fn wall_slide(&mut self, items: Vec<MediaItem>, online: bool) -> Result<Slide, String> {
-        let mut loaded: Vec<(MediaItem, RgbImage)> = Vec::with_capacity(items.len());
+    /// 逐张取图；单张失败只记录并跳过，保留已经成功缓存/下载的海报。
+    ///
+    /// 返回失败张数，供调用方汇总日志；取消时立即返回，由调用方再检查代次。
+    fn load_wall_images(
+        &mut self,
+        items: Vec<MediaItem>,
+        mode: WallLoadMode,
+        loaded: &mut Vec<(MediaItem, RgbImage)>,
+    ) -> usize {
         let mut errors = 0usize;
         for item in items {
-            self.ensure_current()?;
-            let result = if online {
-                self.image_for(&item)
-            } else {
-                self.cached_image(&item)
+            if loaded.len() >= WALL_POSTERS || !self.guard.is_current() {
+                return errors;
+            }
+            if loaded
+                .iter()
+                .any(|(picked, _)| picked.rating_key == item.rating_key)
+            {
+                continue;
+            }
+            let result = match mode {
+                WallLoadMode::Online => self.image_for(&item),
+                WallLoadMode::Cached => self.cached_image(&item),
             };
             match result {
                 Ok(img) => loaded.push((item, img)),
                 Err(err) => {
                     if !self.guard.is_current() {
-                        return Err(TASK_CANCELLED.to_string());
+                        return errors;
                     }
                     log_warn!("海报墙取图失败 {}: {err}", item.title);
                     errors += 1;
                 }
             }
         }
+        errors
+    }
 
+    /// 用已加载的一组海报组帧；1 张时退回单张布局，0 张由调用方报错。
+    fn compose_wall_slide(&mut self, loaded: Vec<(MediaItem, RgbImage)>) -> Result<Slide, String> {
+        let items: Vec<MediaItem> = loaded.iter().map(|(item, _)| item.clone()).collect();
+        let images: Vec<RgbImage> = loaded.into_iter().map(|(_, img)| img).collect();
+        self.ensure_current()?;
+        let frame = render::compose_wall_frame(images, self.size.0, self.size.1)?;
+        if let Frame::Wall(wall) = &frame {
+            log_info!("海报墙组帧完成：{} 张海报", wall.cards);
+        }
+        self.ensure_current()?;
+        Ok(self.finish(items, frame))
+    }
+
+    fn wall_next(&mut self) -> Result<Slide, String> {
+        let mut loaded: Vec<(MediaItem, RgbImage)> = Vec::with_capacity(WALL_POSTERS);
+        let mut errors = 0usize;
+
+        if self.online {
+            let candidates = self.online_wall_items();
+            // 取列表过程中可能已经切到离线：已选中的条目仍然保留，
+            // 但不再为未缓存的封面等待网络超时；能命中缓存的继续组帧。
+            let mode = if self.online {
+                WallLoadMode::Online
+            } else {
+                WallLoadMode::Cached
+            };
+            errors += self.load_wall_images(candidates, mode, &mut loaded);
+            // 取消时不要再消费离线队列。
+            self.ensure_current()?;
+        }
+
+        // 在线候选不足或部分取图失败时，用离线缓存补齐，
+        // 避免“刚选中的条目尚未缓存”导致整组组帧失败。
+        if loaded.len() < WALL_POSTERS {
+            let exclude: Vec<String> = loaded
+                .iter()
+                .map(|(item, _)| item.rating_key.clone())
+                .collect();
+            let offline = self.take_offline_items(WALL_POSTERS - loaded.len(), &exclude);
+            errors += self.load_wall_images(offline, WallLoadMode::Cached, &mut loaded);
+        }
+
+        self.ensure_current()?;
         if loaded.is_empty() {
-            let message = if online {
+            let message = if self.online {
                 "Plex 暂时没有可用的海报，本地也没有可用缓存".to_string()
             } else {
                 "无法连接 Plex，本地缓存也没有可用封面".to_string()
@@ -660,42 +733,8 @@ impl Source {
             );
         }
 
-        let items: Vec<MediaItem> = loaded.iter().map(|(item, _)| item.clone()).collect();
-        let images: Vec<RgbImage> = loaded.into_iter().map(|(_, img)| img).collect();
-        let frame = render::compose_wall_frame(images, self.size.0, self.size.1)?;
-        if let Frame::Wall(wall) = &frame {
-            log_info!("海报墙组帧完成：{} 张海报", wall.cards);
-        }
-        self.ensure_current()?;
-        Ok(self.finish(items, frame))
-    }
-
-    fn wall_next(&mut self) -> Result<Slide, String> {
-        let mut online = self.online;
-        let mut items = if online {
-            self.online_wall_items()
-        } else {
-            Vec::new()
-        };
-        // 取列表过程中可能已经切到离线，后续取图只读缓存，不再等网络超时。
-        online = self.online && !items.is_empty();
-        if items.is_empty() {
-            online = false;
-            items = self.offline_wall_items();
-        }
-        if items.is_empty() {
-            let message = if self.online {
-                "Plex 暂时没有可用的海报".to_string()
-            } else {
-                "无法连接 Plex，本地缓存也没有可用封面".to_string()
-            };
-            self.commit_status(|current| {
-                current.last_error = message.clone();
-            });
-            return Err(message);
-        }
-
-        let slide = self.wall_slide(items, online)?;
+        let slide = self.compose_wall_slide(loaded)?;
+        let online = self.online;
         self.commit_status(|current| {
             current.online = online;
             current.last_error.clear();
@@ -2615,5 +2654,109 @@ mod tests {
             frame: wall_frame(0),
         };
         assert_eq!(empty.title(), "");
+    }
+
+    fn wall_scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("wall-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 生成一张可解码的小 PNG，返回字节；临时源文件不留在缓存目录里。
+    fn png_bytes(dir: &std::path::Path, tag: &str, rgb: [u8; 3]) -> Vec<u8> {
+        let path = dir.join(format!("{tag}.png"));
+        let img = RgbImage::from_pixel(40, 60, image::Rgb(rgb));
+        image::save_buffer(&path, img.as_raw(), 40, 60, image::ColorType::Rgb8).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        data
+    }
+
+    fn wall_source(cache: Cache, size: (u32, u32)) -> Source {
+        Source::new(
+            Client::new(&Config::default()),
+            cache,
+            Vec::new(),
+            size,
+            Vec::new(),
+            status::new(),
+            DisplayLayout::Wall,
+        )
+    }
+
+    fn seed_wall_cache(dir: &std::path::Path, colors: &[[u8; 3]]) -> Cache {
+        let mut cache = Cache::open(dir, 30, crate::config::Naming::Title).unwrap();
+        for (index, rgb) in colors.iter().enumerate() {
+            let item = media(&format!("W{index}"), &format!("Wall {index}"));
+            let data = png_bytes(dir, &format!("src{index}"), *rgb);
+            cache.store(&item, &data).unwrap();
+        }
+        cache
+    }
+
+    #[test]
+    fn wall_falls_back_to_offline_cache_when_plex_is_gone() {
+        let dir = wall_scratch_dir("offline");
+        let cache = seed_wall_cache(&dir, &[[200, 40, 40], [40, 200, 40], [40, 40, 200]]);
+        let mut source = wall_source(cache, (320, 180));
+
+        let slide = source.next().expect("离线缓存应能组帧");
+        assert_eq!(slide.items.len(), 3, "应使用全部 3 张离线缓存");
+        match &slide.frame {
+            Frame::Wall(wall) => {
+                assert_eq!(wall.cards, 3);
+                assert_eq!((wall.width, wall.height), (320, 180));
+            }
+            Frame::Single(_) => panic!("3 张应走海报墙"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wall_skips_corrupt_cache_and_keeps_remaining_posters() {
+        let dir = wall_scratch_dir("corrupt");
+        let mut cache = seed_wall_cache(&dir, &[[200, 40, 40], [40, 200, 40]]);
+        // 损坏文件仍然在索引里，但解码失败时应被跳过，而不是拖垮整组。
+        cache
+            .store(&media("W2", "Broken"), b"not a real image")
+            .unwrap();
+        let mut source = wall_source(cache, (320, 180));
+
+        let slide = source.next().expect("坏缓存不应阻断整面墙");
+        assert_eq!(slide.items.len(), 2);
+        assert!(slide.items.iter().all(|item| item.rating_key != "W2"));
+        match &slide.frame {
+            Frame::Wall(wall) => assert_eq!(wall.cards, 2),
+            Frame::Single(_) => panic!("2 张应走海报墙"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_backfill_skips_items_already_loaded() {
+        let dir = wall_scratch_dir("exclude");
+        let cache = seed_wall_cache(
+            &dir,
+            &[[200, 40, 40], [40, 200, 40], [40, 40, 200], [200, 200, 40]],
+        );
+        let mut source = wall_source(cache, (320, 180));
+
+        let picked = source.take_offline_items(3, &["W0".to_string()]);
+        assert_eq!(picked.len(), 3);
+        assert!(
+            picked.iter().all(|item| item.rating_key != "W0"),
+            "已加载的条目不能重复补进海报墙"
+        );
+        let mut keys: Vec<_> = picked.iter().map(|item| item.rating_key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 3, "补位候选不能有重复");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
