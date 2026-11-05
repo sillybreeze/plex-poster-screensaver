@@ -11,8 +11,9 @@ Plex 海报屏保：从媒体库随机取电影/剧集海报全屏轮播，自�
 ## 特性
 
 - **氛围光 + Ken Burns**：按主色生成渐变、模糊纹理和暗角；10 秒缓慢推近 3.5%
-- **D3D11 渲染**：缩放和双线性采样交给 GPU，每帧 CPU 约 0.05 ms
-- **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡
+- **三种显示设置自由组合**：单张海报或 6 张 3×2 海报墙；淡化或四方向滑入切换；正常动效或完全静止轮播
+- **D3D11 渲染**：缩放和双线性采样交给 GPU，每帧 CPU 约 0.05 ms；方向转场只移动图层，不重建纹理
+- **后台预取**：下载、解码、合成、取色都在工作线程，主界面不卡；海报墙整面画布在 worker 里合成，主线程只上传一张纹理
 - **本地缓存 + 离线播放**：`index.json` 记录媒体信息，Plex 断网时继续轮播，并每 30 秒后台重连
 - **常驻等待**：`--watch` 隐藏等待，空闲到点全屏，有输入立刻收起
 - **托盘控制**：查看在线/离线、缓存数量和当前海报；立即播放、暂停 1 小时、恢复、打开配置/缓存/日志、退出
@@ -96,7 +97,10 @@ Copy-Item config.example.json config.json
   "plex_token": "你的 Plex Token",
   "libraries": ["电影", "动漫"],
   "display_seconds": 10,
-  "fade_seconds": 1.2,
+  "display_layout": "single",
+  "transition": "fade",
+  "transition_seconds": 0.6,
+  "motion_mode": "animated",
   "cache_dir": "covers",
   "cache_naming": "title",
   "cache_days": 30,
@@ -107,6 +111,24 @@ Copy-Item config.example.json config.json
 ```
 
 `PLEX_URL` / `PLEX_TOKEN` 可替代配置里的地址和 Token。`cache_dir` 的相对路径按 **config.json 所在目录** 解析；命令行 `--cache-dir` 的相对路径按当前工作目录。显式 `--config` 读取或解析失败会直接报错。
+
+### 显示模式
+
+布局、切换效果和动效模式是三个独立开关，可以自由组合：
+
+| 配置项 | 可选值 | 默认 | 说明 |
+|---|---|---|---|
+| `display_layout` | `single`、`wall` | `single` | 单张海报，或 6 张 3×2 海报墙 |
+| `transition` | `fade`、`slide_left`、`slide_right`、`slide_up`、`slide_down`、`random` | `fade` | 每次换画面的效果；方向值表示画面从哪一侧滑入 |
+| `transition_seconds` | 0.1–3.0 | `0.6` | 切换时长；0 表示立即切换 |
+| `motion_mode` | `animated`、`static` | `animated` | `static` 关闭切换动画和缩放，但仍按 `display_seconds` 换图 |
+| `ken_burns` | 布尔 | `true` | 仅动画模式下的单张布局启用缓慢推近 |
+
+- `static` 优先级最高：即使 `transition` 不是 `fade`，也只直接切换；海报墙不缩放。
+- `ken_burns: false` 只关闭缩放，淡化/滑入仍然生效。
+- `random` 在每张新画面开始时选一次方向，不会在动画中途改变，也不会和上一次方向连续重复。
+- 海报墙在缓存不足 6 张时用可用数量重新排网格；只剩 1 张时退回单张布局；下载失败的部分会被跳过，全部失败则保持等待/错误状态。
+- 旧配置里的 `fade_seconds` 仍作为 `transition_seconds` 的别名读取；`--fade` 参数保留，同时控制方向滑入时长。
 
 **离线播放**：缓存目录的 `index.json` 记录 ratingKey、标题、thumb 和所属媒体库；断网时用缓存轮播，恢复后自动切回在线。旧版 `1479.jpg`、`标题_1479.jpg` 会自动扫描进索引；Plex 不可用且完全没有缓存时，常驻模式会保持后台等待。
 
@@ -122,14 +144,31 @@ Copy-Item config.example.json config.json
 |---|---|
 | `--config <文件>` | 指定配置文件 |
 | `--library <编号/名称>` | 选择媒体库，可重复 |
-| `--display <秒>` / `--fade <秒>` | 停留时间 / 淡入淡出 |
-| `--no-motion` | 关闭 Ken Burns 动效（轮播继续） |
+| `--display <秒>` | 每张停留时间 |
+| `--layout single\|wall` | 单张海报 / 6 张 3×2 海报墙 |
+| `--transition fade\|slide-left\|slide-right\|slide-up\|slide-down\|random` | 切换效果；方向表示从哪一侧滑入 |
+| `--fade <秒>` | 切换时长，0 表示关闭（旧参数名，也控制滑入时长） |
+| `--motion animated\|static` | 动效模式；`static` 完全静止但仍轮播 |
+| `--no-motion` | 等同 `--motion static`（保留兼容） |
 | `--cache-dir <目录>` | 缓存位置，`auto` 自动挑选 |
 | `--cache-days <天>` | 缓存保留天数 |
 | `--cache-max-mb <MB>` | 缓存容量上限，0 表示不限 |
 | `--watch` / `--now` | 常驻等待 / 立刻全屏 |
 | `--preview` | 1280x720 窗口预览 |
-| `--self-test <N>` / `--snapshot <png>` | 无界面自检 / 导出结果 |
+| `--self-test <N>` / `--snapshot <png>` | 无界面自检 / 导出结果（按当前布局） |
+
+命令行优先于配置文件。例如：
+
+```powershell
+# 海报墙 + 从左侧滑入，每 8 秒换一组
+.\target\release\plex-poster-screensaver.exe --config config.json --preview --layout wall --transition slide-left --display 8
+
+# 单张完全静止，只按间隔换图
+.\target\release\plex-poster-screensaver.exe --config config.json --preview --motion static
+
+# 海报墙 + 静止模式（优先级最高，无转场、无缩放）
+.\target\release\plex-poster-screensaver.exe --config config.json --preview --layout wall --transition random --motion static
+```
 
 普通全屏模式下按 ESC、点击或移动鼠标退出；`--preview` 不会因鼠标移动退出；`--watch` 有输入时收起并继续等待下一轮。
 
