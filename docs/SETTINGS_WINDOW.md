@@ -64,7 +64,8 @@
 
 ## 控制台与日志
 
-- 后台启动（`--background`/开机自启/计划任务）如果控制台是进程独占的，`FreeConsole` 释放；从 cmd/PowerShell 启动时保留共享控制台，CLI 输出仍可用。双击无参数启动时释放控制台并直接显示设置页。
+- release 版使用 Windows GUI 子系统，双击/快捷方式启动不创建控制台，不会闪黑框；从 cmd/PowerShell 启动时 `AttachConsole` 到父控制台，CLI 输出仍可见。从资源管理器启动没有控制台，错误用 MessageBox。
+- 启动后台实例时 stdin/stdout/stderr 显式设空，避免无控制台父进程继承无效句柄导致 `os error 50`。
 - 日志固定写入 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`，5MB 轮换；日志页只读显示当前文件最近 300 行，按文件长度变化刷新。
 - 控制台不可见时，启动致命错误额外弹 MessageBox。
 
@@ -75,7 +76,7 @@
 - `src/settings_preview.rs`：CPU 预览合成，移到独立模块。
 - `src/autostart.rs`：启动文件夹 VBS 的读写。
 - `src/platform.rs`：托盘菜单（含“重启程序”）、跨进程重启消息、设置路径/缓存/覆盖信息传递。
-- `src/app.rs` / `src/main.rs`：覆盖信息传递、`RunOutcome` 重启、无参数设置入口。
+- `src/app.rs` / `src/main.rs`：覆盖信息传递、`RunOutcome` 重启、无参数设置入口、GUI 子系统与父控制台附着、后台进程标准句柄置空。
 
 ## 验证
 
@@ -85,6 +86,8 @@
   - 保存 `wall / slide-left / 0.8s / 8s / static / Ken Burns off`、`idle=7`、`mouse_only=true`、`cache_days=45`、`cache_max_mb=1024`、`motion_fps=24` 全部写回；
   - 高级字段 `custom_advanced` 保留；
   - 无参数启动直接进入设置页；保存后自动启动后台实例；
+  - 通过 wscript 在无父控制台环境启动设置并保存：无错误弹窗，后台实例和托盘正常启动；
+  - release PE subsystem=GUI，双击不再创建控制台；`--help` 从 PowerShell 启动仍有输出；
   - 从托盘打开设置保存后，后台进程 PID 变化（立即重启）；
   - 托盘“重启程序”后 PID 变化；
   - 清理缓存按钮删除测试文件，统计从 `1 张 / 1KB` 变为 `0 张`；

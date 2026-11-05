@@ -72,7 +72,12 @@ impl Logger {
                 }
             }
             Err(err) => {
-                eprintln!("日志文件不可写 {}: {err}", path.display());
+                // windows 子系统下可能没有控制台；写 stderr 失败时不能 panic。
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "日志文件不可写 {}: {err}",
+                    path.display()
+                );
                 Self {
                     file: None,
                     path,

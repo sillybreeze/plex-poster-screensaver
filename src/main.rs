@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 //! plex-poster-screensaver（Rust 重写版）
 //!
 //! 从 Plex 媒体库随机取海报全屏轮播，自动提取主色做氛围光，并带 Ken Burns 缓慢推近。
@@ -34,7 +39,15 @@ mod timer {
 }
 #[cfg(windows)]
 mod console {
-    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    use windows::core::w;
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleProcessList, GetStdHandle, SetStdHandle,
+        ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ConsoleState {
@@ -44,6 +57,46 @@ mod console {
         Shared,
         /// 双击等场景单独分配的控制台，已经释放。
         Hidden,
+    }
+
+    fn valid_handle(handle: HANDLE) -> bool {
+        !handle.0.is_null() && handle != INVALID_HANDLE_VALUE
+    }
+
+    /// release 版是 windows 子系统，不会给双击启动创建黑框。这里主动附着到
+    /// 启动它的 cmd/PowerShell 控制台，恢复 `--help`/`--list` 等命令行输出。
+    pub fn attach_parent() {
+        unsafe {
+            let Ok(()) = AttachConsole(ATTACH_PARENT_PROCESS) else {
+                return;
+            };
+            // 如果父进程已经传了有效的重定向句柄（例如 `> out.txt`），保留它；
+            // 否则用 CONOUT$ 补一个控制台句柄。
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE)
+                .ok()
+                .filter(|handle| valid_handle(*handle))
+                .or_else(|| {
+                    CreateFileW(
+                        w!("CONOUT$"),
+                        GENERIC_READ.0 | GENERIC_WRITE.0,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        None,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        None,
+                    )
+                    .ok()
+                });
+            if let Some(handle) = stdout {
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+                let stderr = GetStdHandle(STD_ERROR_HANDLE)
+                    .ok()
+                    .filter(|handle| valid_handle(*handle));
+                if stderr.is_none() {
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+                }
+            }
+        }
     }
 
     /// 只释放进程独占的控制台。判断依据是同一控制台里是否还有别的进程：
@@ -75,6 +128,8 @@ mod console {
         Hidden,
     }
 
+    pub fn attach_parent() {}
+
     pub fn hide_if_private() -> ConsoleState {
         ConsoleState::None
     }
@@ -94,7 +149,7 @@ mod trigger;
 use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use app::RunOutcome;
@@ -163,6 +218,9 @@ fn launch_background(config_path: Option<&Path>) -> Result<(), String> {
     }
     command
         .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("启动后台实例失败: {err}"))
@@ -178,12 +236,16 @@ fn relaunch_current() -> Result<(), String> {
     Command::new(exe)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("重启程序失败: {err}"))
 }
 
 fn main() {
+    console::attach_parent();
     logging::init();
 
     let args = match config::parse_args() {

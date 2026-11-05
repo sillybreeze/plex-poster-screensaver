@@ -161,7 +161,7 @@ Plex 测试连接在后台线程执行，不会卡住窗口；连接结果会区
 
 ### 控制台与日志
 
-后台启动（`--background`、开机自启或计划任务）时，如果控制台是本进程独占的，程序会主动释放它，不再一直挂着一个黑色终端窗口。从 `cmd` / PowerShell 启动时会保留共用的控制台，`--help`、`--list`、`--self-test`、`--snapshot` 等命令的输出仍然可见。
+release 版按 Windows GUI 子系统构建，双击、快捷方式启动时**不会创建控制台黑框**。从 `cmd` / PowerShell 启动时会附着到父控制台，`--help`、`--list`、`--self-test`、`--snapshot` 等命令的输出仍然可见；从资源管理器启动则没有控制台，错误改用 MessageBox。启动后台实例时显式把 stdin/stdout/stderr 置空，避免无控制台进程继承无效句柄导致 `os error 50`。
 
 日志始终写到 `%LOCALAPPDATA%\PlexPosterScreensaver\logs\app.log`（超过 5MB 轮换），托盘菜单的“打开日志目录”和设置中心的“日志”页都可以查看。控制台不可见时，致命配置/启动错误会额外弹一个 MessageBox，避免程序一闪而过没有任何提示。
 
