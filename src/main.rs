@@ -9,7 +9,9 @@
 
 mod app;
 mod autostart;
+mod cli;
 mod config;
+mod config_validate;
 mod gpu;
 
 /// Windows 默认定时器精度约 15.6ms，会把 30fps 凑整成 15fps，动效一顿一顿的。
@@ -194,11 +196,11 @@ fn show_error(message: &str) {
 ///
 /// 保存成功且没有正在运行的后台实例时，保存后按新配置启动一个
 /// `--background` 实例；如果已有实例，设置保存会请求它重启。
-fn run_settings_only(args: &config::Args, config_path: Option<PathBuf>) -> Result<(), String> {
+fn run_settings_only(args: &cli::Args, config_path: Option<PathBuf>) -> Result<(), String> {
     let cfg = config::load(args)?;
     let path = config::display_settings_path(config_path.as_deref());
     let cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
-    let overrides = config::SettingsOverrides::from_args(args);
+    let overrides = cli::SettingsOverrides::from_args(args);
     let page = if cfg.token.is_empty() {
         settings::Page::Plex
     } else {
@@ -250,15 +252,15 @@ fn main() {
     console::attach_parent();
     logging::init();
 
-    let args = match config::parse_args() {
+    let args = match cli::parse_args() {
         Ok(a) => a,
         Err(err) => {
-            log_error!("参数错误: {err}\n\n{}", config::HELP);
+            log_error!("参数错误: {err}\n\n{}", cli::HELP);
             std::process::exit(2);
         }
     };
     if args.help {
-        print!("{}", config::HELP);
+        print!("{}", cli::HELP);
         return;
     }
     if let Some(seconds) = args.diagnose_foreground {
@@ -321,7 +323,7 @@ fn main() {
             fatal_error(&format!("配置错误: {err}"), 2, popup_errors);
         }
     };
-    let settings_overrides = config::SettingsOverrides::from_args(&args);
+    let settings_overrides = cli::SettingsOverrides::from_args(&args);
     if cfg.token.is_empty() && !utility && !args.background {
         log_warn!("未配置 Plex Token，先打开首次设置");
         let preview_cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);

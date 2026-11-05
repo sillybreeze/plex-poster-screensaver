@@ -71,7 +71,9 @@
 
 ## 实现位置
 
-- `src/config.rs`：`EditableSettings`、`SettingsOverrides`、读写/校验/迁移。
+- `src/config.rs`：配置模型、文件读取和启动校验。
+- `src/cli.rs`：`Args`、命令行解析和覆盖字段汇总。
+- `src/config_validate.rs`：GUI 保存与启动加载共用的范围/URL/Token 规则。
 - `src/settings.rs`：窗口状态、消息循环和保存按钮的界面错误展示。
 - `src/settings/pages.rs`：六个页面的原生控件布局和尺寸。
 - `src/settings_apply.rs`：配置保存、自启同步、重启请求的顺序与失败语义；带可注入的保存失败/自启失败/重启测试。
@@ -82,7 +84,7 @@
 
 ## 验证
 
-- `cargo test --release --offline`：114 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
+- `cargo test --release --offline`：116 个测试通过；`cargo clippy --release --offline --all-targets` 无警告。
 - GUI 验证：
   - 六个页面逐页截图，Plex 测试连接成功并列出 4 个媒体库；
   - 保存 `wall / slide-left / 0.8s / 8s / static / Ken Burns off`、`idle=7`、`mouse_only=true`、`cache_days=45`、`cache_max_mb=1024`、`motion_fps=24` 全部写回；
