@@ -159,9 +159,10 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use app::RunOutcome;
+use cache::Cache;
 use config::{CacheLocation, Config};
 use logging::{log_error, log_info, log_warn};
-use plex::{Cache, Client, Section};
+use plex::{Client, Section};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -199,8 +200,8 @@ fn show_error(message: &str) {
 /// 保存成功且没有正在运行的后台实例时，保存后按新配置启动一个
 /// `--background` 实例；如果已有实例，设置保存会请求它重启。
 fn run_settings_only(args: &cli::Args, config_path: Option<PathBuf>) -> Result<(), String> {
-    let cfg = config::load(args)?;
-    let path = config::display_settings_path(config_path.as_deref());
+    let cfg = config_file::load(args)?;
+    let path = config_file::display_settings_path(config_path.as_deref());
     let cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
     let overrides = cli::SettingsOverrides::from_args(args);
     let page = if cfg.token.is_empty() {
@@ -270,7 +271,7 @@ fn main() {
         return;
     }
 
-    let mut config_path = config::locate_config(args.config.as_deref());
+    let mut config_path = config_file::locate_config(args.config.as_deref());
 
     // --help / --list / --self-test / --snapshot 是工具命令，不能被单实例逻辑拦住。
     // 只有真正要开窗口的模式才检查是否已有实例在跑。
@@ -319,7 +320,7 @@ fn main() {
     };
     let trigger_event = instance.as_ref().and_then(|guard| guard.event());
 
-    let mut cfg = match config::load(&args) {
+    let mut cfg = match config_file::load(&args) {
         Ok(cfg) => cfg,
         Err(err) => {
             fatal_error(&format!("配置错误: {err}"), 2, popup_errors);
@@ -329,7 +330,7 @@ fn main() {
     if cfg.token.is_empty() && !utility && !args.background {
         log_warn!("未配置 Plex Token，先打开首次设置");
         let preview_cache = Cache::auto(&cfg.cache_dir, cfg.cache_days, cfg.cache_naming);
-        let settings_path = config::display_settings_path(config_path.as_deref());
+        let settings_path = config_file::display_settings_path(config_path.as_deref());
         if let Err(err) = settings::run_modal(
             settings_path,
             preview_cache,
@@ -338,8 +339,8 @@ fn main() {
         ) {
             log_warn!("首次设置窗口打开失败: {err}");
         }
-        config_path = config::locate_config(args.config.as_deref());
-        cfg = match config::load(&args) {
+        config_path = config_file::locate_config(args.config.as_deref());
+        cfg = match config_file::load(&args) {
             Ok(cfg) => cfg,
             Err(err) => fatal_error(&format!("配置错误: {err}"), 2, popup_errors),
         };

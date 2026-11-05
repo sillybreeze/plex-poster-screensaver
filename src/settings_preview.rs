@@ -6,9 +6,9 @@ use image::imageops::FilterType;
 use image::RgbImage;
 use windows::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER};
 
+use crate::cache::Cache;
 use crate::config::{DisplayLayout, DisplaySettings, MotionMode, MAX_TRANSITION_SECONDS};
 use crate::layout::WALL_POSTERS;
-use crate::plex::Cache;
 use crate::render::{self, Frame, DIRECTIONS};
 
 const PREVIEW_MAX_HOLD: f64 = 4.0;

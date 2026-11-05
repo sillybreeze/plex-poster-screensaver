@@ -48,12 +48,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
+use crate::cache::Cache;
+use crate::cli::SettingsOverrides;
 use crate::config::{
-    self, Config, DisplayLayout, DisplaySettings, EditableSettings, MotionMode, Naming,
-    SettingsOverrides, Transition,
+    Config, DisplayLayout, DisplaySettings, EditableSettings, MotionMode, Naming, Transition,
 };
 use crate::logging::{log_error, log_info, log_warn};
-use crate::plex::{Cache, Client, Section};
+use crate::plex::{Client, Section};
 use crate::settings_preview::{load_preview_images, PreviewState};
 
 const WINDOW_TITLE: &str = "Plex 海报屏保 - 设置";
@@ -489,7 +490,7 @@ fn create_controls(
         instance,
         font,
     )?;
-    let (settings, load_error) = match config::load_editable_settings(path.as_deref()) {
+    let (settings, load_error) = match crate::config_file::load_editable_settings(path.as_deref()) {
         Ok(settings) => (settings, None),
         Err(err) => (EditableSettings::default(), Some(err)),
     };

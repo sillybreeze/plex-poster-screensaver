@@ -17,12 +17,14 @@ use winit::platform::windows::WindowExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::config::{Config, DisplayLayout, MotionMode, SettingsOverrides};
+use crate::cache::Cache;
+use crate::cli::SettingsOverrides;
+use crate::config::{Config, DisplayLayout, MotionMode};
 use crate::gpu::{Gpu, GpuError, PresentStatus, Textures};
 use crate::idle::{self, Idle};
 use crate::logging::{log_error, log_info, log_warn, Throttle};
 use crate::platform::Platform;
-use crate::plex::{Cache, Client, Section};
+use crate::plex::{Client, Section};
 use crate::render::{self, SlideDirection, TransitionKind, DIRECTIONS};
 use crate::status::{self, Shared};
 
@@ -458,7 +460,7 @@ impl App {
         }
 
         let tray_proxy = event_loop.create_proxy();
-        let settings_path = crate::config::display_settings_path(self.config_path.as_deref());
+        let settings_path = crate::config_file::display_settings_path(self.config_path.as_deref());
         match crate::platform::start(
             tray_proxy,
             self.status.clone(),

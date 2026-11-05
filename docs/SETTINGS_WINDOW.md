@@ -76,7 +76,7 @@
 - `src/cli.rs`：`Args`、命令行解析和覆盖字段汇总。
 - `src/config_validate.rs`：GUI 保存与启动加载共用的范围/URL/Token 规则。
 - `src/settings.rs`：窗口状态、消息循环和保存按钮的界面错误展示。
-- `src/settings/pages.rs`：六个页面的原生控件布局和尺寸。
+- `src/settings/pages.rs`：六个页面各自一个构建函数，`build` 只负责窗口分页框架。
 - `src/settings_apply.rs`：配置保存、自启同步、重启请求的顺序与失败语义；带可注入的保存失败/自启失败/重启测试。
 - `src/settings_preview.rs`：CPU 预览合成，移到独立模块。
 - `src/plex.rs`：Plex HTTP 客户端与媒体模型。

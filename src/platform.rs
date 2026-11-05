@@ -56,9 +56,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
-use crate::config::SettingsOverrides;
+use crate::cache::Cache;
+use crate::cli::SettingsOverrides;
 use crate::logging::{log_info, log_warn};
-use crate::plex::Cache;
 use crate::settings;
 use crate::status;
 

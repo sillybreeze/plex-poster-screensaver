@@ -11,7 +11,8 @@ pub(super) struct BuiltPages {
     pub(super) preview_size: (i32, i32),
 }
 
-#[allow(clippy::vec_init_then_push)]
+type DisplayPage = (Vec<HWND>, HWND, (i32, i32));
+
 pub(super) fn build(
     hwnd: HWND,
     instance: HINSTANCE,
@@ -64,7 +65,32 @@ pub(super) fn build(
         )?;
     }
 
-    // 显示页
+    let (display, preview, preview_size) = display_page(hwnd, instance, s, font)?;
+    pages[Page::Display.index()] = display;
+
+    pages[Page::Plex.index()] = plex_page(hwnd, instance, s, font)?;
+    pages[Page::Startup.index()] = startup_page(hwnd, instance, s, font)?;
+    pages[Page::Cache.index()] = cache_page(hwnd, instance, s, font)?;
+    pages[Page::Advanced.index()] = advanced_page(hwnd, instance, s, font)?;
+
+    let log_view = logs_page(hwnd, instance, s, font)?;
+    pages[Page::Logs.index()] = vec![log_view];
+
+    Ok(BuiltPages {
+        pages,
+        preview,
+        log_view,
+        preview_size,
+    })
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn display_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<DisplayPage, String> {
     let form_x = s(164);
     let label_w = s(112);
     let control_x = s(284);
@@ -236,9 +262,18 @@ pub(super) fn build(
         instance,
         font,
     )?);
-    pages[Page::Display.index()] = display;
 
-    // Plex 页
+    Ok((display, preview, (preview_w, preview_h)))
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn plex_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<Vec<HWND>, String> {
+    let form_x = s(164);
     let mut plex = Vec::new();
     plex.push(create_static(
         hwnd,
@@ -388,9 +423,18 @@ pub(super) fn build(
         instance,
         font,
     )?);
-    pages[Page::Plex.index()] = plex;
 
-    // 启动与热键页
+    Ok(plex)
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn startup_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<Vec<HWND>, String> {
+    let form_x = s(164);
     let mut startup = Vec::new();
     startup.push(create_checkbox(
         hwnd,
@@ -503,9 +547,18 @@ pub(super) fn build(
         instance,
         font,
     )?);
-    pages[Page::Startup.index()] = startup;
 
-    // 缓存页
+    Ok(startup)
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn cache_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<Vec<HWND>, String> {
+    let form_x = s(164);
     let mut cache_page = Vec::new();
     cache_page.push(create_static(
         hwnd,
@@ -699,9 +752,18 @@ pub(super) fn build(
         instance,
         font,
     )?);
-    pages[Page::Cache.index()] = cache_page;
 
-    // 高级页
+    Ok(cache_page)
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn advanced_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<Vec<HWND>, String> {
+    let form_x = s(164);
     let mut advanced = Vec::new();
     advanced.push(create_static(
         hwnd,
@@ -790,16 +852,17 @@ pub(super) fn build(
         instance,
         font,
     )?);
-    pages[Page::Advanced.index()] = advanced;
 
-    // 日志页
-    let log_view = create_log_view(hwnd, content_x, s(64), content_w, s(420), instance, font)?;
-    pages[Page::Logs.index()] = vec![log_view];
+    Ok(advanced)
+}
 
-    Ok(BuiltPages {
-        pages,
-        preview,
-        log_view,
-        preview_size: (preview_w, preview_h),
-    })
+fn logs_page(
+    hwnd: HWND,
+    instance: HINSTANCE,
+    s: &impl Fn(i32) -> i32,
+    font: HFONT,
+) -> Result<HWND, String> {
+    let content_x = s(152);
+    let content_w = s(732);
+    create_log_view(hwnd, content_x, s(64), content_w, s(420), instance, font)
 }

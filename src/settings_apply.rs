@@ -26,7 +26,7 @@ struct SystemApplier;
 
 impl Applier for SystemApplier {
     fn save(&self, path: Option<&Path>, settings: &EditableSettings) -> Result<(), String> {
-        crate::config::save_editable_settings(path, settings)
+        crate::config_file::save_editable_settings(path, settings)
     }
 
     fn autostart_enabled(&self) -> bool {

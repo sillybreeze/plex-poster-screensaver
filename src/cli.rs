@@ -267,3 +267,64 @@ pub(crate) fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<A
 fn parse_num<T: std::str::FromStr>(raw: &str) -> Result<T, String> {
     raw.parse::<T>().map_err(|_| format!("无效的数值: {raw}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DisplayLayout, MotionMode, Transition};
+
+    #[test]
+    fn parse_args_accepts_display_flags() {
+        let args = parse_args_from(
+            [
+                "--layout",
+                "wall",
+                "--transition",
+                "slide-up",
+                "--motion",
+                "static",
+                "--fade",
+                "1.5",
+                "--display",
+                "8",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(args.layout, Some(DisplayLayout::Wall));
+        assert_eq!(args.transition, Some(Transition::SlideUp));
+        assert_eq!(args.motion, Some(MotionMode::Static));
+        assert_eq!(args.fade, Some(1.5));
+        assert_eq!(args.display, Some(8.0));
+    }
+    #[test]
+    fn parse_args_reports_invalid_enum_with_flag_name() {
+        for (flag, value, name) in [
+            ("--layout", "mosaic", "--layout"),
+            ("--transition", "wipe", "--transition"),
+            ("--motion", "slow", "--motion"),
+        ] {
+            let err = parse_args_from([flag.to_string(), value.to_string()])
+                .expect_err("未知枚举值必须报错");
+            assert!(
+                err.contains(name),
+                "错误信息应包含参数名 {name}，实际为 {err}"
+            );
+        }
+    }
+    #[test]
+    fn settings_overrides_summarize_launch_overrides() {
+        let args = Args {
+            url: Some("http://x".to_string()),
+            layout: Some(DisplayLayout::Wall),
+            no_transcode: true,
+            ..Args::default()
+        };
+        let overrides = SettingsOverrides::from_args(&args);
+        assert!(overrides.plex_url);
+        assert!(overrides.display_layout);
+        assert!(overrides.transcode);
+        assert!(overrides.summary().contains("Plex 地址"));
+        assert!(overrides.summary().contains("Plex 高级选项"));
+    }
+}

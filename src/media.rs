@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use image::RgbImage;
 
+use crate::cache::Cache;
 use crate::config::DisplayLayout;
 use crate::layout::WALL_POSTERS;
 use crate::logging::{log_info, log_warn};
-use crate::plex::{Cache, Client, MediaItem, Section};
+use crate::plex::{Client, MediaItem, Section};
 use crate::render::{self, Frame};
 use crate::status::{self, Shared};
 
