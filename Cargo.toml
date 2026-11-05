@@ -1,6 +1,6 @@
 [package]
 name = "plex-poster-screensaver"
-version = "1.3.0"
+version = "1.3.2"
 edition = "2021"
 description = "Windows screensaver that displays your Plex movie and TV posters full-screen, with ambient color glow and Ken Burns motion."
 license = "MIT"
