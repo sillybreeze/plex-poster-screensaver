@@ -15,7 +15,8 @@ use serde_json::{Map, Value};
 use crate::cli::Args;
 use crate::config::{
     app_dir, exe_dir, CacheLocation, Config, DisplayLayout, DisplaySettings, EditableSettings,
-    Hotkey, MotionMode, Naming, Transition, MAX_TRANSITION_SECONDS, MIN_TRANSITION_SECONDS,
+    Hotkey, MotionMode, MultiMonitor, Naming, Transition, MAX_TRANSITION_SECONDS,
+    MIN_TRANSITION_SECONDS,
 };
 use crate::logging::{log_info, log_warn};
 
@@ -165,6 +166,7 @@ pub(crate) struct FileConfig {
     display_layout: Option<String>,
     transition: Option<String>,
     motion_mode: Option<String>,
+    multi_monitor: Option<String>,
     cache_dir: Option<String>,
     cache_naming: Option<String>,
     cache_days: Option<i64>,
@@ -249,7 +251,7 @@ pub fn load(args: &Args) -> Result<Config, String> {
     cfg.cache_location = location;
     cfg.cache_dir = dir;
 
-    cfg.url = cfg.url.trim_end_matches('/').to_string();
+    cfg.url = cfg.url.trim().trim_end_matches('/').to_string();
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -291,6 +293,11 @@ fn apply_file(cfg: &mut Config, file: &FileConfig) -> Result<(), String> {
     if let Some(raw) = &file.motion_mode {
         cfg.motion_mode = MotionMode::parse(raw).ok_or_else(|| {
             format!("config.json 里的 motion_mode 无效（animated|static）: {raw}")
+        })?;
+    }
+    if let Some(raw) = &file.multi_monitor {
+        cfg.multi_monitor = MultiMonitor::parse(raw).ok_or_else(|| {
+            format!("config.json 里的 multi_monitor 无效（black|primary|sync）: {raw}")
         })?;
     }
     if let Some(v) = &file.cache_naming {
@@ -372,6 +379,9 @@ fn apply_args(cfg: &mut Config, args: &Args) {
     }
     if args.no_motion {
         cfg.motion_mode = MotionMode::Static;
+    }
+    if let Some(v) = args.multi_monitor {
+        cfg.multi_monitor = v;
     }
     if let Some(v) = args.motion_fps {
         cfg.motion_fps = v;
@@ -856,6 +866,7 @@ mod tests {
             (r#"{"display_layout":"mosaic"}"#, "display_layout"),
             (r#"{"transition":"wipe"}"#, "transition"),
             (r#"{"motion_mode":"slow"}"#, "motion_mode"),
+            (r#"{"multi_monitor":"extend"}"#, "multi_monitor"),
         ] {
             let file: FileConfig = serde_json::from_str(json).unwrap();
             let mut cfg = Config::default();

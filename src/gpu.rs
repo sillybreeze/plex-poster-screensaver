@@ -37,8 +37,7 @@ use crate::render::Frame;
 const SHADER: &str = r#"
 cbuffer Params : register(b0)
 {
-    float2 screenSize;
-    float2 bgOffset;
+    float4 bgRect;
     float4 posterRect;
     float4 posterUV;
     float4 colorAlpha;
@@ -60,10 +59,10 @@ VSOut VS(uint id : SV_VertexID)
 
 float4 PS(VSOut i) : SV_Target
 {
-    float2 uv = (i.pos.xy - bgOffset) / screenSize;
+    float2 uv = (i.pos.xy - bgRect.xy) / bgRect.zw;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
     {
-        // 海报墙整张画布滑入时，还没覆盖到的地方保留旧场景。
+        // 海报墙整张画布滑入或副屏等比适配时，未覆盖区域保留底色或旧场景。
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
@@ -86,8 +85,7 @@ float4 PS(VSOut i) : SV_Target
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Params {
-    screen: [f32; 2],
-    bg_offset: [f32; 2],
+    bg_rect: [f32; 4],
     rect: [f32; 4],
     uv: [f32; 4],
     /// x = 海报层透明度，w = 背景/整屏画布透明度。
@@ -449,18 +447,18 @@ impl Gpu {
         Ok(())
     }
 
-    /// 把预取线程合成好的一帧上传成纹理，一张图只做一次。
+    /// 把预取线程合成好的一帧上传成纹理；当目标分辨率与合成尺寸不同（副屏同步）时自动等比居中适配。
     pub fn upload(&self, frame: &Frame) -> Result<Textures, GpuError> {
-        let expected = self.width as usize * self.height as usize;
         match frame {
             Frame::Single(comp) => {
+                let expected = comp.width as usize * comp.height as usize;
                 if comp.background.len() != expected {
                     return Err(GpuError::text(
                         "上传纹理",
                         format!(
                             "背景缓冲区尺寸不匹配: 纹理 {}x{} 需要 {} 像素，实际 {} 像素",
-                            self.width,
-                            self.height,
+                            comp.width,
+                            comp.height,
                             expected,
                             comp.background.len()
                         ),
@@ -469,10 +467,10 @@ impl Gpu {
 
                 let bg_srv = create_texture(
                     &self.device,
-                    self.width,
-                    self.height,
+                    comp.width,
+                    comp.height,
                     comp.background.as_ptr() as *const u8,
-                    self.width * 4,
+                    comp.width * 4,
                 )?;
 
                 let (pw, ph) = (comp.poster.width(), comp.poster.height());
@@ -484,28 +482,26 @@ impl Gpu {
                 let poster_srv =
                     create_texture(&self.device, pw, ph, pixels.as_ptr() as *const u8, pw * 4)?;
 
-                Ok(Textures {
-                    bg: bg_srv,
-                    poster: Some(poster_srv),
-                    rect: [
+                let rect = if (comp.width, comp.height) == (self.width, self.height) {
+                    [
                         comp.position.0 as f32,
                         comp.position.1 as f32,
                         pw as f32,
                         ph as f32,
-                    ],
+                    ]
+                } else {
+                    fit_rect(pw, ph, self.width, self.height)
+                };
+
+                Ok(Textures {
+                    bg: bg_srv,
+                    poster: Some(poster_srv),
+                    rect,
                     wall: false,
                 })
             }
             Frame::Wall(wall) => {
-                if (wall.width, wall.height) != (self.width, self.height) {
-                    return Err(GpuError::text(
-                        "上传纹理",
-                        format!(
-                            "海报墙画布尺寸不匹配: 纹理 {}x{}，画布 {}x{}",
-                            self.width, self.height, wall.width, wall.height
-                        ),
-                    ));
-                }
+                let expected = wall.width as usize * wall.height as usize;
                 if wall.canvas.len() != expected {
                     return Err(GpuError::text(
                         "上传纹理",
@@ -523,12 +519,25 @@ impl Gpu {
                     wall.canvas.as_ptr() as *const u8,
                     wall.width * 4,
                 )?;
+                let rect = if (wall.width, wall.height) == (self.width, self.height) {
+                    [0.0, 0.0, wall.width as f32, wall.height as f32]
+                } else {
+                    fit_rect(wall.width, wall.height, self.width, self.height)
+                };
                 Ok(Textures {
                     bg: bg_srv,
                     poster: None,
-                    rect: [0.0, 0.0, wall.width as f32, wall.height as f32],
+                    rect,
                     wall: true,
                 })
+            }
+        }
+    }
+
+    pub fn clear(&self, color: [f32; 4]) {
+        unsafe {
+            if let Some(rtv) = self.render_target() {
+                self.context.ClearRenderTargetView(&rtv, &color);
             }
         }
     }
@@ -560,13 +569,17 @@ impl Gpu {
             };
 
             let params = Params {
-                screen: [self.width as f32, self.height as f32],
-                // 海报墙移动的是整张画布，背景 UV 也要跟着偏移；
+                // 海报墙移动整张画布（在异构分辨率副屏上带等比居中位置）；
                 // 单张布局背景始终铺满，只有海报图层移动。
-                bg_offset: if tex.wall {
-                    [offset.0, offset.1]
+                bg_rect: if tex.wall {
+                    [
+                        tex.rect[0] + offset.0,
+                        tex.rect[1] + offset.1,
+                        tex.rect[2],
+                        tex.rect[3],
+                    ]
                 } else {
-                    [0.0, 0.0]
+                    [0.0, 0.0, self.width as f32, self.height as f32]
                 },
                 rect: if tex.wall {
                     [0.0; 4]
@@ -652,6 +665,16 @@ impl Gpu {
             rtv
         }
     }
+}
+
+fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> [f32; 4] {
+    let scale =
+        (dst_w.max(1) as f32 / src_w.max(1) as f32).min(dst_h.max(1) as f32 / src_h.max(1) as f32);
+    let w = (src_w.max(1) as f32 * scale).round().max(1.0);
+    let h = (src_h.max(1) as f32 * scale).round().max(1.0);
+    let x = ((dst_w.max(1) as f32 - w) * 0.5).floor();
+    let y = ((dst_h.max(1) as f32 - h) * 0.5).floor();
+    [x, y, w, h]
 }
 
 fn compile(source: &str, entry: &str, target: &str) -> Result<ID3DBlob, GpuError> {
@@ -799,5 +822,18 @@ mod tests {
         .unwrap();
         assert_eq!(recovered, 5);
         assert_eq!(calls, 2, "编译失败不能被永久缓存");
+    }
+
+    #[test]
+    fn fit_rect_centers_and_preserves_aspect_ratio() {
+        assert_eq!(fit_rect(1920, 1080, 1920, 1080), [0.0, 0.0, 1920.0, 1080.0]);
+        assert_eq!(
+            fit_rect(1920, 1080, 1080, 1920),
+            [0.0, 656.0, 1080.0, 608.0]
+        );
+        assert_eq!(
+            fit_rect(1000, 1500, 1920, 1080),
+            [600.0, 0.0, 720.0, 1080.0]
+        );
     }
 }

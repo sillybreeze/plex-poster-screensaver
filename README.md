@@ -30,11 +30,12 @@ Windows 10/11 Plex 海报屏保。支持单张海报或海报墙、淡化/方向
   "transition_seconds": 0.6,
   "display_seconds": 10,
   "motion_mode": "animated",
-  "ken_burns": true
+  "ken_burns": true,
+  "multi_monitor": "black"
 }
 ```
 
-布局可选 `single`、`wall`；转场可选 `fade`、`slide_left`、`slide_right`、`slide_up`、`slide_down`、`random`；动效可选 `animated`、`static`。海报墙最多显示 6 张，短列表会自动调整网格。
+布局可选 `single`、`wall`；转场可选 `fade`、`slide_left`、`slide_right`、`slide_up`、`slide_down`、`random`；动效可选 `animated`、`static`；多显示器可选 `black`（主屏播放、副屏黑屏遮罩）、`primary`（仅主屏）、`sync`（所有屏幕同步显示）。海报墙最多显示 6 张，短列表会自动调整网格。
 
 ## 命令行
 
@@ -56,7 +57,7 @@ plex-poster-screensaver.exe --config config.json --self-test 5
 plex-poster-screensaver.exe --config config.json --snapshot out.png
 ```
 
-`--help` 查看全部参数。常用选项：`--idle <分钟>`、`--mouse-only`、`--hotkey <组合键>`、`--no-hotkey`、`--now`、`--fade <秒>`、`--cache-dir <目录>`。
+`--help` 查看全部参数。常用选项：`--idle <分钟>`、`--mouse-only`、`--hotkey <组合键>`、`--no-hotkey`、`--now`、`--fade <秒>`、`--multi-monitor <black|primary|sync>`、`--cache-dir <目录>`。
 
 ## 配置与日志
 

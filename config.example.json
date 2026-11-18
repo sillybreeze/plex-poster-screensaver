@@ -7,6 +7,7 @@
   "transition": "fade",
   "transition_seconds": 0.6,
   "motion_mode": "animated",
+  "multi_monitor": "black",
   "cache_dir": "covers",
   "cache_naming": "title",
   "cache_days": 30,

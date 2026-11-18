@@ -157,6 +157,45 @@ impl MotionMode {
     }
 }
 
+/// 多显示器处理方式：副屏黑屏遮罩、仅主屏、或所有屏幕同步显示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MultiMonitor {
+    /// 主屏播放海报，副屏全屏纯黑遮罩（默认）。
+    #[default]
+    Black,
+    /// 仅覆盖主屏（副屏保持可见）。
+    Primary,
+    /// 所有屏幕同步显示同一画面。
+    Sync,
+}
+
+impl MultiMonitor {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "black" | "blank" | "dark" | "黑屏" | "副屏黑屏" => Some(Self::Black),
+            "primary" | "main" | "single" | "仅主屏" => Some(Self::Primary),
+            "sync" | "mirror" | "all" | "同步" | "全屏同步" => Some(Self::Sync),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Black => "black",
+            Self::Primary => "primary",
+            Self::Sync => "sync",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Black => "副屏黑屏",
+            Self::Primary => "仅主屏",
+            Self::Sync => "全屏同步",
+        }
+    }
+}
+
 /// 转场时长的默认值、允许范围与旧参数的 0 值兼容规则。
 pub const DEFAULT_TRANSITION_SECONDS: f64 = 0.6;
 pub const MIN_TRANSITION_SECONDS: f64 = crate::config_validate::MIN_TRANSITION_SECONDS;
@@ -309,6 +348,7 @@ pub struct Config {
     pub display_layout: DisplayLayout,
     pub transition: Transition,
     pub motion_mode: MotionMode,
+    pub multi_monitor: MultiMonitor,
     pub cache_dir: PathBuf,
     pub cache_location: CacheLocation,
     /// 缓存文件用哪种命名
@@ -342,6 +382,7 @@ impl Default for Config {
             display_layout: DisplayLayout::default(),
             transition: Transition::default(),
             motion_mode: MotionMode::default(),
+            multi_monitor: MultiMonitor::default(),
             cache_dir: app_dir().join("covers"),
             cache_location: CacheLocation::Default,
             cache_naming: Naming::default(),
@@ -516,6 +557,7 @@ pub struct EditableSettings {
     pub verify_tls: bool,
     pub timeout: u64,
     pub display: DisplaySettings,
+    pub multi_monitor: MultiMonitor,
     pub motion_fps: u32,
     pub watch: bool,
     pub idle_minutes: f64,
@@ -542,6 +584,7 @@ impl Default for EditableSettings {
             verify_tls: cfg.verify_tls,
             timeout: cfg.timeout,
             display,
+            multi_monitor: cfg.multi_monitor,
             motion_fps: cfg.motion_fps,
             watch: cfg.watch,
             idle_minutes: cfg.idle_seconds / 60.0,
@@ -602,6 +645,14 @@ impl EditableSettings {
             settings.timeout = raw
                 .as_u64()
                 .ok_or_else(|| "config.json 里的 timeout 必须是整数".to_string())?;
+        }
+        if let Some(raw) = value.get("multi_monitor") {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| "config.json 里的 multi_monitor 必须是字符串".to_string())?;
+            settings.multi_monitor = MultiMonitor::parse(raw).ok_or_else(|| {
+                format!("config.json 里的 multi_monitor 无效（black|primary|sync）: {raw}")
+            })?;
         }
         if let Some(raw) = value.get("motion_fps") {
             settings.motion_fps = raw
@@ -696,6 +747,10 @@ impl EditableSettings {
         );
         map.insert("verify_tls".to_string(), Value::Bool(self.verify_tls));
         map.insert("timeout".to_string(), Value::from(self.timeout));
+        map.insert(
+            "multi_monitor".to_string(),
+            Value::String(self.multi_monitor.as_str().to_string()),
+        );
         map.insert("motion_fps".to_string(), Value::from(self.motion_fps));
         map.insert("watch".to_string(), Value::Bool(self.watch));
         map.insert("idle_minutes".to_string(), Value::from(self.idle_minutes));
@@ -931,6 +986,7 @@ mod tests {
             "transition_seconds": 0.8,
             "display_seconds": 8,
             "motion_mode": "static",
+            "multi_monitor": "sync",
             "ken_burns": false,
             "motion_fps": 24,
             "watch": true,
@@ -957,6 +1013,7 @@ mod tests {
         );
         assert_eq!(settings.display.display_layout, DisplayLayout::Wall);
         assert_eq!(settings.display.transition, Transition::SlideLeft);
+        assert_eq!(settings.multi_monitor, MultiMonitor::Sync);
         assert!((settings.display.transition_seconds - 0.8).abs() < 1e-9);
         assert_eq!(settings.motion_fps, 24);
         assert!(settings.mouse_only);
@@ -975,6 +1032,7 @@ mod tests {
         );
         assert_eq!(map.get("idle_minutes").unwrap().as_f64(), Some(7.0));
         assert_eq!(map.get("hotkey").unwrap().as_str(), Some("Ctrl+Shift+F9"));
+        assert_eq!(map.get("multi_monitor").unwrap().as_str(), Some("sync"));
     }
     #[test]
     fn editable_settings_validation_covers_all_ranges() {
@@ -1025,5 +1083,15 @@ mod tests {
             assert!(broken.validate(false).is_err(), "{label} 应被拒绝");
         }
         let _ = base;
+    }
+
+    #[test]
+    fn parses_multi_monitor_values() {
+        assert_eq!(MultiMonitor::parse("black"), Some(MultiMonitor::Black));
+        assert_eq!(MultiMonitor::parse("primary"), Some(MultiMonitor::Primary));
+        assert_eq!(MultiMonitor::parse("sync"), Some(MultiMonitor::Sync));
+        assert_eq!(MultiMonitor::parse("mirror"), Some(MultiMonitor::Sync));
+        assert_eq!(MultiMonitor::parse("unknown"), None);
+        assert_eq!(MultiMonitor::default(), MultiMonitor::Black);
     }
 }

@@ -4,6 +4,7 @@
 //! 和后台线程通道拿已经组合好的 `Slide`。
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -123,6 +124,132 @@ impl TaskGuard {
 
 /// 断网时每隔多久重试一次 Plex。
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+/// 海报墙并发拉取与解码的最大工作线程数，避免冷缓存时串行等待多个 RTT。
+const WALL_FETCH_WORKERS: usize = 4;
+
+struct WallTask {
+    index: usize,
+    item: MediaItem,
+    cached_path: Option<PathBuf>,
+}
+
+struct WallLoaded {
+    index: usize,
+    item: MediaItem,
+    image: RgbImage,
+    fetched_data: Option<Vec<u8>>,
+    discard_path: Option<PathBuf>,
+}
+
+struct WallFailed {
+    index: usize,
+    item: MediaItem,
+    error: String,
+    discard_path: Option<PathBuf>,
+}
+
+fn download_and_decode(
+    client: &Client,
+    item: &MediaItem,
+    size: (u32, u32),
+    guard: &TaskGuard,
+) -> Result<(RgbImage, Vec<u8>), String> {
+    if !guard.is_current() {
+        return Err(TASK_CANCELLED.to_string());
+    }
+    let data = client.fetch_cover(item, size.0, size.1)?;
+    if !guard.is_current() {
+        return Err(TASK_CANCELLED.to_string());
+    }
+    if data.is_empty() {
+        return Err(format!("封面内容为空: {}", item.title));
+    }
+    let img = render::decode(&data)?;
+    if !guard.is_current() {
+        return Err(TASK_CANCELLED.to_string());
+    }
+    Ok((img, data))
+}
+
+fn execute_wall_task(
+    task: WallTask,
+    mode: WallLoadMode,
+    client: &Client,
+    size: (u32, u32),
+    guard: &TaskGuard,
+) -> Result<WallLoaded, WallFailed> {
+    let WallTask {
+        index,
+        item,
+        cached_path,
+    } = task;
+    if !guard.is_current() {
+        return Err(WallFailed {
+            index,
+            item,
+            error: TASK_CANCELLED.to_string(),
+            discard_path: None,
+        });
+    }
+
+    let mut discard_path = None;
+    if let Some(path) = cached_path {
+        match render::decode_file(&path) {
+            Ok(image) => {
+                return Ok(WallLoaded {
+                    index,
+                    item,
+                    image,
+                    fetched_data: None,
+                    discard_path: None,
+                });
+            }
+            Err(err) => {
+                if !guard.is_current() {
+                    return Err(WallFailed {
+                        index,
+                        item,
+                        error: TASK_CANCELLED.to_string(),
+                        discard_path: None,
+                    });
+                }
+                if mode == WallLoadMode::Cached {
+                    return Err(WallFailed {
+                        index,
+                        item,
+                        error: err,
+                        discard_path: Some(path),
+                    });
+                }
+                log_warn!("缓存损坏，删除后重新下载: {err}");
+                discard_path = Some(path);
+            }
+        }
+    } else if mode == WallLoadMode::Cached {
+        return Err(WallFailed {
+            index,
+            item: item.clone(),
+            error: format!("缓存文件不存在: {}", item.title),
+            discard_path: None,
+        });
+    }
+
+    match download_and_decode(client, &item, size, guard) {
+        Ok((image, data)) => Ok(WallLoaded {
+            index,
+            item,
+            image,
+            fetched_data: Some(data),
+            discard_path,
+        }),
+        Err(error) => Err(WallFailed {
+            index,
+            item,
+            error,
+            discard_path,
+        }),
+    }
+}
 
 /// 按库轮询、分批补货，尽量不连续出现同一张；断网时退到本地索引播放。
 pub struct Source {
@@ -624,37 +751,117 @@ impl Source {
         picked
     }
 
-    /// 逐张取图；单张失败只记录并跳过，保留已经成功缓存/下载的海报。
+    /// 并发拉取/解码一组海报；单张失败只记录并跳过，保留已经成功缓存/下载的海报。
     ///
-    /// 返回失败张数，供调用方汇总日志；取消时立即返回，由调用方再检查代次。
+    /// 本地缓存查找与结果提交仍在调用线程通过 `TaskGate` 串行执行，避免多线程写索引竞争；
+    /// 磁盘解码与 HTTP 下载放在有界工作池里并发完成。
     fn load_wall_images(
         &mut self,
         items: Vec<MediaItem>,
         mode: WallLoadMode,
         loaded: &mut Vec<(MediaItem, RgbImage)>,
     ) -> usize {
-        let mut errors = 0usize;
+        if loaded.len() >= WALL_POSTERS || !self.guard.is_current() {
+            return 0;
+        }
+        let capacity = WALL_POSTERS - loaded.len();
+        let mut tasks = Vec::with_capacity(capacity);
+        let mut queued_keys: Vec<String> = Vec::with_capacity(capacity);
         for item in items {
-            if loaded.len() >= WALL_POSTERS || !self.guard.is_current() {
-                return errors;
+            if tasks.len() >= capacity || !self.guard.is_current() {
+                break;
             }
             if loaded
                 .iter()
                 .any(|(picked, _)| picked.rating_key == item.rating_key)
+                || queued_keys.iter().any(|key| key == &item.rating_key)
             {
                 continue;
             }
-            let result = match mode {
-                WallLoadMode::Online => self.image_for(&item),
-                WallLoadMode::Cached => self.cached_image(&item),
-            };
-            match result {
-                Ok(img) => loaded.push((item, img)),
-                Err(err) => {
+            let cached_path = self.cache.get(&item);
+            queued_keys.push(item.rating_key.clone());
+            tasks.push(WallTask {
+                index: tasks.len(),
+                item,
+                cached_path,
+            });
+        }
+        if tasks.is_empty() || !self.guard.is_current() {
+            return 0;
+        }
+
+        let client = &self.client;
+        let size = self.size;
+        let guard = &self.guard;
+        let mut outcomes: Vec<Result<WallLoaded, WallFailed>> = if tasks.len() == 1 {
+            let task = tasks.pop().unwrap();
+            vec![execute_wall_task(task, mode, client, size, guard)]
+        } else {
+            let worker_count = tasks.len().min(WALL_FETCH_WORKERS);
+            let queue = Mutex::new(VecDeque::from(tasks));
+            let results = Mutex::new(Vec::with_capacity(capacity));
+            std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    scope.spawn(|| loop {
+                        let next = {
+                            let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
+                            q.pop_front()
+                        };
+                        let Some(task) = next else {
+                            break;
+                        };
+                        let outcome = execute_wall_task(task, mode, client, size, guard);
+                        results
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(outcome);
+                    });
+                }
+            });
+            results.into_inner().unwrap_or_else(|p| p.into_inner())
+        };
+
+        if !self.guard.is_current() {
+            return 0;
+        }
+        outcomes.sort_by_key(|res| match res {
+            Ok(ok) => ok.index,
+            Err(err) => err.index,
+        });
+
+        let mut errors = 0usize;
+        for outcome in outcomes {
+            if !self.guard.is_current() {
+                return errors;
+            }
+            match outcome {
+                Ok(entry) => {
+                    if let Some(path) = entry.discard_path {
+                        let _ = self.commit_cache(|cache| cache.discard(&path));
+                    }
+                    if loaded.len() >= WALL_POSTERS {
+                        continue;
+                    }
+                    if let Some(data) = entry.fetched_data {
+                        if self
+                            .commit_cache(|cache| cache.store(&entry.item, &data))
+                            .is_none()
+                        {
+                            return errors;
+                        }
+                    } else {
+                        let _ = self.commit_cache(|cache| cache.remember(&entry.item));
+                    }
+                    loaded.push((entry.item, entry.image));
+                }
+                Err(failed) => {
+                    if let Some(path) = failed.discard_path {
+                        let _ = self.commit_cache(|cache| cache.discard(&path));
+                    }
                     if !self.guard.is_current() {
                         return errors;
                     }
-                    log_warn!("海报墙取图失败 {}: {err}", item.title);
+                    log_warn!("海报墙取图失败 {}: {}", failed.item.title, failed.error);
                     errors += 1;
                 }
             }
@@ -1000,6 +1207,142 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 3, "补位候选不能有重复");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 构造一个本地 HTTP 桩服务器，验证海报墙确实并发下载，且单张失败不拖垮整面墙。
+    fn spawn_mock_plex(
+        png: Vec<u8>,
+        fail_key: Option<&'static str>,
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let active_srv = active.clone();
+        let peak_srv = peak.clone();
+        let stop_srv = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let png = png.clone();
+                        let active = active_srv.clone();
+                        let peak = peak_srv.clone();
+                        handlers.push(thread::spawn(move || {
+                            let _ = stream.set_nonblocking(false);
+                            let mut buf = [0u8; 2048];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let line = req.lines().next().unwrap_or("");
+                            let path = line.split_whitespace().nth(1).unwrap_or("");
+                            if path.contains("/library/sections/") {
+                                let xml = r#"<MediaContainer size="4">
+                                    <Video ratingKey="M1" title="One" thumb="/thumb/M1"/>
+                                    <Video ratingKey="M2" title="Two" thumb="/thumb/M2"/>
+                                    <Video ratingKey="M3" title="Three" thumb="/thumb/M3"/>
+                                    <Video ratingKey="M4" title="Four" thumb="/thumb/M4"/>
+                                </MediaContainer>"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    xml.len(),
+                                    xml
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                            } else if path.contains("/thumb/") {
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                thread::sleep(delay);
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                if fail_key.is_some_and(|k| path.contains(k)) {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                    );
+                                } else {
+                                    let hdr = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        png.len()
+                                    );
+                                    let _ = stream.write_all(hdr.as_bytes());
+                                    let _ = stream.write_all(&png);
+                                }
+                            } else {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                            }
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+        (format!("http://{addr}"), peak, stop, handle)
+    }
+
+    #[test]
+    fn wall_fetches_uncached_posters_concurrently_and_survives_partial_error() {
+        let dir = wall_scratch_dir("concurrent");
+        let png = png_bytes(&dir, "sample", [120, 160, 210]);
+        let (url, peak, stop, srv) = spawn_mock_plex(png, Some("M3"), Duration::from_millis(80));
+
+        let cfg = Config {
+            url,
+            token: "tok".to_string(),
+            transcode: false,
+            timeout: 5,
+            ..Config::default()
+        };
+        let cache = Cache::open(&dir, 30, crate::config::Naming::Title).unwrap();
+        let sections = vec![Section {
+            key: "1".to_string(),
+            title: "Movies".to_string(),
+            kind: "movie".to_string(),
+        }];
+        let mut source = Source::new(
+            Client::new(&cfg),
+            cache.clone(),
+            sections,
+            (320, 180),
+            Vec::new(),
+            status::new(),
+            DisplayLayout::Wall,
+        );
+
+        let slide = source.next().expect("部分下载失败仍应组成 3 张海报墙");
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv.join();
+
+        assert_eq!(slide.items.len(), 3);
+        assert!(slide.items.iter().all(|item| item.rating_key != "M3"));
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "海报墙应并发下载，峰值并发={}",
+            peak.load(Ordering::SeqCst)
+        );
+        // 成功的 3 张应写入缓存。
+        assert_eq!(cache.stats().0, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -215,6 +215,30 @@ fn display_page(
         font,
     )?);
 
+    display.push(create_static(
+        hwnd,
+        "多显示器",
+        form_x,
+        s(306),
+        label_w,
+        s(20),
+        instance,
+        font,
+    )?);
+    let multi_monitor = create_combo(
+        hwnd,
+        control_x,
+        s(302),
+        control_w,
+        s(140),
+        ID_MULTI_MONITOR,
+        false,
+        instance,
+        font,
+    )?;
+    add_combo_items(multi_monitor, &["副屏黑屏", "仅主屏", "全屏同步"]);
+    display.push(multi_monitor);
+
     let preview_x = s(420);
     let preview_y = s(64);
     let preview_w = s(448);

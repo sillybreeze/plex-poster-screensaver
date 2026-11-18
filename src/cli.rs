@@ -2,7 +2,7 @@
 
 use std::env;
 
-use crate::config::{DisplayLayout, Hotkey, MotionMode, Naming, Transition};
+use crate::config::{DisplayLayout, Hotkey, MotionMode, MultiMonitor, Naming, Transition};
 
 /// 当前运行被哪些启动参数/环境变量覆盖；设置窗口只做提示，不改变保存目标。
 #[derive(Debug, Clone, Default)]
@@ -15,6 +15,7 @@ pub struct SettingsOverrides {
     pub transition_seconds: bool,
     pub display_layout: bool,
     pub motion_mode: bool,
+    pub multi_monitor: bool,
     pub motion_fps: bool,
     pub watch: bool,
     pub idle: bool,
@@ -41,6 +42,7 @@ impl SettingsOverrides {
             transition_seconds: args.fade.is_some(),
             display_layout: args.layout.is_some(),
             motion_mode: args.motion.is_some() || args.no_motion,
+            multi_monitor: args.multi_monitor.is_some(),
             motion_fps: args.motion_fps.is_some(),
             watch: args.watch || args.now,
             idle: args.idle.is_some(),
@@ -70,7 +72,7 @@ impl SettingsOverrides {
         if self.libraries {
             items.push("媒体库");
         }
-        if self.display_layout || self.transition || self.transition_seconds {
+        if self.display_layout || self.transition || self.transition_seconds || self.multi_monitor {
             items.push("显示效果");
         }
         if self.display_seconds {
@@ -114,6 +116,7 @@ pub struct Args {
     pub layout: Option<DisplayLayout>,
     pub transition: Option<Transition>,
     pub motion: Option<MotionMode>,
+    pub multi_monitor: Option<MultiMonitor>,
     pub motion_fps: Option<u32>,
     pub no_motion: bool,
     pub no_transcode: bool,
@@ -158,6 +161,7 @@ plex-poster-screensaver (Rust)
                         同时控制方向滑入时长
   --motion <模式>       animated=带动效（默认），static=静止轮播（无转场、无缩放）
   --no-motion           等同 --motion static（保留兼容）
+  --multi-monitor <模式> 多显示器：black=副屏黑屏（默认），primary=仅主屏，sync=全屏同步
   --motion-fps <帧率>   动效帧率，默认 30（1–120）
   --cache-dir <目录>    封面缓存位置（写不进去会直接报错）
   --cache-dir auto      自动挑一个可写目录
@@ -228,6 +232,12 @@ pub(crate) fn parse_args_from(raw: impl IntoIterator<Item = String>) -> Result<A
                         .ok_or_else(|| format!("--motion 的参数无效: {raw}（animated|static）"))?,
                 );
             }
+            "--multi-monitor" => {
+                let raw = value("--multi-monitor")?;
+                args.multi_monitor = Some(MultiMonitor::parse(&raw).ok_or_else(|| {
+                    format!("--multi-monitor 的参数无效: {raw}（black|primary|sync）")
+                })?);
+            }
             "--motion-fps" => args.motion_fps = Some(parse_num(&value("--motion-fps")?)?),
             "--no-motion" => args.no_motion = true,
             "--no-transcode" => args.no_transcode = true,
@@ -287,6 +297,8 @@ mod tests {
                 "1.5",
                 "--display",
                 "8",
+                "--multi-monitor",
+                "sync",
             ]
             .map(str::to_string),
         )
@@ -296,6 +308,7 @@ mod tests {
         assert_eq!(args.motion, Some(MotionMode::Static));
         assert_eq!(args.fade, Some(1.5));
         assert_eq!(args.display, Some(8.0));
+        assert_eq!(args.multi_monitor, Some(MultiMonitor::Sync));
     }
     #[test]
     fn parse_args_reports_invalid_enum_with_flag_name() {
@@ -303,6 +316,7 @@ mod tests {
             ("--layout", "mosaic", "--layout"),
             ("--transition", "wipe", "--transition"),
             ("--motion", "slow", "--motion"),
+            ("--multi-monitor", "extend", "--multi-monitor"),
         ] {
             let err = parse_args_from([flag.to_string(), value.to_string()])
                 .expect_err("未知枚举值必须报错");

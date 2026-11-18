@@ -51,7 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::cache::Cache;
 use crate::cli::SettingsOverrides;
 use crate::config::{
-    Config, DisplayLayout, DisplaySettings, EditableSettings, MotionMode, Naming, Transition,
+    Config, DisplayLayout, DisplaySettings, EditableSettings, MotionMode, MultiMonitor, Naming,
+    Transition,
 };
 use crate::logging::{log_error, log_info, log_warn};
 use crate::plex::{Client, Section};
@@ -64,6 +65,7 @@ const ID_TRANSITION_SECONDS: i32 = 1003;
 const ID_DISPLAY_SECONDS: i32 = 1004;
 const ID_MOTION: i32 = 1005;
 const ID_KEN_BURNS: i32 = 1006;
+const ID_MULTI_MONITOR: i32 = 1007;
 const ID_PREVIEW: i32 = 1010;
 const ID_HINT: i32 = 1011;
 
@@ -546,6 +548,11 @@ fn populate_controls(
     overrides: &SettingsOverrides,
 ) {
     populate_display(hwnd, &settings.display);
+    set_combo_index(
+        hwnd,
+        ID_MULTI_MONITOR,
+        multi_monitor_index(settings.multi_monitor),
+    );
     set_window_text(hwnd, ID_PLEX_URL, &settings.plex_url);
     set_window_text(hwnd, ID_PLEX_TOKEN, &settings.plex_token);
     set_checked(hwnd, ID_VERIFY_TLS, settings.verify_tls);
@@ -729,6 +736,11 @@ impl SettingsState {
     fn reset_display_defaults(&mut self) {
         let defaults = EditableSettings::default();
         populate_display(self.hwnd, &defaults.display);
+        set_combo_index(
+            self.hwnd,
+            ID_MULTI_MONITOR,
+            multi_monitor_index(defaults.multi_monitor),
+        );
         update_display_enabled(self.hwnd);
         self.preview.set_settings(defaults.display);
         self.invalidate_preview();
@@ -772,8 +784,16 @@ impl SettingsState {
         } else {
             field_token
         };
-        if url.is_empty() || token.trim().is_empty() {
-            set_window_text(self.hwnd, ID_TEST_STATUS, "请先填写服务器地址和 Token。");
+        if !crate::config_validate::valid_url(&url) {
+            set_window_text(
+                self.hwnd,
+                ID_TEST_STATUS,
+                "请输入有效的 http:// 或 https:// 服务器地址。",
+            );
+            return;
+        }
+        if token.trim().is_empty() {
+            set_window_text(self.hwnd, ID_TEST_STATUS, "请先填写 Token。");
             return;
         }
         let timeout = match parse_u64(&text_control(self.hwnd, ID_TIMEOUT)) {
@@ -975,12 +995,16 @@ fn read_editable(hwnd: HWND, sections_loaded: bool) -> Result<EditableSettings, 
         .map_err(|_| "动效帧率必须是整数".to_string())?;
 
     let settings = EditableSettings {
-        plex_url: text_control(hwnd, ID_PLEX_URL).trim().to_string(),
+        plex_url: text_control(hwnd, ID_PLEX_URL)
+            .trim()
+            .trim_end_matches('/')
+            .to_string(),
         plex_token: text_control(hwnd, ID_PLEX_TOKEN).trim().to_string(),
         libraries,
         verify_tls: checked(hwnd, ID_VERIFY_TLS),
         timeout,
         display,
+        multi_monitor: multi_monitor_from(combo_index(hwnd, ID_MULTI_MONITOR)),
         motion_fps,
         watch: checked(hwnd, ID_WATCH),
         idle_minutes,
@@ -1804,6 +1828,22 @@ fn motion_from(index: Option<usize>) -> MotionMode {
         MotionMode::Static
     } else {
         MotionMode::Animated
+    }
+}
+
+fn multi_monitor_index(mode: MultiMonitor) -> usize {
+    match mode {
+        MultiMonitor::Black => 0,
+        MultiMonitor::Primary => 1,
+        MultiMonitor::Sync => 2,
+    }
+}
+
+fn multi_monitor_from(index: Option<usize>) -> MultiMonitor {
+    match index {
+        Some(1) => MultiMonitor::Primary,
+        Some(2) => MultiMonitor::Sync,
+        _ => MultiMonitor::Black,
     }
 }
 

@@ -19,7 +19,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::cache::Cache;
 use crate::cli::SettingsOverrides;
-use crate::config::{Config, DisplayLayout, MotionMode};
+use crate::config::{Config, DisplayLayout, MotionMode, MultiMonitor};
 use crate::gpu::{Gpu, GpuError, PresentStatus, Textures};
 use crate::idle::{self, Idle};
 use crate::logging::{log_error, log_info, log_warn, Throttle};
@@ -51,6 +51,166 @@ const IDLE_GRACE: Duration = Duration::from_millis(700);
 /// 手动拉起（热键 / 再启动）留得久一点：按下和松开热键本身都算输入。
 const MANUAL_GRACE: Duration = Duration::from_millis(1200);
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+const WALL_CLEAR_COLOR: [f32; 4] = [
+    render::WALL_BACKGROUND[0] as f32 / 255.0,
+    render::WALL_BACKGROUND[1] as f32 / 255.0,
+    render::WALL_BACKGROUND[2] as f32 / 255.0,
+    1.0,
+];
+
+fn window_hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => Some(windows::Win32::Foundation::HWND(
+            h.hwnd.get() as *mut core::ffi::c_void
+        )),
+        _ => None,
+    }
+}
+
+fn is_primary_monitor(
+    monitor: &winit::monitor::MonitorHandle,
+    primary: Option<&winit::monitor::MonitorHandle>,
+) -> bool {
+    match primary {
+        Some(p) => p == monitor,
+        None => monitor.position() == winit::dpi::PhysicalPosition::new(0, 0),
+    }
+}
+
+/// 副屏窗口与渲染状态。副屏只跟随主屏切换节奏或显示纯黑遮罩，不独立拉取媒体。
+struct SecondaryScreen {
+    window: Arc<Window>,
+    size: (u32, u32),
+    minimized: bool,
+    gpu: Option<Gpu>,
+    current: Option<Textures>,
+    old: Option<Textures>,
+    needs_redraw: bool,
+    needs_present: bool,
+    pointer_start: Option<(f64, f64)>,
+}
+
+impl SecondaryScreen {
+    fn ensure_gpu(&mut self) -> bool {
+        if self.gpu.is_some() {
+            return true;
+        }
+        if self.minimized {
+            return false;
+        }
+        let Some(hwnd) = window_hwnd(&self.window) else {
+            return false;
+        };
+        match Gpu::new(hwnd, self.size.0, self.size.1) {
+            Ok(gpu) => {
+                self.gpu = Some(gpu);
+                true
+            }
+            Err(err) => {
+                log_warn!("副屏初始化 GPU 失败: {err}");
+                false
+            }
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            self.minimized = true;
+            return;
+        }
+        self.minimized = false;
+        let size = (width.max(1), height.max(1));
+        if size != self.size {
+            self.size = size;
+            if let Some(gpu) = &mut self.gpu {
+                if let Err(err) = gpu.resize(size.0, size.1) {
+                    log_warn!("副屏调整交换链尺寸失败: {err}");
+                    self.gpu = None;
+                    self.current = None;
+                    self.old = None;
+                }
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn clear_black(&mut self) {
+        if !self.needs_redraw || self.minimized {
+            return;
+        }
+        if !self.ensure_gpu() {
+            return;
+        }
+        let Some(gpu) = &self.gpu else {
+            return;
+        };
+        gpu.clear([0.0, 0.0, 0.0, 1.0]);
+        match gpu.present() {
+            Ok(_) => self.needs_redraw = false,
+            Err(err) if err.device_lost() => {
+                log_warn!("副屏黑屏设备丢失: {err}");
+                self.gpu = None;
+            }
+            Err(err) => log_warn!("副屏黑屏 Present 失败: {err}"),
+        }
+    }
+
+    fn upload(&mut self, frame: &render::Frame, keep_old: bool) {
+        if self.minimized || !self.ensure_gpu() {
+            return;
+        }
+        let uploaded = match &self.gpu {
+            Some(gpu) => gpu.upload(frame),
+            None => return,
+        };
+        match uploaded {
+            Ok(tex) => {
+                if keep_old {
+                    self.old = self.current.take();
+                } else {
+                    self.old = None;
+                }
+                self.current = Some(tex);
+                self.needs_redraw = true;
+            }
+            Err(err) => {
+                log_warn!("副屏上传纹理失败: {err}");
+                if err.device_lost() {
+                    self.gpu = None;
+                    self.current = None;
+                    self.old = None;
+                }
+            }
+        }
+    }
+
+    fn drop_gpu(&mut self) {
+        self.gpu = None;
+        self.current = None;
+        self.old = None;
+        self.needs_redraw = true;
+        self.needs_present = false;
+    }
+
+    fn present_if_needed(&mut self) {
+        if !self.needs_present {
+            return;
+        }
+        self.needs_present = false;
+        let Some(gpu) = &self.gpu else {
+            return;
+        };
+        if let Err(err) = gpu.present() {
+            if err.device_lost() {
+                log_warn!("副屏 Present 设备丢失: {err}");
+                self.drop_gpu();
+            } else {
+                log_warn!("副屏 Present 失败: {err}");
+            }
+        }
+    }
+}
 
 fn window_icon() -> Option<winit::window::Icon> {
     let rgba = image::load_from_memory(WINDOW_ICON_PNG).ok()?.to_rgba8();
@@ -312,6 +472,7 @@ pub struct App {
     /// 最小化时窗口尺寸为 0；此时只记录，不应用尺寸/重建资源。
     minimized: bool,
     window: Option<Arc<Window>>,
+    secondaries: Vec<SecondaryScreen>,
     gpu: Option<Gpu>,
     gpu_recovery: GpuRecovery,
     /// 非设备类 Present 错误的日志限流，避免瞬时错误刷屏。
@@ -331,7 +492,7 @@ pub struct App {
 
     next_frame_at: Instant,
     grace_until: Instant,
-    pointer_start: (f64, f64),
+    pointer_start: Option<(f64, f64)>,
     /// 窗口连续变化时只记录目标，等稳定后再统一重建交换链和预取线程。
     sizes: SizeSchedule,
     frames: u64,
@@ -391,6 +552,7 @@ impl App {
             size: (1920, 1080),
             minimized: false,
             window: None,
+            secondaries: Vec::new(),
             gpu: None,
             gpu_recovery: GpuRecovery::default(),
             transient_log: Throttle::default(),
@@ -407,7 +569,7 @@ impl App {
                 .unwrap_or(0x9e37_79b9_7f4a_7c15),
             next_frame_at: now,
             grace_until: now + Duration::from_millis(1500),
-            pointer_start: (0.0, 0.0),
+            pointer_start: None,
             sizes: SizeSchedule::default(),
             frames: 0,
             last_report: now,
@@ -418,7 +580,7 @@ impl App {
 
     pub fn run(mut self, trigger: Option<HANDLE>) -> Result<RunOutcome, String> {
         log_info!(
-            "显示设置：布局={}（{}） 转场={}（{}，{:.1} 秒） 动效={}（{}） KenBurns={}",
+            "显示设置：布局={}（{}） 转场={}（{}，{:.1} 秒） 动效={}（{}） KenBurns={} 多显示器={}（{}）",
             self.cfg.display_layout.as_str(),
             self.cfg.display_layout.label(),
             self.cfg.transition.as_str(),
@@ -426,7 +588,9 @@ impl App {
             self.cfg.transition_seconds,
             self.cfg.motion_mode.as_str(),
             self.cfg.motion_mode.label(),
-            if self.cfg.ken_burns { "开" } else { "关" }
+            if self.cfg.ken_burns { "开" } else { "关" },
+            self.cfg.multi_monitor.as_str(),
+            self.cfg.multi_monitor.label()
         );
         if let Some(w) = &self.watch {
             log_info!(
@@ -504,14 +668,9 @@ impl App {
         let Some(window) = self.window.clone() else {
             return false;
         };
-        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => {
-                windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)
-            }
-            _ => {
-                log_error!("无法获取窗口句柄");
-                return false;
-            }
+        let Some(hwnd) = window_hwnd(&window) else {
+            log_error!("无法获取窗口句柄");
+            return false;
         };
         match Gpu::new(hwnd, self.size.0, self.size.1) {
             Ok(gpu) => {
@@ -535,6 +694,59 @@ impl App {
             log_error!("{err}；{retry} 秒后重试");
         } else {
             log_error!("{err}；已抑制 {suppressed} 条同类日志；{retry} 秒后重试");
+        }
+    }
+
+    fn clear_secondaries(&mut self) {
+        self.secondaries.clear();
+    }
+
+    fn sync_secondaries(&mut self, event_loop: &ActiveEventLoop) {
+        self.clear_secondaries();
+        if self.preview || self.cfg.multi_monitor == MultiMonitor::Primary {
+            return;
+        }
+        let primary = event_loop.primary_monitor();
+        let icon = window_icon();
+        for monitor in event_loop.available_monitors() {
+            if is_primary_monitor(&monitor, primary.as_ref()) {
+                continue;
+            }
+            let size = monitor.size();
+            let attrs = Window::default_attributes()
+                .with_title("Plex 海报屏保")
+                .with_decorations(false)
+                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+            match event_loop.create_window(attrs) {
+                Ok(w) => {
+                    let window = Arc::new(w);
+                    if let Some(icon) = &icon {
+                        window.set_window_icon(Some(icon.clone()));
+                        window.set_taskbar_icon(Some(icon.clone()));
+                    }
+                    let mut sec = SecondaryScreen {
+                        window,
+                        size: (size.width.max(1), size.height.max(1)),
+                        minimized: false,
+                        gpu: None,
+                        current: None,
+                        old: None,
+                        needs_redraw: true,
+                        needs_present: false,
+                        pointer_start: None,
+                    };
+                    if self.cfg.multi_monitor == MultiMonitor::Black {
+                        sec.clear_black();
+                    } else {
+                        sec.ensure_gpu();
+                    }
+                    self.secondaries.push(sec);
+                }
+                Err(err) => log_warn!("创建副屏窗口失败: {err}"),
+            }
+        }
+        if let Some(window) = &self.window {
+            window.focus_window();
         }
     }
 
@@ -615,8 +827,11 @@ impl App {
         self.uv = [0.0, 0.0, 1.0, 1.0];
         self.frame_shown = false;
         self.last_direction = None;
+        self.pointer_start = None;
         self.next_frame_at = now;
         self.grace_until = now + if manual { MANUAL_GRACE } else { IDLE_GRACE };
+
+        self.sync_secondaries(event_loop);
 
         if let Some(w) = &mut self.watch {
             w.showing = true;
@@ -629,6 +844,7 @@ impl App {
     /// 有人动了：收起屏保，回到常驻等待。
     fn hide_screensaver(&mut self, now: Instant) {
         log_info!("收起屏保");
+        self.clear_secondaries();
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
             window.set_visible(false);
@@ -644,6 +860,7 @@ impl App {
         self.progress = 0.0;
         self.frame_shown = false;
         self.last_direction = None;
+        self.pointer_start = None;
         self.next_frame_at = now;
         // 常驻模式收起后窗口尺寸不再有意义；下次显示会按当前显示器重新计算，
         // 所以这里直接丢弃待应用尺寸，避免隐藏期间按旧尺寸做资源工作。
@@ -948,6 +1165,13 @@ impl App {
             self.seed,
         );
 
+        let keep_old = kind.is_some();
+        if self.cfg.multi_monitor == MultiMonitor::Sync && !self.secondaries.is_empty() {
+            for sec in &mut self.secondaries {
+                sec.upload(&slide.frame, keep_old);
+            }
+        }
+
         match (self.current.take(), kind) {
             (Some(old), Some(kind)) => {
                 if let TransitionKind::Slide(direction) = kind {
@@ -1012,6 +1236,38 @@ impl App {
                             shift.offset,
                         );
                     }
+                    if self.cfg.multi_monitor == MultiMonitor::Sync {
+                        for sec in &mut self.secondaries {
+                            if sec.minimized {
+                                continue;
+                            }
+                            let (Some(gpu), Some(current)) = (&sec.gpu, &sec.current) else {
+                                continue;
+                            };
+                            if current.is_wall() {
+                                gpu.clear(WALL_CLEAR_COLOR);
+                            }
+                            if let Some(sec_old) = &sec.old {
+                                gpu.draw(sec_old, old_uv, 1.0, 1.0, (0.0, 0.0));
+                            }
+                            let sec_shift = render::transition_layers(
+                                kind,
+                                progress,
+                                current.rect(),
+                                sec.size,
+                                current.is_wall(),
+                            );
+                            gpu.draw(
+                                current,
+                                [0.0, 0.0, 1.0, 1.0],
+                                sec_shift.bg_alpha,
+                                sec_shift.poster_alpha,
+                                sec_shift.offset,
+                            );
+                            sec.needs_redraw = false;
+                            sec.needs_present = true;
+                        }
+                    }
                     self.phase = Phase::Transition {
                         old,
                         old_uv,
@@ -1036,6 +1292,10 @@ impl App {
         self.progress = 0.0;
         self.frame_shown = false;
         self.next_frame_at = now;
+        for sec in &mut self.secondaries {
+            sec.old = None;
+            sec.needs_redraw = true;
+        }
     }
 
     /// 当前帧的海报矩形（未偏移）以及是否为整屏画布。
@@ -1094,6 +1354,29 @@ impl App {
                 drew = true;
             }
         }
+        if self.cfg.multi_monitor == MultiMonitor::Sync {
+            let dir = self.direction();
+            for sec in &mut self.secondaries {
+                if sec.minimized || !(continuous || sec.needs_redraw) {
+                    continue;
+                }
+                let (Some(gpu), Some(current)) = (&sec.gpu, &sec.current) else {
+                    continue;
+                };
+                if current.is_wall() {
+                    gpu.clear(WALL_CLEAR_COLOR);
+                }
+                let sec_uv = if current.is_wall() {
+                    [0.0, 0.0, 1.0, 1.0]
+                } else {
+                    let rect = current.rect();
+                    render::ken_burns_uv(rect[2], rect[3], progress, dir)
+                };
+                gpu.draw(current, sec_uv, 1.0, 1.0, (0.0, 0.0));
+                sec.needs_redraw = false;
+                sec.needs_present = true;
+            }
+        }
 
         if elapsed >= display.as_secs_f64() {
             if self.take_next(now) {
@@ -1120,36 +1403,42 @@ impl App {
         drew
     }
 
-    fn present(&mut self) {
-        let Some(result) = self.gpu.as_ref().map(|gpu| gpu.present()) else {
-            return;
-        };
-        let now = Instant::now();
-        match result {
-            Ok(PresentStatus::Presented) | Ok(PresentStatus::Occluded) => {
-                if self.gpu_recovery.record_success() {
-                    log_info!("GPU 已恢复，继续渲染");
-                }
-            }
-            Err(err) if err.device_lost() => {
-                self.gpu = None;
-                self.current = None;
-                self.phase = Phase::Idle;
-                self.frame_shown = false;
-                self.note_gpu_failure(now, &err);
-                self.next_frame_at = now;
-            }
-            Err(err) => {
-                // 非设备级错误不销毁设备，避免一次瞬时错误升级成完整重建。
-                if let Some(suppressed) = self.transient_log.record(now, GPU_LOG_INTERVAL) {
-                    if suppressed == 0 {
-                        log_warn!("Present 暂时失败，保留当前设备重试: {err}");
-                    } else {
-                        log_warn!("Present 持续失败，保留当前设备: {err}；已抑制 {suppressed} 条");
+    fn present(&mut self, primary_drew: bool) {
+        if primary_drew {
+            if let Some(result) = self.gpu.as_ref().map(|gpu| gpu.present()) {
+                let now = Instant::now();
+                match result {
+                    Ok(PresentStatus::Presented) | Ok(PresentStatus::Occluded) => {
+                        if self.gpu_recovery.record_success() {
+                            log_info!("GPU 已恢复，继续渲染");
+                        }
+                    }
+                    Err(err) if err.device_lost() => {
+                        self.gpu = None;
+                        self.current = None;
+                        self.phase = Phase::Idle;
+                        self.frame_shown = false;
+                        self.note_gpu_failure(now, &err);
+                        self.next_frame_at = now;
+                    }
+                    Err(err) => {
+                        // 非设备级错误不销毁设备，避免一次瞬时错误升级成完整重建。
+                        if let Some(suppressed) = self.transient_log.record(now, GPU_LOG_INTERVAL) {
+                            if suppressed == 0 {
+                                log_warn!("Present 暂时失败，保留当前设备重试: {err}");
+                            } else {
+                                log_warn!(
+                                    "Present 持续失败，保留当前设备: {err}；已抑制 {suppressed} 条"
+                                );
+                            }
+                        }
+                        self.next_frame_at = now + Duration::from_secs(1);
                     }
                 }
-                self.next_frame_at = now + Duration::from_secs(1);
             }
+        }
+        for sec in &mut self.secondaries {
+            sec.present_if_needed();
         }
     }
 
@@ -1195,6 +1484,9 @@ impl App {
         }
         self.stop_worker();
         self.gpu = None;
+        for sec in &mut self.secondaries {
+            sec.drop_gpu();
+        }
         self.gpu_recovery.reset();
         self.transient_log.reset();
         self.current = None;
@@ -1350,6 +1642,7 @@ impl ApplicationHandler<UserEvent> for App {
         if !watching {
             // 首次创建失败不退出：按统一退避在事件循环里重试，避免驱动瞬时故障直接结束进程。
             self.ensure_gpu();
+            self.sync_secondaries(event_loop);
         }
 
         self.ensure_worker();
@@ -1361,10 +1654,27 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let sec_idx = self
+            .secondaries
+            .iter()
+            .position(|sec| sec.window.id() == id);
+        let is_primary = self.window.as_ref().is_some_and(|w| w.id() == id);
+        if !is_primary && sec_idx.is_none() {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                if let Some(idx) = sec_idx {
+                    self.secondaries[idx].resize(size.width, size.height);
+                    if self.cfg.multi_monitor == MultiMonitor::Black {
+                        self.secondaries[idx].clear_black();
+                    } else {
+                        self.next_frame_at = Instant::now();
+                    }
+                    return;
+                }
                 // 常驻模式收起/隐藏过程中的窗口尺寸没有意义，等下次触发再按主屏重建。
                 if self.watch.as_ref().is_some_and(|w| !w.showing) {
                     return;
@@ -1379,6 +1689,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.minimized = false;
                 self.update_size((size.width, size.height), Instant::now());
             }
+            WindowEvent::RedrawRequested => {
+                if let Some(idx) = sec_idx {
+                    self.secondaries[idx].needs_redraw = true;
+                    if self.cfg.multi_monitor == MultiMonitor::Black {
+                        self.secondaries[idx].clear_black();
+                    } else {
+                        self.next_frame_at = Instant::now();
+                    }
+                } else {
+                    self.frame_shown = false;
+                    self.next_frame_at = Instant::now();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     self.user_activity(event_loop);
@@ -1391,16 +1714,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let now = Instant::now();
+                let slot = match sec_idx {
+                    Some(idx) => &mut self.secondaries[idx].pointer_start,
+                    None => &mut self.pointer_start,
+                };
                 if now < self.grace_until {
-                    self.pointer_start = (position.x, position.y);
+                    *slot = Some((position.x, position.y));
                 } else if self.watch.is_some() {
                     // 常驻模式：鼠标一动就收起（藏着的窗口不该收到这个事件，防一手）
                     if self.watch.as_ref().is_some_and(|w| w.showing) {
                         self.hide_screensaver(now);
                     }
                 } else if !self.preview {
-                    let dx = position.x - self.pointer_start.0;
-                    let dy = position.y - self.pointer_start.1;
+                    let start = *slot.get_or_insert((position.x, position.y));
+                    let dx = position.x - start.0;
+                    let dy = position.y - start.1;
                     if dx * dx + dy * dy > 1600.0 {
                         event_loop.exit();
                     }
@@ -1522,13 +1850,20 @@ impl ApplicationHandler<UserEvent> for App {
             self.next_frame_at = now;
         }
 
+        if self.cfg.multi_monitor == MultiMonitor::Black {
+            for sec in &mut self.secondaries {
+                sec.clear_black();
+            }
+        }
+
         if self.window.is_some() && self.gpu.is_some() && now >= self.next_frame_at {
             let t0 = Instant::now();
             let drew = self.tick(now);
             let t1 = Instant::now();
+            let any_sec_present = self.secondaries.iter().any(|sec| sec.needs_present);
             // 静止停留期间不重画，也就不必重复 Present。
-            if drew {
-                self.present();
+            if drew || any_sec_present {
+                self.present(drew);
             }
             let t2 = Instant::now();
             if drew {
