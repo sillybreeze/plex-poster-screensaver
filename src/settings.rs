@@ -617,15 +617,26 @@ fn populate_controls(
     };
     set_window_text(hwnd, ID_CONFIG_PATH, &config_text);
 
-    if !overrides.is_empty() {
-        set_window_text(
-            hwnd,
-            ID_OVERRIDE,
-            &format!(
-                "当前运行受启动参数/环境变量覆盖：{}。保存只改配置文件，不会改变本次运行。",
-                overrides.summary()
-            ),
-        );
+    if let Some(text) = banner_text(overrides) {
+        set_window_text(hwnd, ID_OVERRIDE, &text);
+    }
+}
+
+pub(super) fn banner_text(overrides: &SettingsOverrides) -> Option<String> {
+    let low = crate::platform::is_low_integrity();
+    let override_text = overrides.summary();
+    match (low, override_text.is_empty()) {
+        (true, true) => Some(
+            "警告：当前程序运行在低完整性级别（Low Integrity），保存配置会失败，本地缓存写入也会受限（将退回内存或报错）。请将 exe 复制（勿剪切）到普通目录后再运行。"
+                .to_string(),
+        ),
+        (true, false) => Some(format!(
+            "警告：程序处于低完整性级别（保存配置将失败）。当前运行受参数覆盖：{override_text}。"
+        )),
+        (false, false) => Some(format!(
+            "当前运行受启动参数/环境变量覆盖：{override_text}。保存只改配置文件，不会改变本次运行。"
+        )),
+        (false, true) => None,
     }
 }
 

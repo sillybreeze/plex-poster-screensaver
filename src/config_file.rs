@@ -119,8 +119,12 @@ fn save_preserving_with(
         serde_json::to_string_pretty(&value).map_err(|err| format!("序列化配置失败: {err}"))?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("创建配置目录失败 {}: {err}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|err| {
+                with_write_hint(
+                    format!("创建配置目录失败 {}: {err}", parent.display()),
+                    &err,
+                )
+            })?;
         }
     }
 
@@ -131,13 +135,27 @@ fn save_preserving_with(
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     if let Err(err) = fs::write(&tmp, format!("{text}\n")) {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("写入配置临时文件失败: {err}"));
+        return Err(with_write_hint(
+            format!("写入配置临时文件失败: {err}"),
+            &err,
+        ));
     }
     if let Err(err) = replace(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("保存配置失败 {}: {err}", path.display()));
+        return Err(with_write_hint(
+            format!("保存配置失败 {}: {err}", path.display()),
+            &err,
+        ));
     }
     Ok(())
+}
+
+fn with_write_hint(message: String, err: &io::Error) -> String {
+    if err.kind() == io::ErrorKind::PermissionDenied && crate::platform::is_low_integrity() {
+        format!("{message}\n\n{}", crate::platform::low_integrity_advice())
+    } else {
+        message
+    }
 }
 
 /// 把常用显示设置写回配置文件，保留未识别的 JSON 字段。

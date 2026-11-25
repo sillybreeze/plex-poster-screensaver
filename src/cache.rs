@@ -62,6 +62,13 @@ impl Cache {
     /// 严格模式：配置/命令行显式指定的目录，写不进去就报错，绝不偷偷换地方。
     pub fn open(dir: &Path, days: i64, naming: Naming) -> Result<Self, String> {
         if !writable(dir) {
+            if crate::platform::is_low_integrity() {
+                return Err(format!(
+                    "缓存目录不可写: {}\n\n{}",
+                    dir.display(),
+                    crate::platform::low_integrity_advice()
+                ));
+            }
             return Err(format!(
                 "缓存目录不可写: {}
                  原因: 这个进程当前只能写项目目录（exe 放在项目目录里启动时会被系统限制）。

@@ -57,10 +57,6 @@ impl SettingsOverrides {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.summary().is_empty()
-    }
-
     pub fn summary(&self) -> String {
         let mut items = Vec::new();
         if self.plex_url {

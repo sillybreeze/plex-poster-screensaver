@@ -177,19 +177,22 @@ fn execute_wall_task(
     client: &Client,
     size: (u32, u32),
     guard: &TaskGuard,
-) -> Result<WallLoaded, WallFailed> {
+) -> Result<WallLoaded, Box<WallFailed>> {
+    let fail = |index, item, error, discard_path| {
+        Err(Box::new(WallFailed {
+            index,
+            item,
+            error,
+            discard_path,
+        }))
+    };
     let WallTask {
         index,
         item,
         cached_path,
     } = task;
     if !guard.is_current() {
-        return Err(WallFailed {
-            index,
-            item,
-            error: TASK_CANCELLED.to_string(),
-            discard_path: None,
-        });
+        return fail(index, item, TASK_CANCELLED.to_string(), None);
     }
 
     let mut discard_path = None;
@@ -206,32 +209,18 @@ fn execute_wall_task(
             }
             Err(err) => {
                 if !guard.is_current() {
-                    return Err(WallFailed {
-                        index,
-                        item,
-                        error: TASK_CANCELLED.to_string(),
-                        discard_path: None,
-                    });
+                    return fail(index, item, TASK_CANCELLED.to_string(), None);
                 }
                 if mode == WallLoadMode::Cached {
-                    return Err(WallFailed {
-                        index,
-                        item,
-                        error: err,
-                        discard_path: Some(path),
-                    });
+                    return fail(index, item, err, Some(path));
                 }
                 log_warn!("缓存损坏，删除后重新下载: {err}");
                 discard_path = Some(path);
             }
         }
     } else if mode == WallLoadMode::Cached {
-        return Err(WallFailed {
-            index,
-            item: item.clone(),
-            error: format!("缓存文件不存在: {}", item.title),
-            discard_path: None,
-        });
+        let missing = format!("缓存文件不存在: {}", item.title);
+        return fail(index, item, missing, None);
     }
 
     match download_and_decode(client, &item, size, guard) {
@@ -242,12 +231,7 @@ fn execute_wall_task(
             fetched_data: Some(data),
             discard_path,
         }),
-        Err(error) => Err(WallFailed {
-            index,
-            item,
-            error,
-            discard_path,
-        }),
+        Err(error) => fail(index, item, error, discard_path),
     }
 }
 
@@ -793,7 +777,7 @@ impl Source {
         let client = &self.client;
         let size = self.size;
         let guard = &self.guard;
-        let mut outcomes: Vec<Result<WallLoaded, WallFailed>> = if tasks.len() == 1 {
+        let mut outcomes: Vec<Result<WallLoaded, Box<WallFailed>>> = if tasks.len() == 1 {
             let task = tasks.pop().unwrap();
             vec![execute_wall_task(task, mode, client, size, guard)]
         } else {

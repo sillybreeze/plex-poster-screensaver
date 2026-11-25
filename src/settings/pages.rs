@@ -35,19 +35,11 @@ pub(super) fn build(
         instance,
         font,
     )?;
-    let override_text = overrides.summary();
-    if override_text.is_empty() {
-        unsafe {
+    match super::banner_text(overrides) {
+        Some(text) => set_window_text(hwnd, ID_OVERRIDE, &text),
+        None => unsafe {
             let _ = ShowWindow(override_label, SW_HIDE);
-        }
-    } else {
-        set_window_text(
-            hwnd,
-            ID_OVERRIDE,
-            &format!(
-                "当前运行受启动参数/环境变量覆盖：{override_text}。这里的保存不会改变本次运行。"
-            ),
-        );
+        },
     }
 
     for page in ALL_PAGES {

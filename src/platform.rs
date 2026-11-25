@@ -15,7 +15,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Foundation::{
-    GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -963,6 +963,87 @@ fn is_remote_control(image_path: &str) -> bool {
     )
 }
 
+const MEDIUM_INTEGRITY_RID: u32 = 0x2000;
+
+struct HandleGuard(HANDLE);
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// 读取当前进程令牌的完整性级别 RID（Low=0x1000，Medium=0x2000，High=0x3000）。
+#[cfg(windows)]
+pub fn process_integrity_rid() -> Option<u32> {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let _guard = HandleGuard(token);
+
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed);
+        if needed < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 {
+            return None;
+        }
+        // 用 u64 缓冲保证 8 字节对齐，满足 TOKEN_MANDATORY_LABEL 的对齐要求。
+        let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; words];
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            needed,
+            &mut needed,
+        )
+        .ok()?;
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let count_ptr = GetSidSubAuthorityCount(label.Label.Sid);
+        if count_ptr.is_null() || *count_ptr == 0 {
+            return None;
+        }
+        let sub_ptr = GetSidSubAuthority(label.Label.Sid, (*count_ptr - 1) as u32);
+        if sub_ptr.is_null() {
+            return None;
+        }
+        Some(*sub_ptr)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_integrity_rid() -> Option<u32> {
+    None
+}
+
+fn is_low_rid(rid: u32) -> bool {
+    rid < MEDIUM_INTEGRITY_RID
+}
+
+/// 当前进程是否运行在低完整性级别（Low/Untrusted Integrity）；此状态下系统会拦截对普通用户目录的写入。
+pub fn is_low_integrity() -> bool {
+    process_integrity_rid().is_some_and(is_low_rid)
+}
+
+/// 生成面向用户的低完整性级别排障建议。
+pub fn low_integrity_advice() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "plex-poster-screensaver.exe".to_string());
+    format!(
+        "当前程序运行在 Windows 低完整性级别（Low Integrity），系统会拦截配置保存，日志与本地缓存写入也会受限（当前路径：{exe}）。\n\
+         常见原因：程序留在带 Low 标签的受限/沙箱目录内运行，或曾从这类目录被直接“剪切/移动”出来（保留了旧的 Low 标签）。\n\
+         解决方法：请将 exe 复制（不要剪切或移动）到该目录之外的普通用户目录再运行，并删除带有低完整性标记的旧文件。"
+    )
+}
+
 fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -985,7 +1066,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_remote_control;
+    use super::{is_low_rid, is_remote_control, process_integrity_rid};
 
     #[test]
     fn remote_control_windows_are_not_treated_as_media() {
@@ -998,5 +1079,14 @@ mod tests {
             r"C:\Program Files\Google\Chrome\chrome.exe"
         ));
         assert!(!is_remote_control(r"C:\Program Files\VideoLAN\VLC\vlc.exe"));
+    }
+
+    #[test]
+    fn low_integrity_classification_matches_windows_rids() {
+        assert!(is_low_rid(0x0000)); // Untrusted
+        assert!(is_low_rid(0x1000)); // Low
+        assert!(!is_low_rid(0x2000)); // Medium
+        assert!(!is_low_rid(0x3000)); // High
+        assert!(process_integrity_rid().is_some());
     }
 }

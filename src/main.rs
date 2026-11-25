@@ -170,27 +170,34 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 fn fatal_error(message: &str, code: i32, popup: bool) -> ! {
     log_error!("{message}");
     if popup {
-        show_error(message);
+        show_message(message, false);
     }
     std::process::exit(code);
 }
 
-fn show_error(message: &str) {
+fn show_message(message: &str, warning: bool) {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+    };
 
     let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     let caption: Vec<u16> = "Plex 海报屏保"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    let icon = if warning {
+        MB_ICONWARNING
+    } else {
+        MB_ICONERROR
+    };
     unsafe {
         let _ = MessageBoxW(
             HWND::default(),
             PCWSTR(text.as_ptr()),
             PCWSTR(caption.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            MB_OK | icon,
         );
     }
 }
@@ -287,6 +294,15 @@ fn main() {
     let popup_errors = !matches!(console_state, console::ConsoleState::Shared);
     if std::env::var_os("PPS_DEBUG").is_some() {
         log_info!("控制台状态: {console_state:?}");
+    }
+    if !utility && platform::is_low_integrity() {
+        let advice = platform::low_integrity_advice();
+        log_warn!("{advice}");
+        // 低完整性进程写不了 %LOCALAPPDATA% 日志，release 后台/双击启动也没有 stderr；
+        // 用弹窗确保警告真正到达用户，同时不阻断沙箱内的 --preview 测试。
+        if !args.preview && popup_errors {
+            show_message(&advice, true);
+        }
     }
     // 无参数双击：只打开设置页。后台运行必须显式 --background（开机自启用它），
     // 否则无参数启动会变成设置页，无法区分“配置”和“常驻”。
